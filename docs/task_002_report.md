@@ -7,10 +7,16 @@ danych, których jeszcze nie ma (niezależne statystyki, zwalidowany model, źr�
 Dlatego aplikacja obecnie i zgodnie z zasadami pokazuje
 **BRAK POTWIERDZONEJ PRZEWAGI — BRAK KUPONU DNIA**. Nie deklarujemy zysku ani skuteczności.
 
-Nie używano Git ani GitHub: brak commitów, push, PR i zdalnego repozytorium. Katalog `.git`
-(utworzony 31.10.2026 o 21:12, przed tą sesją pracy, bez commitów) oraz plik
-`.github/workflows/ci.yml` z TASK 001 pozostawiono nietknięte — zgodnie z zakazem usuwania
-plików. Workflow nigdy nie był uruchomiony; jeśli ma nie istnieć, usuń go ręcznie.
+W trakcie TASK 002 nie używano Git ani GitHub: brak commitów, push, PR i zdalnego
+repozytorium. Katalog `.git` (utworzony 31.10.2026 o 21:12, przed tą sesją pracy, bez
+commitów) oraz plik `.github/workflows/ci.yml` z TASK 001 pozostawiono nietknięte — zgodnie
+z zakazem usuwania plików.
+
+**Aktualizacja 31.10.2026 (po raporcie):** na wyraźne polecenie użytkownika kod
+opublikowano w prywatnym repozytorium
+[raiderosos555/SportAI](https://github.com/raiderosos555/SportAI) (gałąź `main`, razem z
+workflow CI). Dane lokalne (`data/`, `backups/`, `.env`, próbki PDF STS) pozostają poza
+repozytorium.
 
 ## 1. Zrealizowane funkcje
 

@@ -230,5 +230,6 @@ def _local_data() -> None:
     if backups:
         st.dataframe(pd.DataFrame(backups), hide_index=True, width="stretch")
     st.caption(
-        "Projekt nie jest publikowany: brak Git push, brak zdalnego repozytorium, dane tylko lokalnie."
+        "Dane (baza, PDF, eksporty, kopie) zostają tylko na tym komputerze — katalogi data/ i "
+        "backups/ są wyłączone z repozytorium Git."
     )

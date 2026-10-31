@@ -7,7 +7,10 @@ Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy si
 bukmachera. Poprawnym wynikiem bez zwalidowanego modelu jest komunikat
 **BRAK POTWIERDZONEJ PRZEWAGI — BRAK KUPONU DNIA**.
 
-Projekt jest wyłącznie lokalny: bez publikacji, bez push, bez zdalnego repozytorium.
+Kod jest w **prywatnym** repozytorium GitHub
+[raiderosos555/SportAI](https://github.com/raiderosos555/SportAI). Aplikacja i jej dane
+działają lokalnie: baza, oferty PDF, eksporty, kopie zapasowe i `.env` nie trafiają do
+repozytorium (`.gitignore`). Commity i push wyłącznie na wyraźne polecenie.
 Stan i ograniczenia: [raport TASK 002](docs/task_002_report.md).
 
 ## Uruchomienie na Windows
@@ -63,7 +66,9 @@ CLI (te same funkcje bez interfejsu):
 ```
 
 133 testy (69 z TASK 001 + 64 z TASK 002). Testy parserów używają oznaczonych fixture
-syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`.
+syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
+(katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
+uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.
 Dokładne wersje pakietów: `requirements-dev.lock` (TASK 001) i `requirements-app.lock`.
 
 ## Struktura
