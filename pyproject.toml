@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-edge-ai"
+version = "0.2.0"
+description = "Local STS/Superbet offer analysis; analytical and paper trading only"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+pdf = ["pymupdf>=1.24,<2", "tzdata>=2024.1"]
+app = ["pymupdf>=1.24,<2", "tzdata>=2024.1", "streamlit>=1.45,<2", "pandas>=2.2,<4"]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1", "build>=1,<2", "pymupdf>=1.24,<2", "tzdata>=2024.1", "streamlit>=1.45,<2", "pandas>=2.2,<4"]
+research = ["numpy>=2,<3", "pandas>=2.2,<4", "scipy>=1.14,<2", "scikit-learn>=1.5,<2", "duckdb>=1.1,<2", "pyarrow>=18"]
+ml = ["lightgbm>=4,<5", "catboost>=1.2,<2"]
+ui = ["fastapi>=0.115,<1", "streamlit>=1.45,<2"]
+
+[project.scripts]
+sports-edge = "sports_edge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["build", "dist", ".tmp"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# Polish UI copy in Streamlit pages; wrapping user-facing sentences hurts readability.
+"src/sports_edge/app/*.py" = ["E501"]

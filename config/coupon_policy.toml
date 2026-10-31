@@ -1,0 +1,16 @@
+# Acceptance policy of the Daily Coupon Engine. A selection is accepted only when ALL gates pass.
+# Changing thresholds after looking at results creates a new policy version (record it).
+[policy]
+version = "2026-10-31.1"
+min_data_quality = 0.9
+require_verified_parser = true
+require_fresh_quote = true
+require_validated_model = true
+min_validation_events = 300
+max_calibration_ece = 0.03
+require_beats_market_benchmark = true
+min_net_ev_lower_bound = 0.02
+max_odds = 10.0
+max_selections = 5
+ako_enabled = false
+ako_requires_joint_model = true

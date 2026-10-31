@@ -1,0 +1,4 @@
+include README.md requirements-dev.lock .env.example
+recursive-include docs *.md
+recursive-include config *.toml
+recursive-include tests *.py

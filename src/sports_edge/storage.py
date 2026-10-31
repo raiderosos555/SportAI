@@ -1,0 +1,235 @@
+"""SQLite operational store. Append-only records: corrections add rows, nothing is updated."""
+
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+SCHEMA_VERSION = 2
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS sources (
+ id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, terms_ref TEXT NOT NULL,
+ retention TEXT NOT NULL, checked_on TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bookmakers (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS imports (
+ id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id),
+ bookmaker_id TEXT NOT NULL REFERENCES bookmakers(id), parser TEXT NOT NULL,
+ parser_verified INTEGER NOT NULL CHECK(parser_verified IN (0,1)),
+ raw_sha256 TEXT NOT NULL, file_name TEXT, raw_path TEXT,
+ data_kind TEXT NOT NULL CHECK(data_kind IN ('prospective','archive','synthetic','demo')),
+ offer_kind TEXT NOT NULL, generated_at TEXT, ingested_at TEXT NOT NULL,
+ rows_total INTEGER NOT NULL, rows_ok INTEGER NOT NULL, rows_review INTEGER NOT NULL,
+ unparsed INTEGER NOT NULL, quality REAL NOT NULL, summary_json TEXT NOT NULL,
+ UNIQUE(raw_sha256, parser, data_kind)
+);
+CREATE TABLE IF NOT EXISTS events (
+ id TEXT PRIMARY KEY, bookmaker_id TEXT NOT NULL REFERENCES bookmakers(id),
+ sport TEXT NOT NULL, sport_raw TEXT NOT NULL, league TEXT NOT NULL, country TEXT,
+ home TEXT, away TEXT, participants_json TEXT NOT NULL, name_raw TEXT NOT NULL,
+ start_at TEXT, offer_date TEXT, first_import_id TEXT NOT NULL REFERENCES imports(id)
+);
+CREATE TABLE IF NOT EXISTS markets (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id), market_key TEXT NOT NULL,
+ period TEXT NOT NULL, overtime TEXT NOT NULL, line TEXT, label_raw TEXT NOT NULL,
+ rules_ref TEXT NOT NULL, mapping_version TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS selections (
+ id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id), key TEXT NOT NULL,
+ label_raw TEXT NOT NULL, UNIQUE(market_id, key)
+);
+CREATE TABLE IF NOT EXISTS quote_sets (
+ id TEXT PRIMARY KEY, market_id TEXT NOT NULL REFERENCES markets(id),
+ import_id TEXT NOT NULL REFERENCES imports(id), offer_code TEXT, page INTEGER NOT NULL,
+ source_text TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('ok','review')),
+ quality REAL NOT NULL, issues_json TEXT NOT NULL, valid_at TEXT, ingested_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS odds (
+ id TEXT PRIMARY KEY, quote_set_id TEXT NOT NULL REFERENCES quote_sets(id),
+ selection_id TEXT NOT NULL REFERENCES selections(id), price TEXT NOT NULL,
+ price_text TEXT NOT NULL, UNIQUE(quote_set_id, selection_id)
+);
+CREATE TABLE IF NOT EXISTS review_items (
+ id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), page INTEGER NOT NULL,
+ source_text TEXT NOT NULL, reason TEXT NOT NULL, context TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS review_decisions (
+ id TEXT PRIMARY KEY, target_kind TEXT NOT NULL CHECK(target_kind IN ('quote_set','review_item')),
+ target_id TEXT NOT NULL, decision TEXT NOT NULL CHECK(decision IN ('confirmed','rejected')),
+ note TEXT NOT NULL, decided_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS aliases (
+ id TEXT PRIMARY KEY, sport TEXT NOT NULL, alias_key TEXT NOT NULL, canonical_key TEXT NOT NULL,
+ origin TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(sport, alias_key, canonical_key)
+);
+CREATE TABLE IF NOT EXISTS event_links (
+ id TEXT PRIMARY KEY, event_a TEXT NOT NULL REFERENCES events(id),
+ event_b TEXT NOT NULL REFERENCES events(id),
+ status TEXT NOT NULL CHECK(status IN ('auto','confirmed','rejected')),
+ confidence REAL NOT NULL, method TEXT NOT NULL, evidence_json TEXT NOT NULL,
+ decided_at TEXT NOT NULL, CHECK(event_a <> event_b)
+);
+CREATE TABLE IF NOT EXISTS models (
+ id TEXT PRIMARY KEY, family TEXT NOT NULL, sport TEXT NOT NULL, description TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS model_versions (
+ id TEXT PRIMARY KEY, model_id TEXT NOT NULL REFERENCES models(id), version TEXT NOT NULL,
+ created_at TEXT NOT NULL, trained_through TEXT, training_data_json TEXT NOT NULL,
+ validation_json TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('experimental','validated','retired'))
+);
+CREATE TABLE IF NOT EXISTS predictions (
+ id TEXT PRIMARY KEY, model_version_id TEXT NOT NULL REFERENCES model_versions(id),
+ event_id TEXT REFERENCES events(id), market_key TEXT NOT NULL, period TEXT NOT NULL,
+ line TEXT, created_at TEXT NOT NULL, probabilities_json TEXT NOT NULL,
+ uncertainty_json TEXT NOT NULL, inputs_json TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('prospective','backtest','simulation'))
+);
+CREATE TABLE IF NOT EXISTS analyses (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, analysis_date TEXT NOT NULL,
+ policy_json TEXT NOT NULL, summary_json TEXT NOT NULL, items_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coupons (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, analysis_id TEXT REFERENCES analyses(id),
+ kind TEXT NOT NULL CHECK(kind IN ('solo','ako')),
+ mode TEXT NOT NULL CHECK(mode IN
+   ('paper_system','paper_manual','simulation','backtest','real_manual')),
+ bookmaker_id TEXT NOT NULL REFERENCES bookmakers(id), stake TEXT NOT NULL,
+ currency TEXT NOT NULL, cost_profile_id TEXT NOT NULL, total_odds TEXT NOT NULL,
+ first_start_at TEXT NOT NULL, note TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coupon_legs (
+ id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id),
+ odds_id TEXT NOT NULL REFERENCES odds(id), selection_id TEXT NOT NULL REFERENCES selections(id),
+ price TEXT NOT NULL, prediction_id TEXT REFERENCES predictions(id),
+ UNIQUE(coupon_id, selection_id)
+);
+CREATE TABLE IF NOT EXISTS results (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id), source TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('completed','void','postponed','cancelled','abandoned')),
+ home_score INTEGER, away_score INTEGER, ht_home INTEGER, ht_away INTEGER,
+ details_json TEXT NOT NULL, verified INTEGER NOT NULL CHECK(verified IN (0,1)),
+ recorded_at TEXT NOT NULL, supersedes_id TEXT REFERENCES results(id)
+);
+CREATE TABLE IF NOT EXISTS settlements (
+ id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id), outcome TEXT NOT NULL,
+ payout TEXT NOT NULL, net_profit TEXT NOT NULL, cash_flow_json TEXT NOT NULL,
+ legs_json TEXT NOT NULL, settled_at TEXT NOT NULL,
+ supersedes_id TEXT REFERENCES settlements(id)
+);
+CREATE TABLE IF NOT EXISTS experiments (
+ id TEXT PRIMARY KEY, hypothesis TEXT NOT NULL, registered_at TEXT NOT NULL,
+ kind TEXT NOT NULL CHECK(kind IN ('simulation','backtest','prospective_paper','real_manual')),
+ config_json TEXT NOT NULL, status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS data_imports (
+ id TEXT PRIMARY KEY, source_name TEXT NOT NULL, license_note TEXT NOT NULL,
+ file_sha256 TEXT NOT NULL, file_name TEXT, kind TEXT NOT NULL, rows INTEGER NOT NULL,
+ ingested_at TEXT NOT NULL, UNIQUE(file_sha256, kind)
+);
+CREATE TABLE IF NOT EXISTS historical_results (
+ id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES data_imports(id),
+ sport TEXT NOT NULL, competition TEXT NOT NULL, season TEXT, match_date TEXT NOT NULL,
+ home TEXT NOT NULL, away TEXT NOT NULL, home_score INTEGER NOT NULL,
+ away_score INTEGER NOT NULL, available_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_day ON events(bookmaker_id, offer_date);
+CREATE INDEX IF NOT EXISTS market_event ON markets(event_id);
+CREATE INDEX IF NOT EXISTS quote_market ON quote_sets(market_id, valid_at);
+CREATE INDEX IF NOT EXISTS odds_quote ON odds(quote_set_id);
+CREATE INDEX IF NOT EXISTS result_event ON results(event_id);
+CREATE INDEX IF NOT EXISTS history_date ON historical_results(sport, match_date);
+CREATE TRIGGER IF NOT EXISTS odds_same_market BEFORE INSERT ON odds
+WHEN (SELECT market_id FROM selections WHERE id=NEW.selection_id) <>
+     (SELECT market_id FROM quote_sets WHERE id=NEW.quote_set_id)
+BEGIN SELECT RAISE(ABORT, 'incompatible_market'); END;
+"""
+
+
+class Store:
+    def __init__(self, path: Path | str):
+        if str(path) != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.path = str(path)
+        self.connection = sqlite3.connect(
+            str(path), isolation_level=None, timeout=15, check_same_thread=False
+        )
+        self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA recursive_triggers=ON")
+        if str(path) != ":memory:":
+            self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.executescript(SCHEMA)
+        self.tables = {
+            r[0]
+            for r in self.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        self._columns: dict[str, set[str]] = {}
+        for table in sorted(self.tables):
+            for action in ("UPDATE", "DELETE"):
+                self.connection.execute(
+                    f"""CREATE TRIGGER IF NOT EXISTS immutable_{table}_{action}
+                    BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT,'append_only'); END"""
+                )
+        self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def close(self):
+        self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    @contextmanager
+    def transaction(self):
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+            self.connection.execute("COMMIT")
+        except BaseException:
+            self.connection.execute("ROLLBACK")
+            raise
+
+    def rows(self, sql: str, params: tuple = ()) -> list[dict]:
+        return [dict(r) for r in self.connection.execute(sql, params)]
+
+    def scalar(self, sql: str, params: tuple = ()):
+        row = self.connection.execute(sql, params).fetchone()
+        return None if row is None else row[0]
+
+    def get(self, table: str, key: str) -> dict | None:
+        if table not in self.tables:
+            raise ValueError("unknown_table")
+        rows = self.rows(f"SELECT * FROM {table} WHERE id=?", (key,))
+        return rows[0] if rows else None
+
+    def insert(self, table: str, **values) -> bool:
+        """Insert once. Same id with identical values is a no-op; differing values fail."""
+        if table not in self.tables:
+            raise ValueError("unknown_table")
+        if table not in self._columns:
+            self._columns[table] = {
+                r[1] for r in self.connection.execute(f"PRAGMA table_info({table})")
+            }
+        if not set(values) <= self._columns[table] or "id" not in values:
+            raise ValueError("unknown_column")
+        existing = self.get(table, values["id"])
+        if existing is not None:
+            if any(existing[k] != v for k, v in values.items()):
+                raise ValueError("identity_conflict")
+            return False
+        keys = list(values)
+        self.connection.execute(
+            f"INSERT INTO {table} ({','.join(keys)}) VALUES ({','.join('?' for _ in keys)})",
+            tuple(values[k] for k in keys),
+        )
+        return True
+
+    def backup_to(self, target: Path) -> None:
+        """Consistent snapshot through SQLite's online backup API."""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(str(target)) as destination:
+            self.connection.backup(destination)
+        destination.close()

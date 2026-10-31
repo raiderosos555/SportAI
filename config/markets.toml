@@ -1,0 +1,27 @@
+# Examples of generic research rules, not certified bookmaker rulebooks.
+[[market]]
+id = "winner"
+version = "1"
+rule_id = "winner.completed.v1"
+period = "match"
+includes_overtime = false
+# Participant IDs and optional draw supplied for each event; arbitrary field size.
+
+[[market]]
+id = "asian_total"
+version = "1"
+rule_id = "asian_total.completed.v1"
+period = "match"
+includes_overtime = false
+requires_line = true
+selection_keys = ["over", "under"]
+# Disjoint count bins supplied with a documented tail state by a future model adapter.
+
+[[market]]
+id = "double_chance"
+version = "1"
+rule_id = "double_chance.unimplemented.v1"
+period = "regulation"
+includes_overtime = false
+selection_keys = ["home_draw", "home_away", "draw_away"]
+state_keys = ["home", "draw", "away"]

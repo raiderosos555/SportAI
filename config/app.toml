@@ -1,0 +1,10 @@
+# Defaults for the local application. User changes are stored in data/settings.json.
+[settings]
+offline_mode = true
+retain_raw_pdf = false
+nominal_stake = "10.00"
+max_quote_age_minutes = 180
+match_tolerance_minutes = 10
+sts_download_enabled = false
+arbiscan_enabled = false
+propline_enabled = false

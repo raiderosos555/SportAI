@@ -1,0 +1,32 @@
+[bookmaker]
+id = "superbet"
+name = "Superbet"
+jurisdiction = "PL"
+checked_on = "2026-10-31"
+license_note = "Licencja MF nr PS4.6831.5.2019 (strona główna superbet.pl, 31.10.2026)"
+
+[tax]
+profile = "tax/pl_superbet_app.toml"
+verified = false
+notes = "Założenie: ustawowe 12% od stawki i 10% od wygranej > 2280 zł; nie potwierdzono w regulaminie Superbet."
+
+[promotions]
+modelled = false
+notes = "Promocje (zwroty, boosty, bonusy) nie są uwzględniane w EV."
+
+[limits]
+known = false
+notes = "Limity stawek i wygranych niezweryfikowane."
+
+[settlement]
+rules_url = "https://superbet.pl/wiki/regulamin"
+verified = false
+notes = "Regulamin zakładów (03.06.2026) i komunikaty dyscyplin nieprzeanalizowane w TASK 002."
+
+[fees]
+execution_fee = "0"
+notes = "Brak znanych opłat dodatkowych."
+
+[offer_source]
+official_pdf_page = ""
+notes = "31.10.2026: brak linków do oferty PDF na superbet.pl (strona główna, sitemap, wiki). Tylko ręczny import PDF dostarczonego przez użytkownika."

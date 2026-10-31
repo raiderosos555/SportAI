@@ -1,0 +1,202 @@
+"""Daily Coupon Engine. No selection is produced to fill a daily quota.
+
+SOLO candidates must pass every gate of the policy. AKO is analysed only with an explicit
+joint-probability model; correlated legs (same event) are never multiplied together.
+"""
+
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from decimal import Decimal
+from math import prod
+from typing import Protocol
+
+from sports_edge.analysis.edge_engine import Candidate
+from sports_edge.analysis.policy import Policy
+from sports_edge.ingestion.types import canonical, digest, iso
+from sports_edge.settlement import CostProfile, Outcome, settle
+from sports_edge.storage import Store
+
+NO_EDGE = "BRAK POTWIERDZONEJ PRZEWAGI — BRAK KUPONU DNIA"
+
+
+class JointModel(Protocol):
+    name: str
+
+    def joint_probability(self, legs: Sequence[Candidate]) -> float | None: ...
+
+
+class IndependentEventsModel:
+    """Product of marginals, allowed only for legs from different events.
+
+    Independence between different matches is an explicit modelling assumption that the
+    user must enable; it is never applied to legs of the same event.
+    """
+
+    name = "independent-events-assumption"
+
+    def joint_probability(self, legs: Sequence[Candidate]) -> float | None:
+        if len({leg.event_id for leg in legs}) != len(legs):
+            return None
+        if any(leg.p_model is None for leg in legs):
+            return None
+        return prod(leg.p_model for leg in legs)
+
+
+@dataclass(frozen=True)
+class AkoAnalysis:
+    created: bool
+    reason: str
+    legs: tuple[Candidate, ...] = ()
+    joint_probability: float | None = None
+    total_odds: Decimal | None = None
+    ev_net: Decimal | None = None
+    solo_ev_net_sum: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class CouponReport:
+    day: str
+    created_at: datetime
+    policy_version: str
+    headline: str
+    solo: tuple[Candidate, ...]
+    analysed: int
+    rejection_reasons: dict[str, int]
+    ako: AkoAnalysis
+    warnings: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def has_coupon(self) -> bool:
+        return bool(self.solo)
+
+
+def rank_key(candidate: Candidate) -> tuple:
+    return (
+        candidate.ev_net_low if candidate.ev_net_low is not None else Decimal("-9"),
+        candidate.quality,
+        -(candidate.p_high - candidate.p_low) if candidate.p_low is not None else -1.0,
+        candidate.freshness == "fresh",
+    )
+
+
+def build_daily_coupon(
+    candidates: Sequence[Candidate],
+    policy: Policy,
+    *,
+    day: str,
+    now: datetime,
+    joint_model: JointModel | None = None,
+    cost: CostProfile | None = None,
+    stake: Decimal = Decimal("10.00"),
+) -> CouponReport:
+    accepted = sorted((c for c in candidates if c.accepted), key=rank_key, reverse=True)
+    # One selection per event in the SOLO ranking: several legs of one match are one risk.
+    best_per_event: dict[str, Candidate] = {}
+    for candidate in accepted:
+        best_per_event.setdefault(candidate.event_id, candidate)
+    solo = tuple(sorted(best_per_event.values(), key=rank_key, reverse=True))[
+        : policy.max_selections
+    ]
+    reasons = Counter(r for c in candidates if not c.accepted for r in c.reasons)
+    warnings = []
+    if not candidates:
+        warnings.append("Brak zaimportowanych ofert dla wybranego dnia")
+    ako = analyse_ako(solo, policy, joint_model=joint_model, cost=cost, stake=stake, now=now)
+    return CouponReport(
+        day=day,
+        created_at=now,
+        policy_version=policy.version,
+        headline=NO_EDGE if not solo else f"Kandydaci SOLO: {len(solo)} (tryb analityczny)",
+        solo=solo,
+        analysed=len(candidates),
+        rejection_reasons=dict(reasons.most_common()),
+        ako=ako,
+        warnings=tuple(warnings),
+    )
+
+
+def analyse_ako(
+    legs: Sequence[Candidate],
+    policy: Policy,
+    *,
+    joint_model: JointModel | None,
+    cost: CostProfile | None,
+    stake: Decimal,
+    now: datetime,
+) -> AkoAnalysis:
+    if not policy.ako_enabled:
+        return AkoAnalysis(False, "Analiza AKO wyłączona w polityce (domyślnie)")
+    if len(legs) < 2:
+        return AkoAnalysis(False, "Mniej niż dwie zaakceptowane selekcje SOLO")
+    if joint_model is None:
+        return AkoAnalysis(False, "Brak wiarygodnego modelu prawdopodobieństwa łącznego")
+    if len({leg.bookmaker for leg in legs}) != 1:
+        return AkoAnalysis(False, "Selekcje pochodzą od różnych bukmacherów")
+    p_joint = joint_model.joint_probability(legs)
+    if p_joint is None:
+        return AkoAnalysis(False, "Model łączny odrzucił zestaw (zależne lub niepełne selekcje)")
+    total = prod(leg.odds for leg in legs)  # operator rounding of AKO odds is not assumed
+    solo_sum = sum((leg.ev_net for leg in legs if leg.ev_net is not None), Decimal(0))
+    if cost is None:
+        return AkoAnalysis(False, "Brak profilu kosztów", tuple(legs), p_joint, total)
+    on_date = min(datetime.fromisoformat(leg.start_at).date() for leg in legs if leg.start_at)
+    try:
+        win = settle(stake, total, Outcome.WIN, cost, on_date=on_date).net_profit
+        loss = settle(stake, total, Outcome.LOSS, cost, on_date=on_date).net_profit
+    except ValueError as error:
+        return AkoAnalysis(False, f"Rozliczenie AKO nieobsługiwane: {error}", tuple(legs))
+    ev = (Decimal(str(p_joint)) * win + Decimal(str(1 - p_joint)) * loss) / stake
+    reason = (
+        f"Model łączny: {joint_model.name}. AKO nie jest domyślnie lepsze od SOLO "
+        f"(suma EV SOLO {solo_sum:.3f} vs EV AKO {ev:.3f})."
+    )
+    ev = ev.quantize(Decimal("0.0001"))
+    return AkoAnalysis(True, reason, tuple(legs), p_joint, total, ev, solo_sum)
+
+
+def save_analysis(
+    store: Store, report: CouponReport, candidates: Sequence[Candidate], policy: Policy
+) -> str:
+    """Immutable snapshot of the analysis with the exact quote ids and prices it used."""
+    items = [
+        {
+            "key": c.key,
+            "bookmaker": c.bookmaker,
+            "event": c.event,
+            "market": c.market_key,
+            "period": c.period,
+            "line": c.line,
+            "selection": c.selection,
+            "odds": str(c.odds),
+            "odds_id": c.odds_id,
+            "p_model": c.p_model,
+            "p_market": c.p_market,
+            "ev_net": str(c.ev_net) if c.ev_net is not None else None,
+            "ev_net_low": str(c.ev_net_low) if c.ev_net_low is not None else None,
+            "freshness": c.freshness,
+            "accepted": c.accepted,
+            "reasons": list(c.reasons),
+        }
+        for c in candidates
+    ]
+    summary = {
+        "headline": report.headline,
+        "analysed": report.analysed,
+        "accepted": [c.key for c in report.solo],
+        "rejection_reasons": report.rejection_reasons,
+        "ako": {"created": report.ako.created, "reason": report.ako.reason},
+    }
+    key = digest(["analysis", report.day, iso(report.created_at), policy.version])
+    with store.transaction():
+        store.insert(
+            "analyses",
+            id=key,
+            created_at=iso(report.created_at),
+            analysis_date=report.day,
+            policy_json=canonical(asdict(policy)),
+            summary_json=canonical(summary),
+            items_json=canonical(items),
+        )
+    return key

@@ -1,0 +1,21 @@
+# Local-only Streamlit configuration for Sports Edge AI.
+[server]
+address = "127.0.0.1"
+port = 8501
+headless = false
+runOnSave = false
+maxUploadSize = 60
+
+[browser]
+gatherUsageStats = false
+serverAddress = "localhost"
+
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0b1220"
+secondaryBackgroundColor = "#111a2e"
+textColor = "#e5e7eb"

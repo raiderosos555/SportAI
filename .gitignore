@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.tmp/
+*.egg-info/
+build/
+dist/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+data/
+artifacts/
+*.db
+*.sqlite*
+*.parquet
+*.csv
+*.jsonl
+!tests/fixtures/**
+
+# TASK 002: local backups and Streamlit secrets never leave this computer
+backups/
+.streamlit/secrets.toml

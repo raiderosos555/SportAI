@@ -1,0 +1,34 @@
+[bookmaker]
+id = "sts"
+name = "STS"
+jurisdiction = "PL"
+checked_on = "2026-10-31"
+license_note = "Zezwolenie MF DAG10.6831.4.2023, ważne 20.02.2024-20.02.2030 (stopka sts.pl, 31.10.2026)"
+
+[tax]
+profile = "tax/pl_sts_app.toml"
+verified = true
+notes = "Stawka x 0,88 oraz 10% od wygranej powyżej 2280 zł (pomoc.sts.pl, TASK 001). Dokładna granica 2280 zł zablokowana."
+
+[promotions]
+modelled = false
+notes = "Promocje, boosty i gra bez podatku nie są uwzględniane w EV."
+
+[limits]
+known = false
+notes = "Limity stawek i wygranych niezweryfikowane; paper trading nie dowodzi możliwości zawarcia zakładu."
+
+[settlement]
+rules_url = "https://www.sts.pl/regulaminy"
+verified = false
+notes = "Okres, dogrywka i linia odczytywane z etykiet PDF; szczegółowe zasady sportów nieporównane."
+
+[fees]
+execution_fee = "0"
+notes = "Brak znanych opłat dodatkowych od kuponu."
+
+[offer_source]
+official_pdf_page = "https://www.sts.pl/oferta-pdf"
+pdf_today = "https://retail-api.sts.pl/printed-offer?day=today"
+pdf_tomorrow = "https://retail-api.sts.pl/printed-offer?day=tomorrow"
+pdf_week = "https://retail-api.sts.pl/printed-offer?day=week"
