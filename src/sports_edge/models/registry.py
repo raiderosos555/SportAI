@@ -7,6 +7,7 @@
 """
 
 import json
+from collections.abc import Sequence
 from datetime import datetime
 
 from sports_edge.ingestion.types import canonical, digest, iso
@@ -137,7 +138,12 @@ def save_prediction(
 
 
 def latest_predictions(
-    store: Store, *, as_of: datetime, prefer: dict[str, str] | None = None
+    store: Store,
+    *,
+    as_of: datetime,
+    prefer: dict[str, str] | None = None,
+    versions: set[str] | None = None,
+    offer_dates: Sequence[str] | None = None,
 ) -> dict[tuple, dict]:
     """Newest pre-match prediction per (event, market, period, line).
 
@@ -145,26 +151,43 @@ def latest_predictions(
     start qualify; anything made after kick-off is never a pre-match forecast. ``prefer``
     maps a market to the model family chosen for it on validation (e.g. 1X2 → Elo or
     Dixon–Coles); a newer forecast of another family never replaces the preferred one.
+    ``versions`` keeps only the served versions (an experiment is not a release) and
+    ``offer_dates`` only events of those STS offer days; both are filtered in SQL.
     """
+    where = ["p.kind='prospective'", "p.created_at<=?", "e.start_at IS NOT NULL"]
+    params: list = [iso(as_of)]
+    if versions is not None:
+        where.append(f"p.model_version_id IN ({','.join('?' for _ in versions)})")
+        params += sorted(versions)
+    if offer_dates is not None:
+        where.append(f"e.offer_date IN ({','.join('?' for _ in offer_dates)})")
+        params += list(offer_dates)
     rows = store.rows(
-        """SELECT p.*, v.status version_status, v.version, v.validation_json, m.family,
-        e.start_at event_start
+        f"""SELECT p.*, v.status version_status, v.version, m.family, e.start_at event_start
         FROM predictions p JOIN model_versions v ON v.id=p.model_version_id
         JOIN models m ON m.id=v.model_id JOIN events e ON e.id=p.event_id
-        WHERE p.kind='prospective' AND p.created_at<=? AND e.start_at IS NOT NULL
-        ORDER BY p.created_at""",
-        (iso(as_of),),
+        WHERE {" AND ".join(where)} ORDER BY p.created_at""",
+        tuple(params),
     )
+    validations: dict[str, dict] = {}  # one parse per version, not per forecast
     latest: dict[tuple, dict] = {}
     for row in rows:
         if datetime.fromisoformat(row["created_at"]) >= datetime.fromisoformat(row["event_start"]):
             continue
+        version_id = row["model_version_id"]
+        if version_id not in validations:
+            validations[version_id] = json.loads(
+                store.get("model_versions", version_id)["validation_json"]
+            )
         row["probabilities"] = json.loads(row["probabilities_json"])
         row["uncertainty"] = json.loads(row["uncertainty_json"])
         row["inputs"] = json.loads(row["inputs_json"])
-        row["validation"] = json.loads(row["validation_json"])
+        row["validation"] = validations[version_id]
         key = (row["event_id"], row["market_key"], row["period"], row["line"])
-        wanted = (prefer or {}).get(row["market_key"])
+        competition = row["inputs"].get("competition")
+        wanted = (prefer or {}).get((row["market_key"], competition)) or (prefer or {}).get(
+            row["market_key"]
+        )
         current = latest.get(key)
         if wanted and current is not None and current["family"] == wanted != row["family"]:
             continue

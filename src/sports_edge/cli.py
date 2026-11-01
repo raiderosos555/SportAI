@@ -69,7 +69,7 @@ def fetch_sts(day: str) -> None:
     _print({"duplicate": outcome.duplicate, **outcome.summary})
 
 
-def research(step: str) -> None:
+def research(step: str, scope: str = "core") -> None:
     """Independent data and the first experiment; downloads respect the offline setting."""
     from sports_edge import services
     from sports_edge.datasources import openfootball
@@ -88,17 +88,23 @@ def research(step: str) -> None:
     elif step == "import-data":
         _print(services.import_openfootball_files(store, paths, now=now))
     elif step == "experiment":
-        report = services.run_research_experiment(store, paths, now=now)
+        report = services.run_research_experiment(
+            store, paths, now=now, competitions=services.MODEL_SCOPES[scope]
+        )
         _print({k: v for k, v in report.items() if k not in {"selection", "holdout"}})
     elif step == "predict":
         _print(services.generate_predictions(store, paths, now=now))
     elif step == "goals-experiment":
-        report = services.run_goals_experiment(store, paths, now=now)
+        report = services.run_goals_experiment(
+            store, paths, now=now, competitions=services.MODEL_SCOPES[scope]
+        )
         _print(
             {k: report[k] for k in ("version_id", "predictive", "markets_served") if k in report}
         )
     elif step == "goals-predict":
         _print(services.generate_goals_predictions(store, paths, now=now))
+    elif step == "backfill":
+        _print(services.backfill_history(store, paths, settings, now=now, progress=print))
     elif step == "update-results":
         _print(services.update_results_data(store, paths, settings, now=now, progress=print))
     elif step == "results":
@@ -206,8 +212,12 @@ def main() -> None:
             "predict",
             "goals-experiment",
             "goals-predict",
+            "backfill",
             "results",
         ],
+    )
+    res.add_argument(
+        "--scope", choices=["core", "extended"], default="core", help="model scope (leagues)"
     )
     ana = commands.add_parser(
         "analyse", help="GENERUJ KUPONY DNIA without the interface (14 stages, saved proposals)"
@@ -229,7 +239,7 @@ def main() -> None:
     elif args.command == "check":
         sys.exit(check())
     elif args.command == "research":
-        research(args.step)
+        research(args.step, args.scope)
     elif args.command == "analyse":
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
 

@@ -5,12 +5,14 @@ bukmacher). Od TASK 005 jej głównym zadaniem jest **tworzenie kuponów STS o m
 najwyższej, rzetelnie oszacowanej szansie trafienia** przy realnym zysku po podatku.
 
 Funkcje:
-- import PDF i historia kursów;
-- aktualne wyniki (football-data.org, PitchAPI, openfootball);
+- import PDF i historia kursów, jawny status każdego pobrania oferty STS;
+- aktualne wyniki (football-data.org, PitchAPI, openfootball, historia z API-Sports);
 - statystyki meczowe i składy (PitchAPI), cechy przedmeczowe as-of;
-- modele Elo (1X2, podwójna szansa) i Dixon–Coles (sumy goli, BTTS) z kalibracją i
-  walidacją predykcyjną;
-- kreator kuponów w trzech profilach;
+- modele Elo (1X2, podwójna szansa) i Dixon–Coles (sumy goli, BTTS) z kalibracją, walidacją
+  predykcyjną i bramką jakości każdej ligi — **12 lig piłkarskich** (5 czołowych +
+  Championship, Eredivisie, Liga Portugal, Pro League, 2. Bundesliga, Süper Lig, Ekstraklasa);
+- kreator kuponów w trzech profilach dla dziś / jutro / 3 / 7 dni, z wyjaśnieniem braku kuponu;
+- analiza meczu prostym językiem: tryb przedmeczowy i pomeczowy;
 - paper trading, automatyczne rozliczenia i panel skuteczności.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
@@ -21,7 +23,7 @@ Kod jest w **prywatnym** repozytorium GitHub
 [raiderosos555/SportAI](https://github.com/raiderosos555/SportAI). Aplikacja i jej dane
 działają lokalnie: baza, oferty PDF, eksporty, kopie zapasowe i `.env` nie trafiają do
 repozytorium (`.gitignore`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 005](docs/task_005_report.md).
+Stan i ograniczenia: [raport TASK 006](docs/task_006_report.md).
 
 ## Uruchomienie na Windows
 
@@ -37,13 +39,13 @@ Start nie pobiera niczego z sieci; tryb offline jest domyślnie włączony.
 
 | Krok w aplikacji | Gdzie |
 |---|---|
-| Import PDF STS, historia i zmiany kursów | **Oferta STS** (lub **Ustawienia → Import PDF**) |
-| Oficjalne PDF STS (dziś / jutro / tydzień) | **Oferta STS** — po wyłączeniu trybu offline i zgodzie w Ustawieniach |
-| Centrum analizy meczu: kursy, forma, statystyki, składy, prawdopodobieństwa AI, ryzyko | **Analiza AI** |
-| Kupony dnia: 3 profile (bezpieczny, zrównoważony, agresywny), 14 etapów od oferty do zapisu | **Kupon dnia** → „GENERUJ KUPONY DNIA” |
-| Wirtualne kupony, wyniki, rozliczenia, skuteczność kreatora, ROI, obsunięcie, CLV | **Historia i wyniki** |
-| Wyniki sportowe (źródła, świeżość lig, aktualizacja, konflikty), eksperyment, kalibracja | **Modele i eksperymenty** |
-| Profil podatkowy i reguły STS, baza, archiwum, eksport, kopie | **Ustawienia** |
+| Przegląd dnia: liczby, najlepsze prognozy, kupony, status danych | **Dashboard** |
+| Kupony 3 profili (dziś / jutro / 3 / 7 dni), powody braku kuponu, typy do rozważenia A/B/C | **Kupon dnia** → „ANALIZUJ MECZE I GENERUJ KUPONY” |
+| Ocena modelu, najbardziej prawdopodobny typ, uzasadnienie, forma, statystyki, składy, tryb po meczu | **Analiza meczów** |
+| Terminarz, zakończone mecze z wynikami, pełna oferta STS i historia kursów, import PDF | **Wydarzenia i wyniki** |
+| Kupony, trafność, ROI, wykres w czasie, rozliczenia, CLV, analizy | **Historia i skuteczność** |
+| Modele prostym językiem, pokrycie oferty, metryki, bramki lig, wersje, eksperymenty | **Modele i statystyki** |
+| Źródła danych, oficjalne pliki STS, ustawienia, podatki i reguły, kopie, diagnostyka | **Źródła i ustawienia** |
 | Dane DEMO (fikcyjne, oddzielna baza) | przełącznik w pasku bocznym |
 
 Aktualne wyniki (bezpłatnie): zarejestruj własny klucz na
@@ -57,7 +59,9 @@ w `.env`. Uwaga: darmowy plan obejmuje tylko sezony 2022–2024 (sprawdzono 01.1
 bieżące wyniki Ekstraklasy, NBA czy NHL wymagają płatnego planu.
 
 PitchAPI (zalecane): darmowy klucz z pitchapi.dev jako `PITCHAPI_KEY=…` w `.env`.
-- Daje wyniki top 5 lig i Ekstraklasy, statystyki meczowe (xG, strzały, rożne, kartki) i składy.
+- Daje wyniki 12 lig z modelem (top 5, Championship, Eredivisie, Liga Portugal, Pro League,
+  2. Bundesliga, Süper Lig, Ekstraklasa), statystyki meczowe (xG, strzały, rożne, kartki) i
+  składy; historia od sezonu 2021/22 (`sports-edge research backfill`).
 - Regulamin nie jest opublikowany, więc dane służą tylko do prywatnej analizy, bez
   redystrybucji.
 - Limit to 60 zapytań o statystyki na jedno generowanie kuponów (Ustawienia).
@@ -76,8 +80,9 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge analyse 2026-11-02 --refresh-offer   # GENERUJ KUPONY DNIA bez interfejsu
 .\.venv\Scripts\sports-edge research experiment         # Elo: trening / walidacja / holdout
 .\.venv\Scripts\sports-edge research predict            # prognozy przedmeczowe (blokady czasu i danych)
-.\.venv\Scripts\sports-edge research goals-experiment   # Dixon–Coles + kalibracja + walidacja predykcyjna
-.\.venv\Scripts\sports-edge research goals-predict      # prognozy rynków bramkowych
+.\.venv\Scripts\sports-edge research goals-experiment   # Dixon–Coles + kalibracja + walidacja (--scope extended)
+.\.venv\Scripts\sports-edge research goals-predict      # prognozy rynków bramkowych (wszystkie zakresy)
+.\.venv\Scripts\sports-edge research backfill           # historia lig z planu HISTORY_PLAN (bezpłatne źródła)
 .\.venv\Scripts\sports-edge research results            # wyniki z danych niezależnych (pewne dopasowanie)
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
@@ -107,8 +112,9 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-196 testów (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005, w tym test integracyjny od
-PDF STS do raportu skuteczności). Testy parserów używają oznaczonych fixture
+223 testy (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005 + 27 z TASK 006: m.in. test
+integracyjny od PDF STS do raportu skuteczności, statusy pobierania STS, przypadki braku kuponu,
+analiza pomeczowa i scenariusze interfejsu). Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
 (katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
 uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.
@@ -126,7 +132,9 @@ src/sports_edge/
                   calibration (izotoniczna, Wilson, przedziały)
   datasources/    kontrakt dostawców wyników, rejestr rozgrywek, football-data.org, PitchAPI,
                   API-Sports, openfootball, STS/Superbet (nieaktywne)
-  app/            interfejs Streamlit (7 widoków)
+  app/            interfejs Streamlit: main (nawigacja, pasek boczny), ui (design system),
+                  page_dashboard, page_coupon, page_match, page_events, pages_history,
+                  page_models, page_sources, diagnostics (analiza EV), common (cache, formaty)
   storage.py      SQLite tylko-dopisywanie, migracje do v5 z kopią;  repository.py  importy i widoki
   history.py      historia kursów STS, zmiany, momenty przed meczem, CLV, braki
   results_engine.py  aktualizacja wyników: brakujący okres, duplikaty, korekty, konflikty, hierarchia
@@ -135,6 +143,8 @@ src/sports_edge/
   probability_lab.py  Dixon–Coles walk-forward, kalibracja, walidacja predykcyjna, prognozy
   sports_intel.py statystyki meczowe, składy, cechy przedmeczowe as-of (migawki)
   performance.py  skuteczność kuponów i selekcji kreatora
+  insights.py     warstwa prostego języka: wiarygodność, grupy typów A/B/C, powody braku kuponu
+  coverage.py     audyt pokrycia oferty STS (wydarzenia, rynki, selekcje, powody braku prognozy)
   provenance.py   stan kodu i snapshot danych;  bookmakers.py  profil STS i reguły rynków
   backup.py, export.py, services.py, settings.py, cli.py
   domain.py, settlement.py, edge.py, probability.py, temporal.py, markets.py  (fundamenty TASK 001)
@@ -144,6 +154,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 006](docs/task_006_report.md) | Redesign, Kupon dnia, analiza meczu, pokrycie 12 lig, zakresy modeli, TASK 007 |
 | [Raport TASK 005](docs/task_005_report.md) | Źródła statystyk, Sports Intelligence, modele i kalibracja, kreator kuponów, TASK 006 |
 | [Raport TASK 004](docs/task_004_report.md) | Diagnoza, źródła wyników, aktualizacja, prognozy, analiza dnia, TASK 005 |
 | [Raport TASK 003](docs/task_003_report.md) | STS ONLY, dane, Elo, walidacja, leakage, wyniki |

@@ -6,7 +6,9 @@ from decimal import Decimal
 import pandas as pd
 import streamlit as st
 
+from sports_edge import insights as ins
 from sports_edge.app import common as c
+from sports_edge.app import ui
 from sports_edge.bookmakers import load_profiles
 from sports_edge.paper import (
     MODES,
@@ -19,15 +21,24 @@ from sports_edge.paper import (
     record_result,
     settle_coupon,
 )
-from sports_edge.performance import coupon_performance, selection_outcomes, selection_summary
+from sports_edge.performance import (
+    builder_coupons,
+    coupon_performance,
+    selection_outcomes,
+    selection_summary,
+)
 from sports_edge.repository import offer_days, offer_table
 from sports_edge.services import normalizer, team_aliases, team_identities
 
 
 def history_page() -> None:
     c.setup_page()
-    st.title("Historia i wyniki")
+    ui.app_header("Historia i skuteczność", "Czy propozycje kuponów rzeczywiście trafiają?")
     db = c.store()
+    _overview(db)
+    ui.section(
+        "Szczegóły", "kupony, wyniki, rozliczenia, skuteczność według profilu, CLV i analizy"
+    )
     tabs = st.tabs(
         [
             "Kupony wirtualne",
@@ -221,6 +232,110 @@ def _results(db) -> None:
                 outcome.get("reason", ""),
                 "; ".join(outcome.get("reasons", [])),
             )
+
+
+MIN_FOR_ROI = 30  # fewer settled coupons: ROI is shown only with a clear warning
+OUTCOME = {
+    "win": ("Trafiony", "ok"),
+    "loss": ("Nietrafiony", "bad"),
+    "push": ("Zwrot", "warn"),
+    "void": ("Unieważniony", "warn"),
+}
+
+
+def _overview(db) -> None:
+    coupons = builder_coupons(db)
+    settled = [x for x in coupons if x["outcome"]]
+    decided = [x for x in settled if x["outcome"] in {"win", "loss"}]
+    wins = sum(x["outcome"] == "win" for x in decided)
+    stake = sum((Decimal(x["stake"]) for x in settled), Decimal(0))
+    profit = sum((x["net_profit"] for x in settled), Decimal(0))
+    predicted = [x["proposal"]["probability"]["calibrated"] for x in decided]
+    roi = profit / stake if stake else None
+    ui.section("Podsumowanie", "kupony kreatora (wirtualne)")
+    ui.metric_cards(
+        [
+            ("Zapisane kupony", str(len(coupons)), f"nierozliczone: {len(coupons) - len(settled)}"),
+            ("Rozliczone", str(len(settled)), f"wygrane {wins} · przegrane {len(decided) - wins}"),
+            (
+                "Trafność",
+                ins.pct(wins / len(decided)) if decided else ins.NO_DATA,
+                f"prognozowana średnio {ins.pct(sum(predicted) / len(predicted))}"
+                if predicted
+                else "brak rozliczonych kuponów",
+            ),
+            (
+                "Zysk / strata netto",
+                ins.money(profit) if settled else ins.NO_DATA,
+                "po podatku STS",
+            ),
+            (
+                "ROI",
+                ins.pct(float(roi)) if roi is not None else ins.NO_DATA,
+                f"za mało rozliczeń (n={len(settled)} < {MIN_FOR_ROI}) — wynik przypadkowy"
+                if settled and len(settled) < MIN_FOR_ROI
+                else "zwrot z sumy stawek",
+            ),
+            (
+                "Średni kurs",
+                ins.num(sum(float(x["total_odds"]) for x in coupons) / len(coupons))
+                if coupons
+                else ins.NO_DATA,
+                "wszystkich zapisanych kuponów",
+            ),
+        ]
+    )
+    if not coupons:
+        ui.empty_state(
+            "Brak kuponów w historii",
+            "Kupony kreatora zapisują się automatycznie po analizie w zakładce Kupon dnia i "
+            "rozliczają się po pobraniu wyników.",
+        )
+        return
+    if settled:
+        series, running = [], Decimal(0)
+        for x in sorted(settled, key=lambda x: x["first_start_at"]):
+            running += x["net_profit"]
+            series.append(
+                {"Data": x["first_start_at"][:10], "Wynik narastająco (zł)": float(running)}
+            )
+        ui.section("Skuteczność w czasie")
+        st.line_chart(pd.DataFrame(series).set_index("Data"), height=220)
+    ui.section("Ostatnie kupony")
+    outcomes = {r["odds_id"]: r["outcome"] for r in selection_outcomes(db)}
+    cards = []
+    for coupon in list(reversed(coupons))[:12]:
+        payload = coupon["proposal"]
+        legs = payload["legs"]
+        known = sum(outcomes.get(leg["odds_id"]) is not None for leg in legs)
+        if coupon["outcome"]:
+            label, tone = OUTCOME.get(coupon["outcome"], (coupon["outcome"], "neutral"))
+        elif known:
+            label, tone = (f"Częściowo rozstrzygnięty ({known}/{len(legs)})", "warn")
+        else:
+            label, tone = ("Nierozliczony", "neutral")
+        settlement = (
+            f"zysk netto {ins.money(coupon['net_profit'])}"
+            if coupon["outcome"]
+            else "czeka na wyniki"
+        )
+        cards.append(
+            ui.card(
+                f"<b>{ui.esc(payload.get('label', coupon['profile']))}</b> · "
+                f"{ui.esc(c.local_time(coupon['first_start_at'], '%d.%m.%Y'))}<br>"
+                + ui.pill(label, tone)
+                + ui.key_values(
+                    [
+                        ("Zdarzenia", str(len(legs))),
+                        ("Kurs", ins.num(coupon["total_odds"])),
+                        ("Prognozowana szansa", ins.pct(payload["probability"]["calibrated"])),
+                        ("Rozliczenie", settlement),
+                    ]
+                ),
+                tone="accent" if tone == "ok" else "bad" if tone == "bad" else "",
+            )
+        )
+    ui.card_grid(cards, wide=False)
 
 
 def _pct(value, digits: int = 0) -> str:

@@ -130,13 +130,13 @@ def test_startup_check_reports_configuration(app_paths):
 
 
 PAGES = {
-    "dashboard": "from sports_edge.app.pages_offers import dashboard; dashboard()",
-    "oferta": "from sports_edge.app.pages_offers import offer_page; offer_page()",
-    "analiza": "from sports_edge.app.pages_analysis import analysis_page; analysis_page()",
-    "kupon": "from sports_edge.app.pages_analysis import coupon_page; coupon_page()",
+    "dashboard": "from sports_edge.app.page_dashboard import dashboard_page; dashboard_page()",
+    "kupon": "from sports_edge.app.page_coupon import coupon_page; coupon_page()",
+    "analiza": "from sports_edge.app.page_match import match_page; match_page()",
+    "wydarzenia": "from sports_edge.app.page_events import events_page; events_page()",
     "historia": "from sports_edge.app.pages_history import history_page; history_page()",
-    "modele": "from sports_edge.app.pages_models import models_page; models_page()",
-    "ustawienia": "from sports_edge.app.pages_settings import settings_page; settings_page()",
+    "modele": "from sports_edge.app.page_models import models_page; models_page()",
+    "zrodla": "from sports_edge.app.page_sources import sources_page; sources_page()",
 }
 
 
@@ -160,6 +160,11 @@ def test_streamlit_pages_render(app_paths, demo):
         assert not app.exception, (name, [e.value for e in app.exception])
         if name == "kupon" and demo:
             app.button[0].click().run()
-            assert any("BRAK POTWIERDZONEJ PRZEWAGI" in m.value for m in app.markdown)
+            assert not app.exception, [e.value for e in app.exception]
+            # a coupon card or the explanation why there is none — never a silent page
+            assert any(
+                "Brak kuponu" in m.value or "Zwalidowany" in m.value or "SYMULACJA" in m.value
+                for m in app.markdown
+            )
     if demo:
         assert not app_paths.database.exists()  # DEMO never writes the production database

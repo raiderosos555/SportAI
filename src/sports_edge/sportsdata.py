@@ -17,6 +17,7 @@ from math import sqrt
 
 from sports_edge.analysis.policy import Policy
 from sports_edge.datasources import openfootball
+from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.matching import TeamIdentities, alias_map, match_participant
 from sports_edge.models import calibration
@@ -555,8 +556,8 @@ def predict_offer(
     competitions = tuple(validation["competitions"])
     league_for = {
         sts: code
-        for code, league in openfootball.LEAGUES.items()
-        if code in competitions
+        for code, league in COMPETITIONS.items()
+        if code in competitions and league.sport == "football"
         for sts in league.sts_leagues
     }
     rows = effective_results(

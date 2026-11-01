@@ -11,18 +11,15 @@ from sports_edge.app import common as c
 from sports_edge.bookmakers import load_profiles
 from sports_edge.datasources import openfootball
 from sports_edge.models.registry import model_overview
-from sports_edge.offers.sources import SourceBlocked
 from sports_edge.pdf.engine import ParseError
 from sports_edge.repository import counts, imports, odds_freshness, offer_days, offer_table
 from sports_edge.results_engine import league_freshness
-from sports_edge.services import RESEARCH_COMPETITIONS, fetch_sts_offer, import_pdf_bytes
+from sports_edge.services import RESEARCH_COMPETITIONS, import_pdf_bytes, sts_download
 from sports_edge.sportsdata import coverage
 
 
-def dashboard() -> None:
-    c.setup_page()
-    st.title("Sports Edge AI — STS")
-    st.caption("Analiza oferty STS · prognozy niezależne · paper trading · bez obstawiania")
+def data_diagnostics() -> None:
+    """Technical status of imports, results, models and data quality (diagnostics)."""
     db = c.store()
     settings = c.settings()
     stats = counts(db)
@@ -46,11 +43,10 @@ def dashboard() -> None:
     row2[1].metric("Kandydaci eksperymentalni (ost. analiza)", counts_last.get("experimental", 0))
     row2[2].metric("Selekcje zwalidowane (ost. analiza)", counts_last.get("validated", 0))
     row2[3].metric("Przeanalizowane selekcje (ost. analiza)", summary.get("analysed", 0))
-    c.pills(
-        "🔌 Offline" if settings.offline_mode else "🌐 Sieć tylko na żądanie",
-        "📄 STS: import ręczny"
-        + (" + oficjalny link na żądanie" if settings.sts_download_enabled else ""),
-        "📊 Wyniki: football-data.org + openfootball (CC0)",
+    st.caption(
+        ("Tryb offline" if settings.offline_mode else "Sieć tylko na żądanie")
+        + " · STS: import ręczny"
+        + (" + oficjalny link na żądanie" if settings.sts_download_enabled else "")
     )
     st.subheader("Status źródeł danych")
     last = sts_imports[0] if sts_imports else None
@@ -150,20 +146,24 @@ def _import_box() -> None:
         ):
             disabled = settings.offline_mode or not settings.sts_download_enabled or c.demo_mode()
             if col.button(f"Pobierz: {label}", key=f"fetch_{day}", disabled=disabled):
-                try:
-                    outcome = fetch_sts_offer(c.store(), c.paths(), settings, day, now=c.now())
-                except (SourceBlocked, ParseError) as error:
-                    st.error(str(error))
+                attempt = sts_download(c.store(), c.paths(), settings, day, now=c.now())
+                if attempt["status"] == "new":
+                    st.success(attempt["message"])
+                elif attempt["status"] in {"blocked", "empty"}:
+                    st.error(attempt["message"])
                 else:
-                    st.success(
-                        "Zaimportowano." if not outcome.duplicate else "Bez zmian (duplikat)."
-                    )
+                    st.warning(attempt["message"])
                     st.json(outcome.summary)
 
 
 def offer_page() -> None:
     c.setup_page()
     st.title("Oferta STS")
+    offer_content()
+
+
+def offer_content() -> None:
+    """Offer import, filters, all STS markets with their statuses and price history."""
     _import_box()
     db = c.store()
     days = offer_days(db)
@@ -172,7 +172,9 @@ def offer_page() -> None:
         return
     default = str(c.today_local()) if str(c.today_local()) in days else days[-1]
     cols = st.columns(4)
-    day = cols[0].selectbox("Dzień", days, index=days.index(default))
+    day = cols[0].selectbox(
+        "Dzień", days, index=days.index(default), key="offer_day", format_func=c.day_label
+    )
     rows = offer_table(db, day=day, data_kinds=c.data_kinds())
     sports = sorted({r["sport"] for r in rows})
     sport = cols[1].selectbox("Dyscyplina", ["(wszystkie)", *sports])

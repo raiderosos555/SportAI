@@ -27,6 +27,25 @@ COMPETITIONS: dict[str, Competition] = {
     "pl.1": Competition(
         "pl.1", "football", "Ekstraklasa", "Europe/Warsaw", ("POLSKA - EKSTRAKLASA",)
     ),
+    # TASK 006: leagues with 5-6 seasons of free PitchAPI history and many STS events.
+    "en.2": Competition(
+        "en.2", "football", "Championship", "Europe/London", ("ANGLIA - CHAMPIONSHIP",)
+    ),
+    "nl.1": Competition(
+        "nl.1", "football", "Eredivisie", "Europe/Amsterdam", ("HOLANDIA - EREDIVISIE",)
+    ),
+    "pt.1": Competition(
+        "pt.1", "football", "Liga Portugal", "Europe/Lisbon", ("PORTUGALIA - PRIMEIRA LIGA",)
+    ),
+    "be.1": Competition(
+        "be.1", "football", "Pro League (Belgia)", "Europe/Brussels", ("BELGIA - PRO LEAGUE",)
+    ),
+    "de.2": Competition(
+        "de.2", "football", "2. Bundesliga", "Europe/Berlin", ("NIEMCY - 2. BUNDESLIGA",)
+    ),
+    "tr.1": Competition(
+        "tr.1", "football", "Süper Lig", "Europe/Istanbul", ("TURCJA - SUPER LIG",)
+    ),
     "basketball.nba": Competition(
         "basketball.nba", "basketball", "NBA", "America/New_York", ("USA - NBA",)
     ),

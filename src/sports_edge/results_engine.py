@@ -325,6 +325,76 @@ def update_results(
     return report
 
 
+def backfill_results(
+    store: Store,
+    provider: SportsResultsProvider,
+    competition: str,
+    windows: Sequence[tuple[date, date]],
+    *,
+    now: datetime,
+    normalizer: NameNormalizer,
+    aliases: dict[tuple[str, str], str],
+    raw_dir: Path,
+    identities: TeamIdentities | None = None,
+    progress: Callable[[str], None] | None = None,
+    accept_new_clubs: bool = False,
+) -> dict:
+    """Past seasons of one competition from one legal source (TASK 006).
+
+    Each window (usually one season) is one request batch and goes through the same
+    verification as a regular update: name matching, duplicates, corrections, conflicts and
+    the availability rule. Rows are only added, never changed.
+    """
+    league = COMPETITIONS[competition]
+    report: dict = {
+        "competition": competition,
+        "provider": provider.id,
+        "inserted": 0,
+        "duplicates": 0,
+        "confirmations": 0,
+        "unmatched": [],
+        "conflicts": [],
+        "errors": [],
+        "requests": 0,
+        "windows": [],
+    }
+    for date_from, date_to in windows:
+        if progress:
+            progress(f"{competition}: {provider.name}, {date_from} – {date_to - timedelta(days=1)}")
+        existing = effective_results(
+            store, sport=league.sport, until=now, competitions=(competition,), identities=identities
+        )
+        try:
+            outcome = provider.fetch(competition, date_from, date_to, now=now)
+        except SourceBlocked as error:
+            report["errors"].append(f"{date_from}: {error}")
+            continue
+        report["requests"] += outcome.requests
+        applied = _apply(
+            store,
+            provider,
+            competition,
+            outcome.records,
+            outcome.payloads,
+            existing=existing,
+            sport=league.sport,
+            now=now,
+            normalizer=normalizer,
+            aliases=aliases,
+            raw_dir=raw_dir,
+            accept_new_clubs=accept_new_clubs,
+        )
+        summary = applied["summary"]
+        report["windows"].append(
+            {"from": date_from.isoformat(), "to": date_to.isoformat(), **summary}
+        )
+        for key in ("inserted", "duplicates", "confirmations"):
+            report[key] += summary[key]
+        report["unmatched"].extend(applied["unmatched"])
+        report["conflicts"].extend(applied["conflicts"])
+    return report
+
+
 def _apply(
     store: Store,
     provider: SportsResultsProvider,
@@ -338,11 +408,15 @@ def _apply(
     normalizer: NameNormalizer,
     aliases: dict[tuple[str, str], str],
     raw_dir: Path,
+    accept_new_clubs: bool = False,
 ) -> dict:
     """Verify, map and store one provider response for one competition.
 
     Without any history in the competition (e.g. Ekstraklasa, NBA) the first source's names
-    become the canonical names ("source" confidence); afterwards every name must match them.
+    become the canonical names ("source" confidence). Afterwards the source that defines the
+    competition's names (most rows) may introduce new clubs — promoted teams — with names
+    unlike any known one; every other source must match the names or use a reviewed alias.
+    ``accept_new_clubs`` extends that to a reviewed history import of another source.
     """
     family = source_family(provider)
     body = b"\n".join(data for _url, data in payloads)
@@ -368,6 +442,8 @@ def _apply(
     seen_payload = store.get("data_imports", import_id) is not None
     known = known_names(existing, sport, normalizer)
     bootstrap = not existing
+    owner = Counter(provider_of(r) for r in existing).most_common(1)[0][0] if existing else family
+    introduces = accept_new_clubs or owner == family
     by_match = {(r["match_date"], r["home"], r["away"]): r for r in existing}
     by_source = {
         r["source_event_id"]: r
@@ -394,6 +470,11 @@ def _apply(
         else:
             home = match_participant(record.home, sport, known, normalizer, aliases)
             away = match_participant(record.away, sport, known, normalizer, aliases)
+            if introduces:  # a club unlike every known name is a new club of this source
+                if home.status == "none":
+                    home = ParticipantMatch(record.home, "source", record.home, 1.0)
+                if away.status == "none":
+                    away = ParticipantMatch(record.away, "source", record.away, 1.0)
         if not record.complete:  # postponed / cancelled / suspended: event status only
             if home.status in ACCEPTED and away.status in ACCEPTED:
                 out["status_records"].append(
@@ -537,7 +618,9 @@ def _save_payloads(
     folder.mkdir(parents=True, exist_ok=True)
     names = []
     for index, (_url, data) in enumerate(payloads):
-        path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{code}_{index}.json"
+        # the content hash keeps several responses of one second (season by season) apart
+        short = hashlib.sha256(data).hexdigest()[:10]
+        path = folder / f"{now:%Y-%m-%d_%H-%M-%S}_{code}_{index}_{short}.json"
         path.write_bytes(data)
         names.append(path.name)
     return names

@@ -1,0 +1,593 @@
+"""Analiza meczów: one event in plain language — pre-match picture or post-match review.
+
+Pre-match mode shows only information available when the forecast was made; post-match mode
+adds the result, the outcome of every modelled selection and what the model did not know.
+Information that no model uses (form, statistics, lineups) is labelled as such.
+"""
+
+from collections import defaultdict
+from datetime import datetime
+
+import pandas as pd
+import streamlit as st
+
+from sports_edge import insights as ins
+from sports_edge.app import common as c
+from sports_edge.app import ui
+from sports_edge.repository import offer_days
+from sports_edge.results_engine import SOURCE_LABELS
+from sports_edge.services import (
+    event_context,
+    event_features,
+    event_lineups,
+    match_review,
+    probability_policy,
+)
+from sports_edge.sports_intel import latest_lineups
+
+MODEL_TEXT = {
+    "elo": "Elo — siła drużyn obliczona z wyników meczów",
+    "dixon": "Dixon–Coles — model liczby goli obu drużyn",
+}
+STATUS_TEXT = {"validated_predictive": "zwalidowany", "experimental": "eksperymentalny"}
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=64)
+def _features(_db, version: tuple, event_id: str, decision: datetime):
+    event = _db.get("events", event_id)
+    return event_features(_db, c.paths(), event, decision_time=decision, save=False)
+
+
+def match_page() -> None:
+    c.setup_page()
+    ui.app_header("Analiza meczów", "Prognoza, ryzyko i uzasadnienie dla pojedynczego wydarzenia")
+    db = c.store()
+    days = offer_days(db)
+    if not days:
+        ui.empty_state("Brak oferty STS", "Zaimportuj ofertę STS, aby analizować mecze.")
+        return
+    top = st.columns([2, 1, 1])
+    with top[0]:
+        day = c.offer_day_choice(days, key="match_day")
+    only_model = top[1].toggle("Tylko z prognozą", value=True, key="match_only_model")
+    show_done = top[2].toggle("Pokaż rozpoczęte", value=False, key="match_done")
+    _report, candidates = c.day_candidates(day)
+    events = defaultdict(list)
+    for x in candidates:
+        events[x.event_id].append(x)
+    # a started match keeps the forecast made before kick-off, even by an older model version
+    marks = ",".join("?" for _ in events)
+    forecast_any = (
+        {
+            r["event_id"]
+            for r in db.rows(
+                f"SELECT DISTINCT event_id FROM predictions WHERE event_id IN ({marks})",
+                tuple(events),
+            )
+        }
+        if events
+        else set()
+    )
+    shown = [
+        eid
+        for eid, rows in events.items()
+        if (show_done or rows[0].event_status == "before_start")
+        and (
+            not only_model
+            or any(r.p_model is not None for r in rows)
+            or (rows[0].event_status != "before_start" and eid in forecast_any)
+        )
+    ]
+    if not shown:
+        ui.empty_state(
+            "Brak meczów spełniających filtry",
+            "Wyłącz filtr „Tylko z prognozą” albo włącz „Pokaż rozpoczęte”.",
+        )
+        return
+    shown.sort(key=lambda eid: events[eid][0].start_at or "")
+    choice = st.selectbox(
+        "Wydarzenie",
+        shown,
+        format_func=lambda eid: (
+            f"{c.local_time(events[eid][0].start_at, '%H:%M')} · "
+            f"{events[eid][0].event} ({events[eid][0].league})"
+        ),
+        key="match_event",
+    )
+    rows = events[choice]
+    head = rows[0]
+    now = c.now()
+    context = event_context(db, c.paths(), event_id=choice, now=now)
+    review = match_review(db, event_id=choice, candidates=rows, now=now)
+    started = review["started"]
+    start = datetime.fromisoformat(head.start_at) if head.start_at else now
+    decision = min(now, start).replace(second=0, microsecond=0)
+    features = _features(db, c.data_version(db), choice, decision)
+    teams = (features or {}).get("features", {}).get("teams", {})
+    max_odds = float(probability_policy(c.paths()).builder["max_odds_per_leg"])
+    _header(head, context, rows, started, review)
+    if started:
+        _post_match(review, head)
+    ui.section("Ocena modelu", "przed meczem" if not started else "prognoza sprzed rozpoczęcia")
+    _outlook(rows, context, head, review)
+    ui.section("Najbardziej prawdopodobny obsługiwany typ")
+    _pick(rows, now, max_odds, started)
+    ui.section("Dlaczego model tak ocenia ten mecz?")
+    _why(rows, context, teams, review.get("forecast") if started else None)
+    tabs = st.tabs(
+        [
+            "Forma",
+            "Statystyki",
+            "Składy i absencje",
+            "Wszystkie rynki i kursy",
+            "Modele i kalibracja",
+            "Dane techniczne",
+        ]
+    )
+    with tabs[0]:
+        _form(context, teams, started)
+    with tabs[1]:
+        _stats(teams, head)
+    with tabs[2]:
+        _lineups(db, context, choice, now, started)
+    with tabs[3]:
+        _markets(rows)
+    with tabs[4]:
+        _models(rows, context)
+    with tabs[5]:
+        st.json(
+            {
+                "kontekst": {k: v for k, v in context.items() if k != "event"},
+                "cechy": features,
+                "selekcje": [x.explanation for x in rows[:12]],
+            },
+            expanded=False,
+        )
+
+
+# ---------------------------------------------------------------- header and modes
+
+
+def _header(head, context, rows, started, review) -> None:
+    status = c.EVENT_STATUS.get(head.event_status, head.event_status)
+    has_forecast = any(r.p_model is not None for r in rows)
+    badges = [ui.pill(status.capitalize(), c.EVENT_TONE.get(head.event_status, "neutral"))]
+    if started:
+        badges.append(
+            ui.pill("Prognoza sprzed meczu zapisana", "ok")
+            if review.get("forecast")
+            else ui.pill("Brak prognozy sprzed meczu", "neutral")
+        )
+    else:
+        badges.append(
+            ui.pill("Prognoza modelu dostępna", "ok")
+            if has_forecast
+            else ui.pill("Brak prognozy modelu", "neutral")
+        )
+    badges.append(
+        ui.pill("Oferta STS potwierdzona", "ok")
+        if head.freshness == "fresh"
+        else ui.pill(
+            "Kurs niepotwierdzony"
+            + (f" ({ins.num(head.odds_age_hours, 1)} h)" if head.odds_age_hours else ""),
+            "warn",
+        )
+    )
+    badges.append(
+        ui.pill("Tryb analizy po meczu", "info")
+        if started
+        else ui.pill("Tryb przedmeczowy", "info")
+    )
+    st.markdown(
+        ui.card(
+            f'<div class="se-match"><div class="teams" style="font-size:1.45rem">'
+            f"{ui.esc(head.event.upper())}</div>"
+            f'<div class="meta">{ui.esc(c.local_time(head.start_at, "%d.%m.%Y · %H:%M"))} · '
+            f"{ui.esc(head.league)} · {ui.esc(head.sport)}</div>" + "".join(badges) + "</div>",
+            tone="accent",
+        ),
+        unsafe_allow_html=True,
+    )
+    if not context.get("competition"):
+        st.caption("Ta liga nie ma legalnego źródła wyników w aplikacji — brak modelu.")
+
+
+def _post_match(review: dict, head) -> None:
+    ui.section("Prognoza a wynik")
+    result = review.get("result")
+    if not review.get("finished"):
+        ui.empty_state(
+            "Mecz rozpoczęty — brak potwierdzonego wyniku",
+            "Wynik pojawi się po aktualizacji danych sportowych. Prognoza sprzed meczu nie zmienia się.",
+        )
+        return
+    forecast = review.get("forecast")
+    names = {"home": "gospodarze", "draw": "remis", "away": "goście"}
+    points = [
+        f"Wynik końcowy: {head.event} {result['home_score']}:{result['away_score']}"
+        + (
+            f" (do przerwy {result['ht_home']}:{result['ht_away']})"
+            if result.get("ht_home") is not None
+            else ""
+        )
+    ]
+    if forecast:
+        points.append(
+            f"Prognoza z {c.local_time(forecast['created_at'], '%d.%m %H:%M')} wskazywała: "
+            f"{names[review['favourite']]} ({ins.pct(forecast['probabilities'][review['favourite']])})"
+            + (" — trafiona." if review["favourite_hit"] else " — nietrafiona.")
+        )
+    else:
+        points.append("Przed meczem nie było prognozy modelu.")
+    ui.explanation(
+        "Rozliczenie prognozy", points, tone="accent" if review.get("favourite_hit") else "warn"
+    )
+    if review["selections"]:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Typ": ins.pick_label(
+                            s["market_key"], s["line"], s["selection"], head.event, s["market"]
+                        ),
+                        "Szansa przed meczem": round(s["p"] * 100, 1),
+                        "Kurs": float(s["odds"]) if s["odds"] is not None else None,
+                        "Wynik": {"win": "wygrana", "loss": "przegrana"}.get(
+                            s["outcome"], s["outcome"] or "do rozliczenia ręcznego"
+                        ),
+                    }
+                    for s in review["selections"]
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Szansa przed meczem": st.column_config.ProgressColumn(
+                    format="%.1f%%", min_value=0, max_value=100
+                )
+            },
+        )
+    ui.explanation("Czego model nie wiedział przed meczem", review["unknown_before"])
+
+
+def _outlook(rows, context, head, review) -> None:
+    probs = {
+        r.selection: r.p_model
+        for r in rows
+        if r.market_key == "1x2" and r.period == "FT" and r.p_model is not None
+    }
+    original = review.get("forecast") if review.get("started") else None
+    if original:  # after kick-off: exactly the forecast made before the match
+        probs = original["probabilities"]
+    elif len(probs) < 3 and context.get("prediction"):
+        probs = context["prediction"]["probabilities"]
+    home, away = (head.event.split(" - ", 1) + [""])[:2]
+    view = ins.outlook(probs if len(probs) == 3 else None, home, away)
+    if view is None:
+        ui.empty_state(
+            "Brak prognozy 1X2",
+            "Model nie przygotował prognozy (liga bez danych, nieaktualne dane, za krótka "
+            "historia drużyny albo mecz już się rozpoczął).",
+        )
+        return
+    model = (original or {}).get("family") or next(
+        (r.model for r in rows if r.market_key == "1x2" and r.model), ""
+    )
+    body = (
+        f"<b>{ui.esc(ins.sentence(view['character']))}</b>"
+        + ui.probability_bars(
+            [
+                (f"{home} wygrywa", view["home"], ins.pct(view["home"])),
+                ("Remis", view["draw"], ins.pct(view["draw"])),
+                (f"{away} wygrywa", view["away"], ins.pct(view["away"])),
+            ]
+        )
+        + f"<div style='color:#94A3B8;font-size:.82rem'>Model: "
+        f"{ui.esc(_model_text(model))}</div>"
+    )
+    st.markdown(ui.card(body), unsafe_allow_html=True)
+
+
+def _model_text(model: str) -> str:
+    key = "elo" if model.startswith("elo") else "dixon" if "dixon" in model else ""
+    return MODEL_TEXT.get(key, model or "brak")
+
+
+def _pick(rows, now, max_odds, started) -> None:
+    pick = ins.best_pick(rows, now=now, max_odds=max_odds) if not started else None
+    if pick is None:
+        ui.empty_state(
+            "Brak wystarczająco wiarygodnego typu dla tego meczu",
+            "Żaden obsługiwany rynek nie ma ostrożnie oszacowanej szansy co najmniej 55% przy "
+            "kursie, który po współczynniku 0,88 zwraca stawkę."
+            if not started
+            else "Mecz już się rozpoczął — nie jest kandydatem do kuponu.",
+        )
+        return
+    x = pick["candidate"]
+    qualifies = (
+        ("Kwalifikuje się do kuponu", "ok")
+        if pick["eligible"]
+        else ("Tylko symulacja (model eksperymentalny)", "warn")
+        if pick["experimental"]
+        else (f"Poza kuponem: {pick['why_not']}", "warn")
+    )
+    st.markdown(
+        ui.match_card(
+            teams=ins.candidate_pick(x),
+            meta=f"{x.market_label} · kurs STS {ins.num(x.odds)} · nr zakładu {x.offer_code or '—'}",
+            pick="Szansa trafienia",
+            market="skalibrowana; obok wersja ostrożna",
+            probability=ins.pct(x.p_model),
+            conservative=ins.pct(x.p_low),
+            odds=ins.num(x.odds),
+            badges=[ui.RISK[pick["reliability"]], qualifies],
+            note="; ".join(pick["reliability_reasons"]),
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _why(rows, context, teams, original=None) -> None:
+    prediction = original or context.get("prediction") or {}
+    inputs = prediction.get("inputs") or {}
+    used = []
+    games = inputs.get("games") or []
+    counted = (
+        f" ({ins.plural(games[0], 'mecz', 'mecze', 'meczów')} i "
+        f"{ins.plural(games[1], 'mecz', 'mecze', 'meczów')})"
+        if len(games) == 2
+        else ""
+    )
+    one_x_two = str(prediction.get("family") or "")
+    if one_x_two.startswith("elo"):
+        used.append(
+            "Wynik 1X2 i podwójna szansa: siła obu drużyn (Elo) obliczona z wyników ich meczów"
+            + counted
+            + ", z przewagą własnego boiska."
+        )
+    if any(r.model and "dixon" in r.model for r in rows if r.p_model is not None):
+        used.append(
+            "Model goli (Dixon–Coles): średnie gole zdobyte i stracone obu drużyn z ostatnich "
+            "2 lat, starsze mecze ważą mniej"
+            + ("" if one_x_two.startswith("elo") else counted)
+            + " — z nich szanse liczby goli i BTTS"
+            + ("." if one_x_two.startswith("elo") else ", a w tej lidze także 1X2.")
+        )
+    if used:
+        used.append(
+            "Prawdopodobieństwa skalibrowane na meczach z sezonów 2022–2024 (sprawdzone na "
+            "późniejszych meczach)."
+        )
+    fresh = context.get("freshness") or {}
+    if fresh:
+        used.append(
+            f"Wyniki ligi do {fresh.get('last_result')} (źródła: "
+            + ", ".join(SOURCE_LABELS.get(p, p) for p in fresh.get("providers", {}))
+            + ")."
+        )
+    extra = []
+    for side, label in (("home", "Gospodarze"), ("away", "Goście")):
+        for point in ins.form_points(teams.get(side)):
+            extra.append(f"{label}: {point}")
+    extra.append("Składy, kontuzje i statystyki meczowe nie wpływają na prognozę.")
+    left, right = st.columns(2, gap="medium")
+    with left:
+        ui.explanation(
+            "Dane wykorzystane przez model",
+            used or ["Brak modelu dla tego wydarzenia."],
+            tone="accent",
+        )
+    with right:
+        ui.explanation("Dodatkowe informacje o meczu (poza modelem)", extra)
+
+
+# ---------------------------------------------------------------- tabs
+
+
+def _form(context, teams, started) -> None:
+    if not context.get("teams"):
+        st.caption("Brak niezależnych wyników dla tej ligi.")
+        return
+    cols = st.columns(2, gap="medium")
+    for col, side in zip(cols, ("home", "away"), strict=True):
+        team = context["teams"][side]
+        with col:
+            if not team["canonical"]:
+                st.warning(
+                    f"{team['sts']}: brak zweryfikowanego dopasowania nazwy — wyników nie zgadujemy."
+                )
+                continue
+            st.markdown(
+                f"**{team['sts']}** · {ins.plural(team['games'], 'mecz', 'mecze', 'meczów')} w danych"
+            )
+            for point in ins.form_points(teams.get(side)):
+                st.caption(point)
+            matches = [m for m in team["matches"] if started or m["known_before_forecast"]]
+            if not matches:
+                st.caption("Brak meczów znanych przed prognozą.")
+                continue
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Data": m["date"],
+                            "Mecz": m.get("match") or m["score"],
+                            "Miejsce": m["venue"],
+                            "Wynik drużyny": m.get("team_score", ""),
+                            "W/R/P": m["result"],
+                            "Przed prognozą": "tak" if m["known_before_forecast"] else "nie",
+                        }
+                        for m in matches
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+    st.caption(
+        "W/R/P oraz „Wynik drużyny” są liczone z perspektywy danej drużyny (jej gole : gole "
+        "rywala); kolumna „Mecz” pokazuje wynik w kolejności gospodarze – goście."
+    )
+
+
+def _stats(teams, head) -> None:
+    home, away = teams.get("home") or {}, teams.get("away") or {}
+    if not home and not away:
+        st.caption("Brak danych o drużynach tego meczu.")
+        return
+    names = (home.get("team") or "Gospodarze", away.get("team") or "Goście")
+    rows = []
+    for label, key, field, digits in (
+        ("Punkty na mecz (5)", "form5", "points_per_game", 2),
+        ("Gole zdobyte (5)", "form5", "goals_for", 2),
+        ("Gole stracone (5)", "form5", "goals_against", 2),
+        ("Punkty na mecz (10)", "form10", "points_per_game", 2),
+    ):
+        a = (home.get(key) or {}).get(field)
+        b = (away.get(key) or {}).get(field)
+        n = ((home.get(key) or {}).get("matches"), (away.get(key) or {}).get("matches"))
+        rows.append(
+            (
+                label,
+                ins.num(a, digits),
+                ins.num(b, digits),
+                a,
+                b,
+                f"mecze: {n[0] or 0} / {n[1] or 0}",
+            )
+        )
+    keys = sorted(set(home.get("stats5") or {}) | set(away.get("stats5") or {}))
+    for key in keys:
+        a = (home.get("stats5") or {}).get(key)
+        b = (away.get("stats5") or {}).get(key)
+        label = (a or b)["label"]
+        rows.append(
+            (
+                f"{label} (średnio)",
+                ins.num(a["for"]) if a else ins.NO_DATA,
+                ins.num(b["for"]) if b else ins.NO_DATA,
+                a["for"] if a else None,
+                b["for"] if b else None,
+                f"dane z {a['matches'] if a else 0} / {b['matches'] if b else 0} meczów",
+            )
+        )
+    st.markdown(
+        ui.card(
+            f"<div style='display:flex;justify-content:space-between'><b>{ui.esc(names[0])}</b>"
+            f"<b>{ui.esc(names[1])}</b></div>" + ui.comparison_rows(rows)
+        ),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Średnie z ostatnich meczów znanych przed chwilą prognozy. Przy 1–2 meczach średnia nie "
+        "jest reprezentatywna. Statystyki meczowe (xG, strzały) są tylko informacją — modele "
+        "ich nie używają."
+    )
+
+
+def _lineups(db, context, event_id, now, started) -> None:
+    teams = context.get("teams") or {}
+    names = [teams[s]["canonical"] for s in ("home", "away")] if teams else []
+    stored = None
+    if names and all(names):
+        stored = latest_lineups(
+            db, home=names[0], away=names[1], day=context["event"]["start_at"][:10]
+        )
+    if not started and st.button(
+        "Sprawdź składy (PitchAPI, 2 zapytania)", key=f"lineups_{event_id}"
+    ):
+        out = event_lineups(db, c.paths(), c.settings(), event_id=event_id, now=now)
+        if out["status"] == "ok":
+            stored = {"lineups": out["lineups"], "observed_at": out["observed_at"]}
+        else:
+            st.info(out["status"])
+    if stored:
+        observed = datetime.fromisoformat(stored["observed_at"])
+        start = datetime.fromisoformat(context["event"]["start_at"])
+        cols = st.columns(2)
+        for col, side in zip(cols, ("home", "away"), strict=True):
+            part = stored["lineups"][side]
+            with col:
+                st.markdown(
+                    f"**{part['team']}** · {part['formation'] or '—'} · "
+                    + ("potwierdzony" if part["confirmed"] else "przewidywany")
+                )
+                st.write(", ".join(p["name"] or "?" for p in part["starters"]) or ins.NO_DATA)
+        st.caption(
+            f"Obserwacja z {c.local_time(stored['observed_at'])}"
+            + (" — po rozpoczęciu meczu (informacja pomeczowa)" if observed >= start else "")
+        )
+    else:
+        st.caption("Składy są publikowane zwykle około godziny przed meczem.")
+    st.caption(
+        "Kontuzje i zawieszenia: brak bezpłatnego, zweryfikowanego źródła. Modele nie uwzględniają "
+        "składów ani absencji."
+    )
+
+
+def _markets(rows) -> None:
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Rynek": x.market_label,
+                    "Typ": ins.selection_label(x.selection),
+                    "Kurs": float(x.odds),
+                    "Nr zakładu": x.offer_code or "",
+                    "Szansa (model)": round(x.p_model * 100, 1) if x.p_model is not None else None,
+                    "Ostrożnie": round(x.p_low * 100, 1) if x.p_low is not None else None,
+                    "Rynek bez marży": round(x.p_market * 100, 1)
+                    if x.p_market is not None
+                    else None,
+                    "Kurs STS": "potwierdzony" if x.freshness == "fresh" else "niepotwierdzony",
+                }
+                for x in sorted(rows, key=lambda x: (x.market_label, x.selection))
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+        height=420,
+        column_config={
+            "Szansa (model)": st.column_config.NumberColumn(format="%.1f%%"),
+            "Ostrożnie": st.column_config.NumberColumn(format="%.1f%%"),
+            "Rynek bez marży": st.column_config.NumberColumn(format="%.1f%%"),
+            "Kurs": st.column_config.NumberColumn(format="%.2f"),
+        },
+    )
+    st.caption("Brak wartości oznacza brak danych (model nie liczy tego rynku), a nie zero.")
+
+
+def _models(rows, context) -> None:
+    modelled = [x for x in rows if x.p_model is not None]
+    if not modelled:
+        st.caption("Brak prognoz modelu dla tego meczu.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Rynek": x.market_label,
+                    "Typ": ins.selection_label(x.selection),
+                    "Model": _model_text(x.model or ""),
+                    "Walidacja predykcyjna": STATUS_TEXT.get(
+                        x.predictive_status, x.predictive_status
+                    ),
+                    "Kalibracja (holdout)": x.calibration,
+                }
+                for x in modelled
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    prediction = context.get("prediction")
+    if prediction:
+        st.caption(
+            f"Wersja modelu 1X2: {prediction['family']} {prediction['version']} · prognoza z "
+            f"{c.local_time(prediction['created_at'])} · dane: "
+            f"{(prediction.get('inputs') or {}).get('data', '')}"
+        )
+    st.caption(
+        "Status „zwalidowany” dotyczy trafności i kalibracji na nowych meczach, nie przewagi "
+        "nad kursami STS."
+    )

@@ -44,6 +44,13 @@ LEAGUES = {
     "it.1": "l_0ALvwF",
     "fr.1": "l_3FJFUl",
     "pl.1": "l_214sqK",
+    # TASK 006 (seasons verified in /v1/leagues on 01.11.2026)
+    "en.2": "l_4DWyTT",  # Championship 2021/22-2026/27
+    "nl.1": "l_4H43wr",  # Eredivisie 2021/22-2026/27
+    "pt.1": "l_4QexZg",  # Liga Portugal 2021/22-2026/27
+    "be.1": "l_2L6d1F",  # First Division A 2021/22-2026/27
+    "de.2": "l_3hvsne",  # 2. Bundesliga 2021/22-2026/27
+    "tr.1": "l_0S1uaf",  # Super Lig 2022/23-2026/27
 }
 STATUS = {
     "finished": "finished",

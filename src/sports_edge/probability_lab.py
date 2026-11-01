@@ -17,6 +17,7 @@ import tomllib
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 
 from sports_edge.analysis.policy import Policy
@@ -371,6 +372,16 @@ def run_probability_experiment(
         "data_until": iso(max(datetime.fromisoformat(r["available_at"]) for r in rows)),
         "providers": sorted({r["provider_resolved"] for r in rows}, key=priority),
     }
+    report["by_league"] = _league_gates(
+        rows,
+        split,
+        hold,
+        rows_by_id,
+        calibrators,
+        elo_forecasts or {},
+        competitions,
+        min_n=int(probability_policy.validation["min_holdout_n"]),
+    )
     if register:
         version = f"dc-goals-{'-'.join(competitions)}-{now:%Y%m%d%H%M}"
         version_id, status, reasons = register_version(
@@ -392,6 +403,114 @@ def run_probability_experiment(
         )
         report.update(version_id=version_id, status=status, status_reasons=reasons)
     return report
+
+
+def pair_dependence(picks: list[tuple[str, str, float, int]], *, same_league: bool) -> dict:
+    """Do two selections of the same day win together as often as their separate hit rates
+    say? ``picks``: (day, competition, forecast, hit). The ratio of the joint hit rate to the
+    product of the separate hit rates is ~1 for independent matches; the product of forecasts
+    is reported too (it also contains the calibration error of the forecasts)."""
+    by_day: dict[str, list[tuple[str, float, int]]] = defaultdict(list)
+    for day, competition, p, hit in picks:
+        by_day[day].append((competition, p, hit))
+    n = both = first = second = 0
+    forecast = 0.0
+    for items in by_day.values():
+        for (c1, p1, y1), (c2, p2, y2) in combinations(items, 2):
+            if (c1 == c2) != same_league:
+                continue
+            n += 1
+            both += y1 * y2
+            first += y1
+            second += y2
+            forecast += p1 * p2
+    if not n:
+        return {"pairs": 0}
+    separate = (first / n) * (second / n)
+    low, high = calibration.wilson_interval(both, n)
+    return {
+        "pairs": n,
+        "joint": round(both / n, 4),
+        "joint_ci95": [round(low, 4), round(high, 4)],
+        "separate_product": round(separate, 4),
+        "forecast_product": round(forecast / n, 4),
+        "ratio": round(both / n / separate, 3) if separate else None,
+    }
+
+
+def league_gate(
+    pairs: list[tuple[float, int]], events_per_item: int, baseline: float | None, *, min_n: int
+) -> dict:
+    """Extra check of one market family in one league on the holdout (TASK 006).
+
+    It adds to the pooled predictive validation and never replaces it: enough forecasts of
+    this league and log loss below the league's own base rates. Overconfident ranges are
+    reported per league but decided on the pooled sample (one range test per league and
+    family would fail well-calibrated leagues by chance). A league that fails keeps its
+    forecasts experimental.
+    """
+    metrics = _binary_metrics(pairs, events_per_item)
+    side = [(p, y) for p, y in pairs if p >= 0.5]
+    ranges = calibration.bin_report([p for p, _ in side], [y for _, y in side], BIN_EDGES)
+    reasons = []
+    if metrics.get("n", 0) < min_n:
+        reasons.append(f"za mało prognoz w holdoucie ligi: {metrics.get('n', 0)} < {min_n}")
+    if baseline is None or metrics.get("log_loss", 9.0) >= baseline:
+        reasons.append("nie lepszy od częstości bazowej tej ligi")
+    return {
+        "n": metrics.get("n", 0),
+        "log_loss": metrics.get("log_loss"),
+        "baseline_log_loss": baseline,
+        "ece": metrics.get("ece"),
+        "ok": not reasons,
+        "reasons": reasons,
+        "overconfident_ranges": [r["range"] for r in ranges if r["overconfident"]],
+    }
+
+
+def _league_gates(
+    rows, split, hold, rows_by_id, calibrators, elo_forecasts, competitions, *, min_n
+) -> dict:
+    out: dict[str, dict] = {}
+    for code in competitions:
+        ids = [k for k in hold if rows_by_id[k]["competition"] == code]
+        if not ids:
+            continue
+        subset = {k: hold[k] for k in ids}
+        entry: dict[str, dict] = {"dc": {}, "elo": {}}
+        for family in ("1x2", *BINARY_FAMILIES):
+            events = 3 if family in ("1x2", "double_chance") else 2
+            pairs = [
+                (_calibrate(calibrators[family], p), y)
+                for p, y in _items(rows_by_id, subset, family)
+            ]
+            base = _baseline(rows, split, family, subset, rows_by_id)
+            entry["dc"][family] = league_gate(pairs, events, base, min_n=min_n)
+        elo = {
+            k: {
+                ("1x2", None): elo_forecasts[k],
+                ("double_chance", None): _double_chance(elo_forecasts[k]),
+            }
+            for k in ids
+            if k in elo_forecasts
+        }
+        if elo:
+            for family in ("1x2", "double_chance"):
+                base = _baseline(rows, split, family, elo, rows_by_id)
+                entry["elo"][family] = league_gate(
+                    _items(rows_by_id, elo, family), 3, base, min_n=min_n
+                )
+        out[code] = entry
+    return out
+
+
+def league_status(validation: dict, competition: str | None, model: str, family: str) -> dict:
+    """Per-league gate of a family (``model``: "dc" or "elo"); {} when not evaluated."""
+    if not competition:
+        return {}
+    return (((validation.get("by_league") or {}).get(competition) or {}).get(model) or {}).get(
+        family
+    ) or {}
 
 
 def _double_chance(probs: dict[str, float]) -> dict[str, float]:
@@ -576,17 +695,13 @@ def predict_offer_goals(
             if market_key == "1x2":
                 total = sum(calibrated.values())
                 calibrated = {k: v / total for k, v in calibrated.items()}
-            status = (
-                (predictive.get(family) or {}).get("status", "experimental")
-                if family
-                else "experimental"
-            )
+            status = _served_status(predictive, validation, competition, family)
             derived = {}
             if market_key == "1x2":
                 derived["double_chance"] = _calibrated_sides(
                     priced[("double_chance", None)],
                     calibrators.get("double_chance"),
-                    (predictive.get("double_chance") or {}).get("status", "experimental"),
+                    _served_status(predictive, validation, competition, "double_chance"),
                 )
             save_prediction(
                 store,
@@ -626,6 +741,15 @@ def predict_offer_goals(
             )
             saved += 1
     return {"saved": saved, "kept": kept, "skipped": skipped}
+
+
+def _served_status(predictive: dict, validation: dict, competition: str, family) -> str:
+    """Pooled predictive status, downgraded when the league fails its own holdout gate."""
+    if not family:
+        return "experimental"
+    status = (predictive.get(family) or {}).get("status", "experimental")
+    gate = league_status(validation, competition, "dc", family)
+    return "experimental" if gate and not gate["ok"] else status
 
 
 def _calibrated_sides(probs: dict[str, float], blocks, status: str) -> dict:

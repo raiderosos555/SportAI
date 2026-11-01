@@ -440,7 +440,7 @@ def _version(store, family: str, version: str, when: datetime, validation: dict 
         version=version,
         created_at=when,
         trained_through=when,
-        training_data={},
+        training_data={"competitions": ["es.1"]},  # a version belongs to a model scope
         validation=validation or {},
         policy=Policy(),
     )

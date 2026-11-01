@@ -16,53 +16,51 @@ from sports_edge.storage import Store
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 FRESHNESS = {
-    "fresh": "🟢 świeża migawka",
-    "unconfirmed": "🟠 kurs niepotwierdzony",
-    "unknown": "⚪ nieznany czas obserwacji",
+    "fresh": "potwierdzony",
+    "unconfirmed": "niepotwierdzony",
+    "unknown": "nieznany czas obserwacji",
 }
 EVENT_STATUS = {
-    "before_start": "⏳ przed rozpoczęciem",
-    "in_play": "▶ w trakcie",
-    "finished": "🏁 zakończone",
-    "postponed": "↪ przełożone",
-    "cancelled": "✖ anulowane",
-    "unknown": "❔ nieznany",
+    "before_start": "przed rozpoczęciem",
+    "in_play": "w trakcie",
+    "finished": "zakończony",
+    "postponed": "przełożony",
+    "cancelled": "odwołany",
+    "unknown": "status nieznany",
+}
+EVENT_TONE = {
+    "before_start": "info",
+    "in_play": "warn",
+    "finished": "neutral",
+    "postponed": "warn",
+    "cancelled": "bad",
+    "unknown": "neutral",
 }
 PRESENCE = {
     "current": "potwierdzony w najnowszej ofercie",
-    "withdrawn": "⛔ wycofany",
-    "unconfirmed": "❔ niepotwierdzony",
+    "withdrawn": "wycofany",
+    "unconfirmed": "niepotwierdzony",
 }
 __all__ = ["MARKETS", "PERIODS", "SELECTIONS", "market_label"]
 TIERS = {
-    "validated": "✅ zwalidowany",
-    "experimental": "🧪 eksperymentalny",
+    "validated": "zwalidowany",
+    "experimental": "eksperymentalny",
     "rejected": "odrzucony",
 }
 
-CSS = """
-<style>
-:root { --se-accent: #22c55e; --se-warn: #f59e0b; --se-bad: #ef4444; --se-card: #111a2e; }
-.block-container { padding-top: 1.6rem; max-width: 1500px; }
-div[data-testid="stMetric"] { background: var(--se-card); border: 1px solid #1f2a44;
-  border-radius: 12px; padding: 12px 16px; }
-.se-banner { border-radius: 12px; padding: 16px 20px; margin: 8px 0 16px 0; font-weight: 600; }
-.se-noedge { background: #1f1220; border: 1px solid #7f1d1d; color: #fecaca; font-size: 1.25rem; }
-.se-demo { background: #2a1f05; border: 1px solid #a16207; color: #fde68a; }
-.se-info { background: #0f1f33; border: 1px solid #1e3a5f; color: #bfdbfe; }
-.se-ok { background: #0c2416; border: 1px solid #166534; color: #bbf7d0; }
-.se-pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.8rem;
-  margin-right: 6px; border: 1px solid #334155; background: #0f172a; }
-</style>
-"""
-
 
 def banner(text: str, kind: str = "info") -> None:
-    st.markdown(f'<div class="se-banner se-{kind}">{text}</div>', unsafe_allow_html=True)
+    """Highlighted message in the design system (status colour only when it means something)."""
+    from sports_edge.app import ui
+
+    tone = {"noedge": "bad", "ok": "accent", "demo": "warn"}.get(kind, "")
+    st.markdown(ui.card(f"<b>{ui.esc(text)}</b>", tone=tone), unsafe_allow_html=True)
 
 
 def pills(*items: str) -> None:
-    st.markdown("".join(f'<span class="se-pill">{i}</span>' for i in items), unsafe_allow_html=True)
+    from sports_edge.app import ui
+
+    ui.pills([(item, "neutral") for item in items])
 
 
 def now() -> datetime:
@@ -128,14 +126,102 @@ def load_demo_data() -> dict:
 
 
 def setup_page() -> None:
-    st.markdown(CSS, unsafe_allow_html=True)
-    st.sidebar.caption(f"Wyniki bieżącego sezonu: {ATTRIBUTION}.")
+    from sports_edge.app import ui
+
+    ui.inject()
+    st.sidebar.caption(f"Wyniki bieżącego sezonu: {ATTRIBUTION}.")  # required attribution
     if demo_mode():
-        banner(
-            "TRYB DEMO — dane syntetyczne z fikcyjnymi drużynami i kursami. "
-            "To nie jest oferta STS i nie wolno jej analizować jak danych rzeczywistych.",
-            "demo",
+        ui.empty_state(
+            "Tryb DEMO",
+            "Dane syntetyczne z fikcyjnymi drużynami i kursami. To nie jest oferta STS i nie "
+            "wolno jej analizować jak danych rzeczywistych.",
+            tone="warn",
         )
+
+
+# ---------------------------------------------------------------- caching (TASK 006)
+
+
+def data_version(db: Store) -> tuple:
+    """Cheap fingerprint of the database: cached views are rebuilt when any data changes."""
+    return tuple(
+        db.scalar(sql) or ""
+        for sql in (
+            "SELECT MAX(ingested_at) FROM imports",
+            "SELECT MAX(observed_at) FROM historical_results",
+            "SELECT MAX(created_at) FROM predictions",
+            "SELECT COUNT(*) FROM coupons",
+            "SELECT COUNT(*) FROM settlements",
+            "SELECT COUNT(*) FROM results",
+            "SELECT MAX(created_at) FROM model_versions",
+            "SELECT COUNT(*) FROM stat_observations",
+        )
+    )
+
+
+def minute() -> datetime:
+    """Current time rounded down to the minute (one cache entry per minute)."""
+    return now().replace(second=0, microsecond=0)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=64)
+def cached_day(_db: Store, version: tuple, day: str, at: datetime, kinds: tuple[str, ...]):
+    from sports_edge.services import analyse_day
+
+    return analyse_day(_db, paths(), settings(), day, now=at, data_kinds=kinds)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=16)
+def cached_freshness(_db: Store, version: tuple, at: datetime) -> list[dict]:
+    from sports_edge.results_engine import league_freshness
+    from sports_edge.services import RESEARCH_COMPETITIONS
+
+    return league_freshness(_db, RESEARCH_COMPETITIONS, now=at)
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=16)
+def cached_coverage(_db: Store, version: tuple, days: tuple[str, ...], at: datetime) -> dict:
+    from sports_edge.coverage import coverage_report
+
+    return coverage_report(_db, paths(), settings(), list(days), now=at, data_kinds=data_kinds())
+
+
+def day_candidates(day: str):
+    """(report, candidates) of an offer day — cached per minute and database state."""
+    db = store()
+    return cached_day(db, data_version(db), day, minute(), data_kinds())
+
+
+def offer_day_choice(days: list[str], label: str = "Dzień", key: str | None = None) -> str:
+    today = str(today_local())
+    future = [d for d in days if d >= today]
+    default = today if today in days else (future[0] if future else days[-1])
+    return st.selectbox(label, days, index=days.index(default), key=key, format_func=day_label)
+
+
+WEEKDAYS = ("poniedziałek", "wtorek", "środa", "czwartek", "piątek", "sobota", "niedziela")
+MONTHS = (
+    "stycznia",
+    "lutego",
+    "marca",
+    "kwietnia",
+    "maja",
+    "czerwca",
+    "lipca",
+    "sierpnia",
+    "września",
+    "października",
+    "listopada",
+    "grudnia",
+)
+
+
+def day_label(day: str) -> str:
+    """'2026-11-02' → 'poniedziałek, 2 listopada (jutro)' in the Warsaw calendar."""
+    value = date.fromisoformat(day)
+    offset = (value - today_local()).days
+    rel = {0: " (dziś)", 1: " (jutro)", -1: " (wczoraj)"}.get(offset, "")
+    return f"{WEEKDAYS[value.weekday()]}, {value.day} {MONTHS[value.month - 1]}{rel}"
 
 
 def odds_text(selections: dict) -> str:
@@ -191,3 +277,10 @@ def offers_frame(
         )
         records.append(record)
     return pd.DataFrame.from_records(records)
+
+
+def page_link(key: str, label: str) -> None:
+    """Link to another page of the navigation (registered by main.py)."""
+    page = st.session_state.get("pages", {}).get(key)
+    if page is not None:
+        st.page_link(page, label=label, icon=":material/arrow_forward:")

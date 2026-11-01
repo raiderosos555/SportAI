@@ -13,9 +13,32 @@ serverAddress = "localhost"
 [client]
 toolbarMode = "minimal"
 
+# Sports Edge AI design tokens (TASK 006). Status colours carry meaning only:
+# green = confirmed / won, red = error / lost, amber = warning, blue = information.
 [theme]
 base = "dark"
-primaryColor = "#22c55e"
-backgroundColor = "#0b1220"
-secondaryBackgroundColor = "#111a2e"
-textColor = "#e5e7eb"
+primaryColor = "#22C55E"
+backgroundColor = "#0B1120"
+secondaryBackgroundColor = "#111C30"
+textColor = "#F8FAFC"
+linkColor = "#38BDF8"
+redColor = "#EF4444"
+orangeColor = "#F59E0B"
+yellowColor = "#F59E0B"
+blueColor = "#38BDF8"
+greenColor = "#22C55E"
+grayColor = "#94A3B8"
+borderColor = "#22314D"
+dataframeBorderColor = "#1E2B45"
+dataframeHeaderBackgroundColor = "#17243B"
+dataframeHeaderTextColor = "#CBD5E1"
+font = "'Segoe UI', Inter, system-ui, -apple-system, sans-serif"
+headingFontWeights = [800, 750, 700]
+baseRadius = "0.75rem"
+buttonRadius = "0.6rem"
+showWidgetBorder = true
+
+[theme.sidebar]
+backgroundColor = "#0D1626"
+secondaryBackgroundColor = "#111C30"
+borderColor = "#1E2B45"

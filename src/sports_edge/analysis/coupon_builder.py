@@ -26,7 +26,11 @@ from sports_edge.analysis.edge_engine import Candidate
 from sports_edge.settlement import CostProfile, Outcome, settle
 
 VALIDATED = "validated_predictive"
-JOINT_BASIS = "iloczyn prawdopodobieństw różnych meczów (założenie niezależności)"
+JOINT_BASIS = (
+    "iloczyn prawdopodobieństw różnych meczów (założenie niezależności; na holdoucie pary "
+    "meczów jednego dnia trafiały razem tak często, jak wynika z ich osobnych trafności — "
+    "stosunek ≈ 1,00)"
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,9 @@ class BuilderReport:
     refusals: dict[str, str]
     pool: tuple[Candidate, ...]
     excluded: dict[str, int] = field(default_factory=dict)
+    # why a profile has no coupon: no_candidates | not_validated | low_probability | payout
+    refusal_codes: dict[str, str] = field(default_factory=dict)
+    alternatives: dict[str, tuple[Proposal, ...]] = field(default_factory=dict)
 
 
 def eligibility(candidate: Candidate, max_odds: float) -> str | None:
@@ -108,29 +115,45 @@ def build_coupons(
         for c in sorted(items, key=_strength, reverse=True)[: int(builder.get("per_event", 1))]
     ]
     pool = tuple(sorted(alternatives, key=_strength, reverse=True)[: int(builder["candidates"])])
-    proposals, refusals = {}, {}
+    proposals, refusals, codes, alternatives = {}, {}, {}, {}
     for name, profile in policy.profiles.items():
+        likely = [c for c in pool if c.p_low >= float(profile["min_leg_probability"])]
         legs = [
             c
-            for c in pool
-            if c.p_low >= float(profile["min_leg_probability"])
-            and (not profile["require_predictive_validation"] or c.predictive_status == VALIDATED)
+            for c in likely
+            if not profile["require_predictive_validation"] or c.predictive_status == VALIDATED
         ]
-        found = _optimise(legs, profile, cost=cost, on_date=on_date, stake=stake)
-        if found is None:
+        ranked = _optimise(legs, profile, cost=cost, on_date=on_date, stake=stake)
+        if not ranked:
             proposals[name] = None
             refusals[name] = _refusal(legs, profile)
+            codes[name] = (
+                "no_candidates"
+                if not pool
+                else "payout"
+                if legs
+                else "not_validated"
+                if likely
+                else "low_probability"
+            )
             continue
-        proposals[name] = _proposal(name, profile, found, cost=cost, on_date=on_date, stake=stake)
-    return BuilderReport(proposals, refusals, pool, excluded)
+        built = [
+            _proposal(name, profile, found, cost=cost, on_date=on_date, stake=stake)
+            for found in ranked
+        ]
+        proposals[name] = built[0]
+        alternatives[name] = tuple(built[1:])
+    return BuilderReport(proposals, refusals, pool, excluded, codes, alternatives)
 
 
 def _strength(candidate: Candidate) -> tuple[float, float]:
     return candidate.p_low, candidate.p_model
 
 
-def _optimise(legs, profile, *, cost, on_date, stake):
-    best = None
+def _optimise(legs, profile, *, cost, on_date, stake, keep: int = 3):
+    """Best combinations (most likely first): the proposal and up to two alternatives that
+    share no match with a better one."""
+    found = []
     for n in range(1, int(profile["max_legs"]) + 1):
         for combo in combinations(legs, n):
             if len({c.event_id for c in combo}) != n:
@@ -142,9 +165,18 @@ def _optimise(legs, profile, *, cost, on_date, stake):
             if net is None or net < stake * Decimal(str(profile["min_net_profit_share"])):
                 continue
             score = (prod(c.p_low for c in combo), -n, prod(c.p_model for c in combo))
-            if best is None or score > best[0]:
-                best = (score, combo, total, net)
-    return best
+            found.append((score, combo, total, net))
+    found.sort(key=lambda item: item[0], reverse=True)
+    chosen, used = [], set()
+    for item in found:
+        events = {c.event_id for c in item[1]}
+        if chosen and events & used:
+            continue  # an alternative is a different bet, not the same match again
+        chosen.append(item)
+        used |= events
+        if len(chosen) == keep:
+            break
+    return chosen
 
 
 def _total_odds(combo) -> Decimal:

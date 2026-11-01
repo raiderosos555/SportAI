@@ -35,13 +35,16 @@ from sports_edge.matching import (
     match_participant,
 )
 from sports_edge.models.registry import latest_predictions, model_overview
+from sports_edge.offers.labels import market_label
 from sports_edge.offers.sources import STS_URLS, SourceBlocked, StsOfficialPdf
 from sports_edge.offers.text import NameNormalizer, load_normalizer
 from sports_edge.paper import (
     create_coupon,
     import_source_results,
+    latest_result,
     latest_settlement,
     record_status_results,
+    resolve,
     settle_coupon,
 )
 from sports_edge.pdf.engine import ParseError, parse_pdf
@@ -50,6 +53,7 @@ from sports_edge.probability_lab import (
 )
 from sports_edge.probability_lab import (
     ProbabilityPolicy,
+    league_status,
     load_probability_policy,
     predict_offer_goals,
     run_probability_experiment,
@@ -62,6 +66,7 @@ from sports_edge.repository import (
     offer_table,
 )
 from sports_edge.results_engine import (
+    backfill_results,
     effective_results,
     known_names,
     league_freshness,
@@ -84,7 +89,15 @@ from sports_edge.storage import SCHEMA_VERSION, Store
 WARSAW = ZoneInfo("Europe/Warsaw")
 
 # First research area (TASK 003): 1X2 regular time, five top European leagues.
-RESEARCH_COMPETITIONS = ("en.1", "de.1", "es.1", "it.1", "fr.1")
+# TASK 006: six leagues with PitchAPI history since 2021/22 and Ekstraklasa (API-Sports
+# 2022-2024 + PitchAPI) join the five top leagues; each league must also pass its own gate.
+# Each scope has its own Elo and Dixon–Coles versions and its own pooled validation: one
+# model for all 12 leagues was worse calibrated (TASK 006 experiment, 01.11.2026).
+CORE_COMPETITIONS = ("en.1", "de.1", "es.1", "it.1", "fr.1")
+EXTENDED_COMPETITIONS = ("en.2", "nl.1", "pt.1", "be.1", "de.2", "tr.1", "pl.1")
+MODEL_SCOPES = {"core": CORE_COMPETITIONS, "extended": EXTENDED_COMPETITIONS}
+SCOPE_LABELS = {"core": "5 czołowych lig", "extended": "7 lig dodanych w TASK 006"}
+RESEARCH_COMPETITIONS = CORE_COMPETITIONS + EXTENDED_COMPETITIONS
 RESEARCH_SPLIT = Split(validation_from="2022-07-01", holdout_from="2024-07-01")
 # What the registered Elo model forecasts (double chance follows from the same 1X2).
 MODEL_MARKETS = {("1x2", "FT"), ("double_chance", "FT")}
@@ -185,7 +198,14 @@ def analyse_day(
     candidates = evaluate(
         offer_table(store, day=day, data_kinds=data_kinds),
         predictions=with_predictive_status(
-            store, latest_predictions(store, as_of=now, prefer=prediction_preference(store))
+            store,
+            latest_predictions(
+                store,
+                as_of=now,
+                prefer=prediction_preference(store),
+                versions=active_version_ids(store),
+                offer_dates=[day],
+            ),
         ),
         profile=profiles["sts"],
         market_rules=load_rules(paths.config),
@@ -232,10 +252,16 @@ def import_openfootball_files(store: Store, paths: AppPaths, *, now: datetime) -
     return summary
 
 
-def run_research_experiment(store: Store, paths: AppPaths, *, now: datetime) -> dict:
+def run_research_experiment(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    competitions: tuple[str, ...] = CORE_COMPETITIONS,
+) -> dict:
     return run_elo_experiment(
         store,
-        competitions=RESEARCH_COMPETITIONS,
+        competitions=competitions,
         split=RESEARCH_SPLIT,
         now=now,
         policy=policy(paths),
@@ -256,24 +282,90 @@ def latest_model_version(
     return None
 
 
-def generate_predictions(store: Store, paths: AppPaths, *, now: datetime) -> dict:
-    """Pre-match forecasts for upcoming STS events with the newest registered model."""
-    version = latest_model_version(store)
-    if version is None:
-        raise ValueError("Brak zarejestrowanego modelu — uruchom eksperyment")
-    events = store.rows(
+def version_competitions(row: dict) -> tuple[str, ...]:
+    data = json.loads(row.get("training_data_json") or "{}")
+    found = data.get("competitions") or json.loads(row["validation_json"]).get("competitions")
+    return tuple(found or ())
+
+
+def scope_version(
+    store: Store, scope: tuple[str, ...], family: str = ELO_FAMILY, sport: str = "football"
+) -> dict | None:
+    """Newest version of a family trained on (a subset of) the scope's competitions.
+
+    Versions spanning several scopes (e.g. the 12-league experiment of TASK 006) are kept in
+    the history but never served.
+    """
+    for row in model_overview(store):
+        if row["sport"] != sport or row["family"] != family or row["status"] == "retired":
+            continue
+        competitions = version_competitions(row)
+        if competitions and set(competitions) <= set(scope):
+            return row
+    return None
+
+
+def active_versions(store: Store) -> dict[str, dict[str, dict | None]]:
+    return {
+        name: {
+            "elo": scope_version(store, scope),
+            "goals": scope_version(store, scope, GOALS_FAMILY),
+        }
+        for name, scope in MODEL_SCOPES.items()
+    }
+
+
+def active_version_ids(store: Store) -> set[str]:
+    return {
+        row["version_id"]
+        for pair in active_versions(store).values()
+        for row in pair.values()
+        if row is not None
+    }
+
+
+def scope_has_data(store: Store, scope: tuple[str, ...], minimum: int = 500) -> bool:
+    marks = ",".join("?" for _ in scope)
+    return (
+        store.scalar(
+            f"SELECT COUNT(*) FROM historical_results WHERE competition IN ({marks})", scope
+        )
+        >= minimum
+    )
+
+
+def _upcoming(store: Store, now: datetime) -> list[dict]:
+    return store.rows(
         "SELECT * FROM events WHERE bookmaker_id='sts' AND start_at IS NOT NULL AND start_at>?",
         (now.isoformat(),),
     )
-    return predict_offer(
-        store,
-        version_id=version["version_id"],
-        events=events,
-        normalizer=normalizer(paths),
-        now=now,
-        team_aliases=team_aliases(paths),
-        identities=team_identities(paths),
-    )
+
+
+def generate_predictions(
+    store: Store, paths: AppPaths, *, now: datetime, events: list[dict] | None = None
+) -> dict:
+    """Pre-match Elo forecasts for upcoming STS events with the served version of each scope."""
+    events = _upcoming(store, now) if events is None else events
+    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}}
+    for name, pair in active_versions(store).items():
+        if pair["elo"] is None:
+            continue
+        found = predict_offer(
+            store,
+            version_id=pair["elo"]["version_id"],
+            events=events,
+            normalizer=normalizer(paths),
+            now=now,
+            team_aliases=team_aliases(paths),
+            identities=team_identities(paths),
+        )
+        out["scopes"][name] = {k: found[k] for k in ("saved", "kept")}
+        out["saved"] += found["saved"]
+        out["kept"] += found["kept"]
+        out["skipped"] += found["skipped"]
+    if not out["scopes"]:
+        raise ValueError("Brak zarejestrowanego modelu — uruchom eksperyment")
+    return out
 
 
 def startup_check(paths: AppPaths, *, today: date | None = None) -> list[str]:
@@ -379,6 +471,78 @@ def results_providers(
     return providers
 
 
+# TASK 006: past seasons that make a league modellable — (competition, source id, first and
+# last season start year, new clubs accepted from this source). API-Sports Free covers only
+# seasons 2022-2024 (checked 01.11.2026). Its Ekstraklasa club names were reviewed against
+# PitchAPI on 01.11.2026: two need aliases (config/team_aliases.toml), the remaining unknown
+# names are clubs absent from the PitchAPI seasons (relegated earlier).
+HISTORY_PLAN: tuple[tuple[str, str, int, int, bool], ...] = (
+    ("en.2", "pitchapi", 2021, 2026, False),
+    ("nl.1", "pitchapi", 2021, 2026, False),
+    ("pt.1", "pitchapi", 2021, 2026, False),
+    ("be.1", "pitchapi", 2021, 2026, False),
+    ("de.2", "pitchapi", 2021, 2026, False),
+    ("tr.1", "pitchapi", 2022, 2026, False),
+    ("pl.1", "pitchapi", 2025, 2026, False),
+    ("pl.1", "api_sports_football", 2022, 2024, True),
+)
+
+
+def backfill_history(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    *,
+    now: datetime,
+    plan: Sequence[tuple[str, str, int, int, bool]] = HISTORY_PLAN,
+    providers: Sequence[SportsResultsProvider] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> list[dict]:
+    """Complete past seasons from free legal sources (one request batch per season).
+
+    A finished season already present from the same source is not requested again.
+    """
+    if settings.offline_mode:
+        raise ValueError("Tryb offline jest włączony — uzupełnianie historii wymaga sieci")
+    available = {p.id: p for p in (providers or results_providers(paths, settings))}
+    today = now.astimezone(WARSAW).date()
+    names, identities = normalizer(paths), team_identities(paths)
+    out = []
+    for competition, source, first, last, new_clubs in plan:
+        provider = available.get(source)
+        if provider is None or not getattr(provider, "key", True):
+            out.append({"competition": competition, "provider": source, "errors": ["brak klucza"]})
+            continue
+        family = getattr(provider, "family", provider.id)
+        windows = []
+        for year in range(first, last + 1):
+            start, end = date(year, 7, 1), min(date(year + 1, 7, 1), today + timedelta(days=1))
+            finished = end <= today
+            stored = store.scalar(
+                """SELECT COUNT(*) FROM historical_results WHERE competition=? AND provider=?
+                AND match_date>=? AND match_date<?""",
+                (competition, family, start.isoformat(), end.isoformat()),
+            )
+            if finished and stored:
+                continue  # complete past season already imported from this source
+            windows.append((start, end))
+        report = backfill_results(
+            store,
+            provider,
+            competition,
+            windows,
+            now=now,
+            normalizer=names,
+            aliases=alias_map(store, team_aliases(paths)),
+            raw_dir=paths.data / "sources" / "results",
+            identities=identities,
+            progress=progress,
+            accept_new_clubs=new_clubs,
+        )
+        out.append(report)
+    return out
+
+
 def update_results_data(
     store: Store,
     paths: AppPaths,
@@ -439,6 +603,20 @@ class PipelineRun:
     stages: list[dict]
     coupons: BuilderReport | None = None
     coupon_ids: dict[str, str] = field(default_factory=dict)
+    day: str = ""
+    offer: dict = field(default_factory=dict)  # newest STS document for the day and its age
+    refresh: list[dict] = field(default_factory=list)  # what the STS download attempt did
+
+
+@dataclass
+class RangeRun:
+    """One analysis of several days: shared data steps, then separate coupons for each day."""
+
+    days: list[str]
+    runs: dict[str, PipelineRun]
+    stages: list[dict]  # shared steps (offer, results, statistics, matching, models)
+    refresh: list[dict]
+    run_at: str
 
 
 STAGES = (
@@ -457,6 +635,174 @@ STAGES = (
     "Zapis",
     "Prezentacja",
 )
+SHARED_STAGES = 7  # stages 0-6 run once for all analysed days, 7-13 for every day
+STS_KINDS = {
+    "today": "oferta na dziś",
+    "tomorrow": "oferta na jutro",
+    "week": "oferta na kolejne dni",
+}
+RANGES = {"Dziś": 1, "Jutro": 1, "3 dni": 3, "7 dni": 7}
+
+
+def analysis_days(choice: str, today: date) -> list[str]:
+    """ISO days of a range choice (Warsaw calendar): today, tomorrow, 3 or 7 days from today."""
+    first = today + timedelta(days=1) if choice == "Jutro" else today
+    return [(first + timedelta(days=i)).isoformat() for i in range(RANGES[choice])]
+
+
+def offer_status(
+    store: Store,
+    settings: AppSettings,
+    day: str,
+    *,
+    now: datetime,
+    data_kinds: tuple[str, ...] = ("prospective", "archive"),
+) -> dict:
+    """Newest non-empty STS document covering the day and its age against the price limit."""
+    rows = offer_table(store, day=day, data_kinds=data_kinds)
+    docs = [
+        i
+        for i in imports(store)
+        if i["data_kind"] in data_kinds
+        and day in json.loads(i["summary_json"]).get("offer_dates", [])
+    ]
+    non_empty = [i for i in docs if i["rows_total"] > 0]
+    newest = max((i["generated_at"] or "" for i in non_empty), default=None) or None
+    age = (
+        round((now - datetime.fromisoformat(newest)).total_seconds() / 3600, 1) if newest else None
+    )
+    limit = round(settings.max_quote_age_minutes / 60, 1)
+    return {
+        "day": day,
+        "events": len({r["event_id"] for r in rows}),
+        "markets": len(rows),
+        "review": sum(r["status"] != "ok" for r in rows),
+        "documents": len(docs),
+        "empty_documents": len(docs) - len(non_empty),
+        "newest_document": newest,
+        "age_hours": age,
+        "limit_hours": limit,
+        "fresh": age is not None and age <= limit,
+    }
+
+
+def sts_kinds_for(days: Sequence[str], today: date) -> list[str]:
+    kinds: list[str] = []
+    for day in days:
+        offset = (date.fromisoformat(day) - today).days
+        kind = "today" if offset <= 0 else "tomorrow" if offset == 1 else "week"
+        if kind not in kinds:
+            kinds.append(kind)
+    return kinds
+
+
+def refresh_offers(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    days: Sequence[str],
+    *,
+    now: datetime,
+    fetch: Callable[..., ImportOutcome] | None = None,
+) -> list[dict]:
+    """Download the official STS PDFs needed for the days and say exactly what happened.
+
+    Statuses: skipped (not executed), blocked (offline, limit, refusal), empty (0 rows),
+    duplicate (the same document as before: its prices are NOT confirmed again), no_day_events
+    (a new document without the analysed days) and new. An empty or day-less document makes
+    the other official variants be checked too. Only the document's own time makes a price
+    fresh — a download time is never assigned to an old price.
+    """
+    today = now.astimezone(WARSAW).date()
+    kinds = sts_kinds_for(days, today)
+    if settings.offline_mode or not settings.sts_download_enabled:
+        reason = (
+            "tryb offline jest włączony"
+            if settings.offline_mode
+            else "pobieranie oficjalnych PDF STS jest wyłączone w Ustawieniach"
+        )
+        return [
+            {
+                "kind": kind,
+                "label": STS_KINDS[kind],
+                "status": "skipped",
+                "message": f"Nie pobrano — {reason}",
+                "days": {},
+            }
+            for kind in kinds
+        ]
+    attempts, queue, tried = [], list(kinds), set()
+    while queue:
+        kind = queue.pop(0)
+        if kind in tried:
+            continue
+        tried.add(kind)
+        attempt = _fetch_attempt(store, paths, settings, kind, days, now=now, fetch=fetch)
+        attempts.append(attempt)
+        if attempt["status"] in {"empty", "no_day_events"}:
+            queue += [k for k in STS_KINDS if k not in tried and k not in queue]
+    return attempts
+
+
+def sts_download(
+    store: Store, paths: AppPaths, settings: AppSettings, kind: str, *, now: datetime
+) -> dict:
+    """One official STS file on the user's click, with the same explicit status."""
+    if settings.offline_mode or not settings.sts_download_enabled:
+        return {
+            "kind": kind,
+            "label": STS_KINDS[kind],
+            "status": "skipped",
+            "message": "Nie pobrano — tryb offline lub pobieranie wyłączone w Ustawieniach",
+            "days": {},
+        }
+    return _fetch_attempt(store, paths, settings, kind, [], now=now, fetch=None)
+
+
+def _fetch_attempt(store, paths, settings, kind, days, *, now, fetch) -> dict:
+    label = STS_KINDS[kind]
+    try:
+        outcome = (fetch or fetch_sts_offer)(store, paths, settings, kind, now=now)
+    except (SourceBlocked, ParseError) as error:
+        return {
+            "kind": kind,
+            "label": label,
+            "status": "blocked",
+            "message": f"Nie pobrano: {error}",
+            "days": {},
+        }
+    summary = outcome.summary
+    generated = summary.get("generated_at")
+    when = (
+        datetime.fromisoformat(generated).astimezone(WARSAW).strftime("%d.%m %H:%M")
+        if generated
+        else "bez daty"
+    )
+    covered = {day: day in summary.get("offer_dates", []) for day in days}
+    if not summary.get("rows"):
+        status = "empty"
+        message = f"STS udostępnia pusty plik (dokument z {when}, 0 wydarzeń)"
+    elif outcome.duplicate:
+        status = "duplicate"
+        message = (
+            f"Pobrano ten sam dokument co wcześniej (z {when}) — kursy nie zostały potwierdzone "
+            "na nowo"
+        )
+    elif days and not any(covered.values()):
+        status = "no_day_events"
+        message = f"Nowy dokument z {when} nie zawiera wydarzeń analizowanych dni"
+    else:
+        status = "new"
+        message = f"Pobrano nowy dokument z {when}: {summary.get('events', 0)} wydarzeń"
+    return {
+        "kind": kind,
+        "label": label,
+        "status": status,
+        "message": message,
+        "generated_at": generated,
+        "events": summary.get("events"),
+        "days": covered,
+    }
 
 
 def run_daily_analysis(
@@ -473,54 +819,96 @@ def run_daily_analysis(
     progress: Callable[[int, str, str], None] | None = None,
     save_coupons: bool = True,
     stats_provider: PitchApiProvider | None = None,
+    fetch: Callable[..., ImportOutcome] | None = None,
 ) -> PipelineRun:
-    """One button: offer → results → statistics → features → forecasts → calibration →
-    ranking → coupon builder → probabilities → payouts → risk → save → presentation.
+    """One button for one day (see ``run_analysis``)."""
+    return run_analysis(
+        store,
+        paths,
+        settings,
+        [day],
+        now=now,
+        refresh_offer=refresh_offer,
+        refresh_results=refresh_results,
+        providers=providers,
+        data_kinds=data_kinds,
+        progress=progress,
+        save_coupons=save_coupons,
+        stats_provider=stats_provider,
+        fetch=fetch,
+    ).runs[day]
+
+
+def run_analysis(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    days: Sequence[str],
+    *,
+    now: datetime,
+    refresh_offer: bool = False,
+    refresh_results: bool = True,
+    providers: Sequence[SportsResultsProvider] | None = None,
+    data_kinds: tuple[str, ...] = ("prospective", "archive"),
+    progress: Callable[[int, str, str], None] | None = None,
+    save_coupons: bool = True,
+    stats_provider: PitchApiProvider | None = None,
+    fetch: Callable[..., ImportOutcome] | None = None,
+) -> RangeRun:
+    """Offer → results → statistics → matching → features → forecasts → calibration (once),
+    then for EVERY day separately: ranking → coupon builder → probabilities → payouts → risk →
+    save → presentation. Coupons never mix days.
 
     Network steps run only when the settings allow them (offline mode, opt-ins, keys); paid
-    sources are never called; models are trained only when no version exists yet. Missing
-    data stops nothing: each stage reports what it could do.
+    sources are never called; models are trained only when no version exists yet. Forecasts
+    for later days use only data available now. Missing data stops nothing: each stage
+    reports what it could do.
     """
-    stages: list[dict] = []
+    days = list(days)
+    shared: list[dict] = []
 
-    def stage(index: int, status: str, detail: str, **numbers) -> None:
-        stages.append({"stage": STAGES[index], "status": status, "detail": detail, **numbers})
+    def stage(target: list[dict], index: int, status: str, detail: str, **numbers) -> None:
+        target.append({"stage": STAGES[index], "status": status, "detail": detail, **numbers})
         if progress:
             progress(index, STAGES[index], detail)
 
     # 1. STS offer ------------------------------------------------------------------
-    refreshed = _refresh_offer(store, paths, settings, day, now=now) if refresh_offer else None
-    rows = offer_table(store, day=day, data_kinds=data_kinds)
-    docs = [
-        i
-        for i in imports(store)
-        if i["data_kind"] in data_kinds
-        and day in json.loads(i["summary_json"]).get("offer_dates", [])
-    ]
-    non_empty = [i for i in docs if i["rows_total"] > 0]
-    newest = max((i["generated_at"] or "" for i in non_empty), default=None)
-    age = (
-        round((now - datetime.fromisoformat(newest)).total_seconds() / 3600, 1) if newest else None
+    refresh = (
+        refresh_offers(store, paths, settings, days, now=now, fetch=fetch) if refresh_offer else []
     )
-    advice = (
-        f"Najnowszy dokument STS ma {age} h — zalecane ponowne pobranie oferty"
-        if age is not None and age > settings.max_quote_age_minutes / 60
-        else "Oferta aktualna"
-        if age is not None
-        else "Brak dokumentu STS dla tego dnia"
-    )
+    offers = {
+        day: offer_status(store, settings, day, now=now, data_kinds=data_kinds) for day in days
+    }
+    first = offers[days[0]]
+
+    def advice(info: dict) -> str:
+        if info["age_hours"] is None:
+            return "brak dokumentu STS"
+        if not info["fresh"]:
+            return (
+                f"najnowszy dokument STS ma {info['age_hours']} h (limit {info['limit_hours']} h) "
+                "— kursy wymagają odświeżenia"
+            )
+        return "oferta aktualna"
+
     stage(
+        shared,
         0,
-        "ok" if rows else "brak danych",
-        f"{len({r['event_id'] for r in rows})} wydarzeń, {len(rows)} rynków; {advice}"
-        + (f"; odświeżenie: {refreshed}" if refreshed else ""),
-        events=len({r["event_id"] for r in rows}),
-        markets=len(rows),
-        review=sum(r["status"] != "ok" for r in rows),
-        documents=len(docs),
-        empty_documents=len(docs) - len(non_empty),
-        newest_document=newest,
-        document_age_hours=age,
+        "ok" if any(o["markets"] for o in offers.values()) else "brak danych",
+        "; ".join(
+            f"{d}: {o['events']} wydarzeń, {o['markets']} rynków, {advice(o)}"
+            for d, o in offers.items()
+        )
+        + ("; pobieranie: " + " | ".join(a["message"] for a in refresh) if refresh else ""),
+        events=sum(o["events"] for o in offers.values()),
+        markets=sum(o["markets"] for o in offers.values()),
+        review=sum(o["review"] for o in offers.values()),
+        documents=first["documents"],
+        empty_documents=first["empty_documents"],
+        newest_document=first["newest_document"],
+        document_age_hours=first["age_hours"],
+        offers=offers,
+        refresh=refresh,
     )
 
     # 2. Results ----------------------------------------------------------------------
@@ -530,6 +918,7 @@ def run_daily_analysis(
     freshness = league_freshness(store, RESEARCH_COMPETITIONS, now=now)
     fresh_leagues = [f for f in freshness if f["fresh"]]
     stage(
+        shared,
         1,
         "ok" if fresh_leagues else "dane nieaktualne",
         (
@@ -543,10 +932,11 @@ def run_daily_analysis(
         update=_short_update(update),
         freshness=freshness,
     )
+    marks = ",".join("?" for _ in days)
     upcoming = store.rows(
-        "SELECT * FROM events WHERE bookmaker_id='sts' AND offer_date=? "
+        f"SELECT * FROM events WHERE bookmaker_id='sts' AND offer_date IN ({marks}) "
         "AND start_at IS NOT NULL AND start_at > ?",
-        (day, now.isoformat()),
+        (*days, now.isoformat()),
     )
     covered = [e for e in upcoming if league_code(e["league"], e["sport"])]
 
@@ -560,6 +950,7 @@ def run_daily_analysis(
     )
     fetched = sum(v.get("fetched", 0) for v in stats.values() if isinstance(v, dict))
     stage(
+        shared,
         2,
         "ok" if fetched or stats.get("status") is None else "pominięte",
         f"pobrane statystyki meczów: {fetched}"
@@ -571,18 +962,23 @@ def run_daily_analysis(
     # 4. Matching ---------------------------------------------------------------------
     names, aliases = normalizer(paths), alias_map(store, team_aliases(paths))
     identities = team_identities(paths)
-    matched, unmatched = 0, []
+    matched, unmatched, known_by_code = 0, [], {}
     for event in covered:
         code = league_code(event["league"], event["sport"])
-        known = known_names(
-            effective_results(
-                store, sport=event["sport"], until=now, competitions=(code,), identities=identities
-            ),
-            event["sport"],
-            names,
-        )
+        if code not in known_by_code:
+            known_by_code[code] = known_names(
+                effective_results(
+                    store,
+                    sport=event["sport"],
+                    until=now,
+                    competitions=(code,),
+                    identities=identities,
+                ),
+                event["sport"],
+                names,
+            )
         sides = [
-            match_participant(event[s] or "", event["sport"], known, names, aliases)
+            match_participant(event[s] or "", event["sport"], known_by_code[code], names, aliases)
             for s in ("home", "away")
         ]
         if all(f.status in {"exact", "alias"} for f in sides):
@@ -594,6 +990,7 @@ def run_daily_analysis(
                 if f.status not in {"exact", "alias"}
             ]
     stage(
+        shared,
         3,
         "ok" if covered else "brak wydarzeń w ligach z danymi",
         f"wydarzenia w ligach z danymi: {len(covered)}, dopasowane: {matched}, "
@@ -608,114 +1005,160 @@ def run_daily_analysis(
     for event in covered:
         if event_features(store, paths, event, decision_time=now) is not None:
             snapshots += 1
-    stage(4, "ok", f"migawki cech przedmeczowych: {snapshots}", snapshots=snapshots)
+    stage(shared, 4, "ok", f"migawki cech przedmeczowych: {snapshots}", snapshots=snapshots)
 
-    # 6. Models -----------------------------------------------------------------------
-    version = latest_model_version(store)
-    trained = None
-    if version is None:
-        try:
-            trained = run_research_experiment(store, paths, now=now)
-            version = latest_model_version(store)
-        except ValueError as error:
-            trained = {"error": str(error)}
-    forecasts = None
-    if version is not None:
-        forecasts = predict_offer(
-            store,
-            version_id=version["version_id"],
-            events=upcoming,
-            normalizer=names,
-            now=now,
-            team_aliases=team_aliases(paths),
-            identities=identities,
-        )
-    goals_version = latest_model_version(store, family=GOALS_FAMILY)
-    if goals_version is None and version is not None:
-        try:
-            run_goals_experiment(store, paths, now=now)
-            goals_version = latest_model_version(store, family=GOALS_FAMILY)
-        except ValueError:
-            goals_version = None
-    goals = (
-        generate_goals_predictions(store, paths, now=now, events=upcoming)
-        if goals_version
-        else None
+    # 6. Models (one Elo and one Dixon–Coles version per scope; trained only when missing) --
+    trained, errors = False, []
+    for name, scope in MODEL_SCOPES.items():
+        if not scope_has_data(store, scope):
+            continue  # no history for this scope yet: nothing to train
+        if scope_version(store, scope) is None:
+            try:
+                run_research_experiment(store, paths, now=now, competitions=scope)
+                trained = True
+            except ValueError as error:
+                errors.append(f"{SCOPE_LABELS[name]}: {error}")
+                continue
+        if scope_version(store, scope, GOALS_FAMILY) is None:
+            try:
+                run_goals_experiment(store, paths, now=now, competitions=scope)
+            except ValueError as error:
+                errors.append(f"{SCOPE_LABELS[name]} (gole): {error}")
+    served = active_versions(store)
+    forecasts = goals = None
+    if any(pair["elo"] for pair in served.values()):
+        forecasts = generate_predictions(store, paths, now=now, events=upcoming)
+    if any(pair["goals"] for pair in served.values()):
+        goals = generate_goals_predictions(store, paths, now=now, events=upcoming)
+    core = served["core"]["elo"] or next((p["elo"] for p in served.values() if p["elo"]), None)
+    core_goals = served["core"]["goals"] or next(
+        (p["goals"] for p in served.values() if p["goals"]), None
     )
     stage(
+        shared,
         5,
-        "ok" if version else "brak modelu",
+        "ok" if forecasts else "brak modelu",
         (
-            f"Elo {version['version']}: nowe prognozy {forecasts['saved']}, aktualne "
-            f"{forecasts['kept']}, pominięte {len(forecasts['skipped'])}"
+            f"Elo: nowe prognozy {forecasts['saved']}, aktualne {forecasts['kept']}, pominięte "
+            f"{len(forecasts['skipped'])}"
             + (f"; Dixon–Coles: nowe {goals['saved']}, aktualne {goals['kept']}" if goals else "")
-            if version and forecasts
-            else f"brak modelu: {trained.get('error') if trained else 'nie zarejestrowano'}"
+            if forecasts
+            else "brak modelu: " + ("; ".join(errors) or "nie zarejestrowano")
         ),
-        model=version["version"] if version else None,
-        model_status=version["status"] if version else None,
-        goals_model=goals_version["version"] if goals_version else None,
-        trained_now=bool(trained and "error" not in trained),
+        model=core["version"] if core else None,
+        model_status=core["status"] if core else None,
+        goals_model=core_goals["version"] if core_goals else None,
+        scopes={
+            name: {k: (row["version"] if row else None) for k, row in pair.items()}
+            for name, pair in served.items()
+        },
+        trained_now=trained,
         forecasts_saved=forecasts["saved"] if forecasts else 0,
         forecasts_kept=forecasts["kept"] if forecasts else 0,
         goals_saved=goals["saved"] if goals else 0,
         skipped=(forecasts or {}).get("skipped", [])[:50],
+        errors=errors,
     )
 
     # 7. Calibration and predictive validation -----------------------------------------
     quality = model_quality(store)
+    by_scope = model_quality_by_scope(store)
     stage(
+        shared,
         6,
         "ok" if quality else "brak oceny",
-        "zwalidowane predykcyjnie: "
-        + (
-            ", ".join(k for k, v in quality.items() if v["status"] == "validated_predictive") or "—"
-        ),
+        "; ".join(
+            f"{SCOPE_LABELS[name]}: zwalidowane predykcyjnie "
+            + (
+                ", ".join(k for k, v in fams.items() if v["status"] == "validated_predictive")
+                or "—"
+            )
+            for name, fams in by_scope.items()
+            if fams
+        )
+        or "brak oceny",
         families=quality,
+        scopes=by_scope,
     )
 
+    rules = probability_policy(paths)
+    cost = load_profiles(paths.config)["sts"].cost
+    runs = {}
+    for day in days:
+        runs[day] = _analyse_one_day(
+            store,
+            paths,
+            settings,
+            day,
+            now=now,
+            data_kinds=data_kinds,
+            shared=shared,
+            stage=stage,
+            fresh_leagues=bool(fresh_leagues),
+            rules=rules,
+            cost=cost,
+            save_coupons=save_coupons,
+        )
+        runs[day].offer = offers[day]
+        runs[day].refresh = refresh
+    return RangeRun(days, runs, shared, refresh, now.astimezone(UTC).isoformat())
+
+
+def _analyse_one_day(
+    store,
+    paths,
+    settings,
+    day,
+    *,
+    now,
+    data_kinds,
+    shared,
+    stage,
+    fresh_leagues,
+    rules,
+    cost,
+    save_coupons,
+) -> PipelineRun:
+    stages = list(shared)
     # 8. Ranking of selections ---------------------------------------------------------------
     report, candidates = analyse_day(store, paths, settings, day, now=now, data_kinds=data_kinds)
-    report = replace(
-        report,
-        diagnosis=diagnose(report.counts, sports_data_fresh=bool(fresh_leagues)),
-    )
+    report = replace(report, diagnosis=diagnose(report.counts, sports_data_fresh=fresh_leagues))
     stage(
+        stages,
         7,
         "ok",
-        f"selekcje: {report.counts['analysed']}, z prognozą: {report.counts['with_forecast']}, "
-        f"z P ≥ progu i świeżym kursem: {len(report.probable)}",
+        f"{day}: selekcje {report.counts['analysed']}, z prognozą "
+        f"{report.counts['with_forecast']}, z P ≥ progu i świeżym kursem {len(report.probable)}",
         **{k: report.counts[k] for k in ("analysed", "with_forecast", "ev_positive")},
         probable=len(report.probable),
     )
 
     # 9-12. Coupon builder --------------------------------------------------------------
-    built = build_coupons(
-        candidates,
-        probability_policy(paths),
-        cost=load_profiles(paths.config)["sts"].cost,
-        on_date=date.fromisoformat(day),
-    )
+    built = build_coupons(candidates, rules, cost=cost, on_date=date.fromisoformat(day))
     made = {k: v for k, v in built.proposals.items() if v is not None}
     stage(
+        stages,
         8,
         "ok" if made else "brak kuponu",
-        f"pula selekcji: {len(built.pool)}; kupony: {', '.join(made) or 'żaden profil'}",
+        f"{day}: pula selekcji {len(built.pool)}; kupony: {', '.join(made) or 'żaden profil'}",
         pool=len(built.pool),
     )
     stage(
+        stages,
         9,
         "ok",
         "; ".join(f"{k}: {v.p_conservative:.0%} (ostrożnie)" for k, v in made.items()) or "—",
         probabilities={k: [v.p_calibrated, v.p_conservative] for k, v in made.items()},
     )
     stage(
+        stages,
         10,
         "ok",
         "; ".join(f"{k}: wypłata {v.payout} zł, zysk {v.net_profit} zł" for k, v in made.items())
         or "—",
     )
     stage(
+        stages,
         11,
         "ok",
         "; ".join(f"{k}: {why}" for k, why in built.refusals.items()) or "wszystkie profile",
@@ -732,6 +1175,7 @@ def run_daily_analysis(
         else {}
     )
     stage(
+        stages,
         12,
         "ok",
         f"analiza {analysis_id[:12]}…, propozycje kuponów: {len(coupon_ids)}",
@@ -741,18 +1185,20 @@ def run_daily_analysis(
 
     # 14. Presentation ---------------------------------------------------------------------
     stage(
+        stages,
         13,
-        "ok",
+        "ok" if made else "brak kuponu",
         "kupony gotowe"
         if made
         else "BRAK KUPONU SPEŁNIAJĄCEGO WARUNKI PROFILI — " + report.headline,
     )
-    return PipelineRun(report, candidates, analysis_id, stages, built, coupon_ids)
+    return PipelineRun(report, candidates, analysis_id, stages, built, coupon_ids, day=day)
 
 
-def model_quality(store: Store) -> dict[str, dict]:
-    """Predictive status per market family: Elo serves 1X2 / double chance, Dixon–Coles goals."""
-    goals = latest_model_version(store, family=GOALS_FAMILY)
+def model_quality(store: Store, scope: tuple[str, ...] = CORE_COMPETITIONS) -> dict[str, dict]:
+    """Predictive status per market family of one scope: Elo serves 1X2 / double chance,
+    Dixon–Coles the goals markets."""
+    goals = scope_version(store, scope, GOALS_FAMILY)
     if goals is None:
         return {}
     validation = json.loads(goals["validation_json"])
@@ -763,6 +1209,10 @@ def model_quality(store: Store) -> dict[str, dict]:
         if family not in out:
             out[family] = {**info, "model": GOALS_FAMILY}
     return out
+
+
+def model_quality_by_scope(store: Store) -> dict[str, dict[str, dict]]:
+    return {name: model_quality(store, scope) for name, scope in MODEL_SCOPES.items()}
 
 
 def proposal_payload(proposal: Proposal, *, policy_version: str) -> dict:
@@ -942,6 +1392,72 @@ def league_code(sts_league: str, sport: str | None = None) -> str | None:
     return found.code if found else None
 
 
+def match_review(
+    store: Store, *, event_id: str, candidates: list[Candidate], now: datetime
+) -> dict:
+    """Pre-match picture versus what happened (TASK 006). Never changes a forecast.
+
+    The original forecast is the newest one made before kick-off by any version (the version
+    served then may no longer be active); the result, the outcome of every forecast selection
+    and the information the model did not have are listed separately.
+    """
+    event = store.get("events", event_id)
+    start = datetime.fromisoformat(event["start_at"]) if event and event["start_at"] else None
+    started = bool(start and now >= start)
+    out: dict = {"started": started, "start_at": event["start_at"] if event else None}
+    if not started:
+        return out
+    forecasts = with_predictive_status(
+        store,
+        latest_predictions(
+            store,
+            as_of=start,
+            prefer=prediction_preference(store),
+            offer_dates=[event["offer_date"]] if event.get("offer_date") else None,
+        ),
+    )
+    forecast = forecasts.get((event_id, "1x2", "FT", None))
+    result = latest_result(store, event_id)
+    out["forecast"] = forecast
+    out["result"] = result
+    out["finished"] = bool(result and result["status"] == "completed")
+    if forecast and out["finished"]:
+        probs = forecast["probabilities"]
+        favourite = max(probs, key=probs.get)
+        h, a = result["home_score"], result["away_score"]
+        actual = "home" if h > a else "away" if h < a else "draw"
+        out["favourite"] = favourite
+        out["actual"] = actual
+        out["favourite_hit"] = favourite == actual
+    selections = []
+    if out["finished"]:
+        odds = {(c.market_key, c.period, c.line, c.selection): c.odds for c in candidates}
+        for (eid, market_key, period, line), row in forecasts.items():
+            if eid != event_id:
+                continue
+            market = {"market_key": market_key, "period": period, "overtime": "false", "line": line}
+            for selection, p in row["probabilities"].items():
+                outcome = resolve(market, selection, result)
+                selections.append(
+                    {
+                        "market": market_label(market_key, period, line),
+                        "market_key": market_key,
+                        "line": line,
+                        "selection": selection,
+                        "p": p,
+                        "odds": odds.get((market_key, period, line, selection)),
+                        "outcome": outcome.value if outcome else None,
+                    }
+                )
+    out["selections"] = selections
+    out["unknown_before"] = [
+        "składy (publikowane około godziny przed meczem; model ich nie używa)",
+        "kontuzje i zawieszenia (brak bezpłatnego, zweryfikowanego źródła)",
+        "przebieg i statystyki tego meczu (znane dopiero po jego zakończeniu)",
+    ]
+    return out
+
+
 def event_context(
     store: Store, paths: AppPaths, *, event_id: str, now: datetime, last: int = 10
 ) -> dict:
@@ -954,7 +1470,13 @@ def event_context(
     if event is None:
         raise ValueError("Nieznane wydarzenie")
     prediction = with_predictive_status(
-        store, latest_predictions(store, as_of=now, prefer=prediction_preference(store))
+        store,
+        latest_predictions(
+            store,
+            as_of=now,
+            prefer=prediction_preference(store),
+            versions=active_version_ids(store),
+        ),
     ).get((event_id, "1x2", "FT", None))
     code = league_code(event["league"], event["sport"])
     sport = event["sport"]
@@ -1002,6 +1524,9 @@ def event_context(
                         "venue": "dom" if at_home else "wyjazd",
                         "opponent": r["away"] if at_home else r["home"],
                         "score": f"{r['home_score']}:{r['away_score']}",
+                        # unambiguous: the match as played (home first) and the team's view
+                        "match": f"{r['home']} {r['home_score']}:{r['away_score']} {r['away']}",
+                        "team_score": f"{scored}:{conceded}",
                         "result": "W" if scored > conceded else "P" if scored < conceded else "R",
                         "source": r["provider_resolved"],
                         "conflict": r["conflict"],
@@ -1022,10 +1547,15 @@ def probability_policy(paths: AppPaths) -> ProbabilityPolicy:
 
 
 def elo_walk_forward_forecasts(
-    store: Store, *, now: datetime, identities: TeamIdentities | None = None
+    store: Store,
+    *,
+    now: datetime,
+    identities: TeamIdentities | None = None,
+    competitions: tuple[str, ...] = CORE_COMPETITIONS,
+    version: dict | None = None,
 ) -> dict[str, dict]:
     """As-of Elo forecasts of every historical match (benchmark for the goals model)."""
-    version = latest_model_version(store)
+    version = version or scope_version(store, competitions)
     if version is None:
         return {}
     params = json.loads(version["validation_json"])["hyperparameters"]
@@ -1034,7 +1564,7 @@ def elo_walk_forward_forecasts(
             store,
             sport="football",
             until=now,
-            competitions=RESEARCH_COMPETITIONS,
+            competitions=competitions,
             identities=identities,
         )
     )
@@ -1047,97 +1577,154 @@ def elo_walk_forward_forecasts(
     return {item["match"].result_id: item["forecast"] for item in items}
 
 
-def run_goals_experiment(store: Store, paths: AppPaths, *, now: datetime) -> dict:
-    elo = latest_model_version(store)
+def run_goals_experiment(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    competitions: tuple[str, ...] = CORE_COMPETITIONS,
+) -> dict:
+    elo = scope_version(store, competitions)
     return run_probability_experiment(
         store,
-        competitions=RESEARCH_COMPETITIONS,
+        competitions=competitions,
         split=RESEARCH_SPLIT,
         now=now,
         policy=policy(paths),
         probability_policy=probability_policy(paths),
-        elo_forecasts=elo_walk_forward_forecasts(store, now=now, identities=team_identities(paths)),
+        elo_forecasts=elo_walk_forward_forecasts(
+            store,
+            now=now,
+            identities=team_identities(paths),
+            competitions=competitions,
+            version=elo,
+        ),
         identities=team_identities(paths),
         elo_version_id=elo["version_id"] if elo else None,
     )
 
 
-def elo_validation(store: Store) -> tuple[str | None, dict, dict]:
-    """Predictive status and holdout ranges of the Elo version benchmarked by the newest
-    goals experiment: (Elo version id, status per family, metrics per family).
+def elo_benchmarks(store: Store) -> dict[str, dict]:
+    """Elo version id → report of the served goals experiment that judged it (per scope).
 
-    Versions registered before the id was recorded used the newest Elo version that existed
-    when the goals experiment ran.
+    Goals versions registered before the Elo id was recorded used the newest Elo version of
+    their scope that existed when the goals experiment ran.
     """
-    goals = latest_model_version(store, family=GOALS_FAMILY)
-    if goals is None:
+    out: dict[str, dict] = {}
+    for scope in MODEL_SCOPES.values():
+        goals = scope_version(store, scope, GOALS_FAMILY)
+        if goals is None:
+            continue
+        report = json.loads(goals["validation_json"])
+        version_id = report.get("elo_version_id")
+        if version_id is None:
+            version_id = next(
+                (
+                    row["version_id"]
+                    for row in model_overview(store)
+                    if row["family"] == ELO_FAMILY
+                    and row["created_at"] <= goals["created_at"]
+                    and set(version_competitions(row)) <= set(scope)
+                ),
+                None,
+            )
+        if version_id:
+            out[version_id] = report
+    return out
+
+
+def elo_validation(store: Store) -> tuple[str | None, dict, dict]:
+    """(Elo version id, status per family, metrics per family) of the core scope."""
+    elo = scope_version(store, CORE_COMPETITIONS)
+    report = elo_benchmarks(store).get(elo["version_id"]) if elo else None
+    if report is None:
         return None, {}, {}
-    report = json.loads(goals["validation_json"])
-    version_id = report.get("elo_version_id")
-    if version_id is None:
-        version_id = next(
-            (
-                row["version_id"]
-                for row in model_overview(store)
-                if row["family"] == ELO_FAMILY and row["created_at"] <= goals["created_at"]
-            ),
-            None,
-        )
-    return version_id, report.get("elo_predictive") or {}, report.get("elo_families") or {}
+    return elo["version_id"], report.get("elo_predictive") or {}, report.get("elo_families") or {}
 
 
 def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict[tuple, dict]:
-    """Elo forecasts carry no status of their own: the goals experiment measured it for one
-    Elo version, so only that version's forecasts receive it (others stay experimental)."""
-    version_id, statuses, families = elo_validation(store)
-    if version_id is None:
+    """Elo forecasts carry no status of their own: the goals experiment of their scope
+    measured it for one Elo version, so only that version's forecasts receive it; a league
+    that fails its own gate stays experimental."""
+    benchmarks = elo_benchmarks(store)
+    if not benchmarks:
         return predictions
+
+    def status(report: dict, family: str, competition: str | None) -> str:
+        value = ((report.get("elo_predictive") or {}).get(family) or {}).get(
+            "status", "experimental"
+        )
+        gate = league_status(report, competition, "elo", family)
+        return "experimental" if gate and not gate["ok"] else value
+
     for row in predictions.values():
-        if row["model_version_id"] != version_id or row["market_key"] != "1x2":
+        report = benchmarks.get(row["model_version_id"])
+        if report is None or row["market_key"] != "1x2":
             continue
         if "predictive_status" in row["uncertainty"]:
             continue
+        competition = (row.get("inputs") or {}).get("competition")
         row["uncertainty"] = {
             **row["uncertainty"],
             "family": "1x2",
-            "predictive_status": (statuses.get("1x2") or {}).get("status", "experimental"),
-            "derived_status": {
-                "double_chance": (statuses.get("double_chance") or {}).get("status", "experimental")
-            },
+            "predictive_status": status(report, "1x2", competition),
+            "derived_status": {"double_chance": status(report, "double_chance", competition)},
+            "league_gate": league_status(report, competition, "elo", "1x2"),
         }
-        row["validation"] = {**row["validation"], "families": families}
+        row["validation"] = {**row["validation"], "families": report.get("elo_families") or {}}
     return predictions
 
 
-def prediction_preference(store: Store) -> dict[str, str]:
-    """1X2 is served by the model that won the VALIDATION comparison (stored in the version)."""
-    goals = latest_model_version(store, family=GOALS_FAMILY)
-    if goals is None:
-        return {}
-    served = json.loads(goals["validation_json"]).get("markets_served", [])
-    return {"1x2": GOALS_FAMILY if "1x2" in served else ELO_FAMILY}
+def prediction_preference(store: Store) -> dict:
+    """Model serving 1X2 (and the double chance derived from it), per scope and league.
+
+    The model that passed the predictive validation wins; when both or neither passed, the
+    lower VALIDATION log loss decides (stored in the version). The holdout never decides.
+    """
+    out: dict = {}
+    for name, scope in MODEL_SCOPES.items():
+        goals = scope_version(store, scope, GOALS_FAMILY)
+        if goals is None:
+            continue
+        report = json.loads(goals["validation_json"])
+        elo_ok = ((report.get("elo_predictive") or {}).get("1x2") or {}).get(
+            "status"
+        ) == "validated_predictive"
+        dc_ok = ((report.get("predictive") or {}).get("1x2") or {}).get(
+            "status"
+        ) == "validated_predictive"
+        by_loss = GOALS_FAMILY if "1x2" in report.get("markets_served", []) else ELO_FAMILY
+        family = by_loss if elo_ok == dc_ok else ELO_FAMILY if elo_ok else GOALS_FAMILY
+        out.update({("1x2", code): family for code in scope})
+        if name == "core" or "1x2" not in out:
+            out["1x2"] = family
+    return out
 
 
 def generate_goals_predictions(
     store: Store, paths: AppPaths, *, now: datetime, events: list[dict] | None = None
 ) -> dict:
-    version = latest_model_version(store, family=GOALS_FAMILY)
-    if version is None:
-        raise ValueError("Brak zarejestrowanego modelu bramkowego — uruchom eksperyment")
-    if events is None:
-        events = store.rows(
-            "SELECT * FROM events WHERE bookmaker_id='sts' AND start_at IS NOT NULL AND start_at>?",
-            (now.isoformat(),),
+    events = _upcoming(store, now) if events is None else events
+    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}}
+    for name, pair in active_versions(store).items():
+        if pair["goals"] is None:
+            continue
+        found = predict_offer_goals(
+            store,
+            version_id=pair["goals"]["version_id"],
+            events=events,
+            normalizer=normalizer(paths),
+            now=now,
+            team_aliases=team_aliases(paths),
+            identities=team_identities(paths),
         )
-    return predict_offer_goals(
-        store,
-        version_id=version["version_id"],
-        events=events,
-        normalizer=normalizer(paths),
-        now=now,
-        team_aliases=team_aliases(paths),
-        identities=team_identities(paths),
-    )
+        out["scopes"][name] = {k: found[k] for k in ("saved", "kept")}
+        out["saved"] += found["saved"]
+        out["kept"] += found["kept"]
+        out["skipped"] += found["skipped"]
+    if not out["scopes"]:
+        raise ValueError("Brak zarejestrowanego modelu bramkowego — uruchom eksperyment")
+    return out
 
 
 # ---------------------------------------------------------------- TASK 005: sports intelligence
