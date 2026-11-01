@@ -44,8 +44,9 @@ w katalogu projektu linię `FOOTBALL_DATA_API_KEY=…` (plik jest w `.gitignore`
 zmiennej środowiskowej). Bez klucza aplikacja działa na danych historycznych i wyjaśnia, dlaczego
 prognozy są wstrzymane.
 
-Ekstraklasa (opcjonalnie): bezpłatny klucz API-Sports z dashboard.api-football.com jako
-`API_SPORTS_KEY=…` w `.env` (100 zapytań/dzień; regulamin akceptujesz przy rejestracji).
+API-Sports (opcjonalnie): klucz z dashboard.api-football.com jako `API_SPORTS_KEY=…`
+w `.env`. Uwaga: darmowy plan obejmuje tylko sezony 2022–2024 (sprawdzono 01.11.2026);
+bieżące wyniki Ekstraklasy, NBA czy NHL wymagają płatnego planu.
 
 CLI (te same funkcje bez interfejsu):
 
@@ -88,7 +89,7 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-170 testów (69 z TASK 001 + 101 z TASK 002–004). Testy parserów używają oznaczonych fixture
+171 testów (69 z TASK 001 + 102 z TASK 002–004). Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
 (katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
 uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.

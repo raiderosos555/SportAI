@@ -309,7 +309,8 @@ def _apply(
         label = f"{record.home} - {record.away} ({record.match_date})"
         if not record.complete and record.status not in {"postponed", "cancelled", "suspended"}:
             if record.status in {"finished", "awarded"}:
-                out["incomplete"].append(f"{label}: status zakończony bez pełnego wyniku")
+                why = record.details.get("inconsistent") or "status zakończony bez pełnego wyniku"
+                out["incomplete"].append(f"{label}: {why}")
             continue
         if not record.match_date:
             out["incomplete"].append(f"{label}: brak daty meczu")

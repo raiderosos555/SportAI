@@ -47,10 +47,10 @@ RESULTS_SOURCES = [
         "Źródło": "API-Sports (API-Football i inne)",
         "Legalność": "regulamin akceptowany przy rejestracji (niedostępny do odczytu automatycznego)",
         "Aktualność": "bieżące (brak znacznika aktualizacji — czas obserwacji)",
-        "Zakres": "Ekstraklasa i inne ligi; koszykówka, hokej, siatkówka; darmowy plan: ostatnie sezony",
+        "Zakres": "piłka (w tym Ekstraklasa), koszykówka, hokej; darmowy plan: tylko sezony 2022–2024",
         "Automatyzacja": "API, 100 zapytań/dzień na API, limit z rezerwą",
-        "Koszt": "0 zł (plan darmowy)",
-        "Rola": "WDROŻONE — Ekstraklasa; inne dyscypliny po weryfikacji na kluczu",
+        "Koszt": "0 zł (darmowy, bez bieżącego sezonu); bieżący sezon — plan płatny",
+        "Rola": "WDROŻONE i zweryfikowane — nieaktywne dla bieżącego sezonu w planie darmowym",
     },
     {
         "Źródło": "STS — wyniki na stronie",

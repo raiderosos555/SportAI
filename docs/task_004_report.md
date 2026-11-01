@@ -235,8 +235,8 @@ informację, że ofertę można pobrać ponownie.
 
 ## G. TESTY
 
-- **pytest: 170 passed.** 69 testów TASK 001 jest bez zmian, 101 to testy TASK 002–004, w tym
-  18 nowych w `tests/test_task004.py` i 5 w `tests/test_api_sports.py` (sekcja I).
+- **pytest: 171 passed.** 69 testów TASK 001 jest bez zmian, 102 to testy TASK 002–004, w tym
+  18 nowych w `tests/test_task004.py` i 6 w `tests/test_api_sports.py` (sekcja I).
 - **Ruff:** `check` i `format --check` bez uwag.
 - **Nowe testy obejmują:**
   - parser football-data.org (statusy, czas regulaminowy, niespójne `lastUpdated`);
@@ -319,12 +319,25 @@ warunków) i kilka tygodni zbierania danych.
   końcowy (`observed_at_fetch`).
 - **Pierwsze źródło nowej ligi** (Ekstraklasa nie ma historii w openfootball) wyznacza nazwy
   kanoniczne (`source`). Kolejne źródła muszą się do nich dopasować.
-- **Koszykówka (NBA, Euroliga) i hokej (NHL)** (`/games`): parsery istnieją (czas regulaminowy,
-  dogrywka w `after_ot`), ale adaptery są **nieaktywne**. Schematu odpowiedzi ani
-  identyfikatorów lig nie potwierdzono na prawdziwym kluczu, a nic nie jest zgadywane.
-- **Stan na 01.11.2026:** klucza jeszcze nie podano, więc nie wykonano żadnego zapytania.
-  Pierwsze uruchomienie pokaże, czy darmowy plan obejmuje bieżący sezon. Jeśli nie, aplikacja
-  wyświetli komunikat dostawcy.
+- **Weryfikacja na kluczu użytkownika (01.11.2026)**, łącznie 15 zapytań: konto w planie
+  Free, aktywne do 01.11.2027, limit 100 zapytań na dobę.
+- **Darmowy plan nie obejmuje bieżącego sezonu** w żadnym sprawdzonym API. Ekstraklasa,
+  5 lig, NBA, Euroliga i NHL zwróciły: „Free plans do not have access to this season, try
+  from 2022 to 2024.”
+  - Adapter zatrzymał się na tym komunikacie i niczego nie zapisał.
+  - Odmowa jest zapamiętana na 7 dni (`PLAN_RECHECK_DAYS`): dostawca jest wtedy nieaktywny i
+    podaje powód, więc aktualizacje nie zużywają limitu.
+  - **Wniosek:** bieżące wyniki z API-Sports wymagają płatnego planu, co jest decyzją
+    użytkownika. W darmowym planie Ekstraklasa nadal nie ma bieżących wyników.
+- **Koszykówka i hokej** — schemat zweryfikowany na dozwolonych sezonach:
+  - NBA: liga 12, sezony zapisane jako „2023-2024”, 1377 meczów, w tym 66 po dogrywce;
+  - Euroliga: liga 120, sezony zapisane jako rok;
+  - NHL: liga 57, sezony zapisane jako rok, 1514 meczów, w tym 314 po dogrywce lub karnych.
+
+  Wynik regulaminowy to suma kwart lub tercji, a dogrywka trafia do `after_ot`. W danych NHL
+  były **3 niespójne rekordy** (np. wynik 2:4 przy sumie tercji 2:3). Kontrola spójności
+  odrzuca je, więc nie trafiają do historii ani do rozliczeń. Siatkówka pozostaje
+  niezweryfikowana.
 - **Regulamin API-Sports** jest za zabezpieczeniem Cloudflare; użytkownik akceptuje go przy
   rejestracji.
 

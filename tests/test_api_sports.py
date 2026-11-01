@@ -217,7 +217,7 @@ def test_ekstraklasa_from_api_sports_settles_sts_events(store, import_sts, tmp_p
     assert legia["result_status"] == "completed"
 
 
-def test_other_sports_parse_regular_time_and_stay_inactive_until_verified():
+def test_other_sports_parse_regular_time_and_refuse_inconsistent_records():
     basketball = {
         "response": [
             {
@@ -275,9 +275,48 @@ def test_other_sports_parse_regular_time_and_stay_inactive_until_verified():
         0
     ]
     assert (record.home_score, record.away_score) == (3, 2) and record.details["after_ot"] is None
-    for sport in ("basketball", "ice_hockey"):
-        status = ApiSportsGamesProvider("synthetic-key", sport=sport).status(offline=False)
-        assert not status.active and "niezweryfikowane" in status.reason
+    # Modelled on real NHL records (2026-11-01 check): FT whose periods do not add up.
+    broken = {
+        "response": [
+            {
+                **hockey["response"][0],
+                "id": 3,
+                "scores": {"home": 2, "away": 4},
+                "periods": {"first": "1-2", "second": "0-0", "third": "1-1", "overtime": None},
+            }
+        ]
+    }
+    refused = parse_games(
+        broken, competition="ice_hockey.nhl", sport="ice_hockey", observed_at=NOW
+    )[0]
+    assert (
+        not refused.complete and refused.details["inconsistent"] == "suma okresów 2:3 ≠ wynik 2:4"
+    )
+    for sport in ("basketball", "ice_hockey"):  # schema and league ids verified 2026-11-01
+        assert ApiSportsGamesProvider("synthetic-key", sport=sport).status(offline=False).active
+    volleyball = ApiSportsGamesProvider("synthetic-key", sport="volleyball").status(offline=False)
+    assert not volleyball.active and "niezweryfikowane" in volleyball.reason
+
+
+def test_free_plan_refusal_is_remembered_instead_of_spending_the_quota():
+    calls = []
+
+    def refused(request, timeout=30):
+        calls.append(request.full_url)
+        message = "Free plans do not have access to this season, try from 2022 to 2024."
+        return _Response(body([], errors={"plan": message}))
+
+    provider = ApiSportsFootballProvider(
+        "synthetic-key", opener=refused, quota_path=None, sleep=lambda s: None
+    )
+    today = datetime.now(UTC)
+    with pytest.raises(SourceBlocked, match="Free plans"):
+        provider.fetch("pl.1", today.date() - timedelta(days=5), today.date(), now=today)
+    status = provider.status(offline=False)
+    assert not status.active and "Plan darmowy nie obejmuje bieżącego sezonu" in status.reason
+    assert len(calls) == 1
+    later = today.date() + timedelta(days=7)
+    assert provider.quota.plan_limit("football", later) is None  # checked again after a week
 
 
 def test_probability_ranking_shows_break_even_and_derived_double_chance(

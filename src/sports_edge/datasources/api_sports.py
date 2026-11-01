@@ -12,8 +12,14 @@ Checked 2026-11-01. What is known and what is not:
 * Football v3: ``/fixtures?league&season&from&to`` (dates inclusive); ``score.fulltime`` is the
   regular-time score, ``score.halftime`` the first half. There is no record update timestamp,
   so availability falls back to the moment the result was observed (``results_engine``).
-* Basketball, hockey and volleyball v1 (``/games?league&season``): parsed from the documented
-  response shape, but INACTIVE until a real response confirms the schema and league ids.
+* Basketball and hockey v1 (``/games?league&season``): schema and league ids VERIFIED on
+  2026-11-01 with the user's key on allowed seasons — NBA (12, seasons "2023-2024"),
+  Euroleague (120, seasons 2023), NHL (57, seasons 2023): quarters / periods, totals, FT / AOT
+  / AP statuses. Records whose periods do not add up to the final score (seen in real NHL
+  data) are refused. Volleyball stays unverified.
+* FREE PLAN LIMIT (verified 2026-11-01, every football league): "Free plans do not have access
+  to this season, try from 2022 to 2024." — no current-season results on the free plan. The
+  refusal is remembered for ``PLAN_RECHECK_DAYS`` so updates do not waste the daily quota.
 """
 
 import json
@@ -54,7 +60,8 @@ GAME_LEAGUES = {
     "basketball.euroleague": (120, "year"),
     "ice_hockey.nhl": (57, "year"),
 }
-VERIFIED_SPORTS: frozenset[str] = frozenset({"football"})
+VERIFIED_SPORTS: frozenset[str] = frozenset({"football", "basketball", "ice_hockey"})
+PLAN_RECHECK_DAYS = 7
 FOOTBALL_STATUS = {
     "TBD": "scheduled",
     "NS": "scheduled",
@@ -149,6 +156,20 @@ class DailyQuota:
             entry["server_remaining"] = server_remaining
         self._save(data)
 
+    def record_plan_limit(self, api: str, day: date, message: str) -> None:
+        data = self._load()
+        data.setdefault("plan_limits", {})[api] = {"since": day.isoformat(), "message": message}
+        self._save(data)
+
+    def plan_limit(self, api: str, day: date) -> str | None:
+        """Plan refusal remembered for a few days (then checked again with one request)."""
+        found = self._load().get("plan_limits", {}).get(api)
+        if not found:
+            return None
+        if (day - date.fromisoformat(found["since"])).days >= PLAN_RECHECK_DAYS:
+            return None
+        return found["message"]
+
 
 class _ApiSportsBase:
     id = "api_sports"
@@ -186,6 +207,12 @@ class _ApiSportsBase:
                 "— adapter nieaktywny",
             )
         today = datetime.now(UTC).date()
+        if limit := self.quota.plan_limit(self.sport, today):
+            return ProviderStatus(
+                False,
+                f"Plan darmowy nie obejmuje bieżącego sezonu ({limit}) — bieżące wyniki wymagają "
+                "płatnego planu (decyzja użytkownika)",
+            )
         if not self.quota.allows(self.sport, today):
             return ProviderStatus(False, "Dzienny limit zapytań API-Sports wyczerpany (z rezerwą)")
         left = self.quota.remaining(self.sport, today)
@@ -219,7 +246,10 @@ class _ApiSportsBase:
         errors = payload.get("errors")
         if errors:
             messages = errors.values() if isinstance(errors, dict) else errors
-            raise SourceBlocked("API-Sports: " + "; ".join(str(m) for m in messages))
+            text = "; ".join(str(m) for m in messages)
+            if isinstance(errors, dict) and "plan" in errors:
+                self.quota.record_plan_limit(self.sport, day, str(errors["plan"]))
+            raise SourceBlocked("API-Sports: " + text)
         return payload, data, url
 
 
@@ -351,6 +381,9 @@ def parse_games(payload: dict, *, competition: str, sport: str, observed_at: dat
         teams = item.get("teams") or {}
         home, away = teams.get("home") or {}, teams.get("away") or {}
         regular, final, periods = _game_scores(item, sport)
+        problem = _inconsistency(sport, short, regular, final)
+        if problem:
+            regular = (None, None)  # never settle or model from contradictory numbers
         out.append(
             ResultRecord(
                 provider="api_sports",
@@ -368,7 +401,10 @@ def parse_games(payload: dict, *, competition: str, sport: str, observed_at: dat
                 details={
                     "status_short": short,
                     "periods": periods,
-                    "after_ot": list(final) if final != regular and None not in final else None,
+                    "after_ot": list(final)
+                    if final != regular and None not in final and None not in regular
+                    else None,
+                    "inconsistent": problem,
                     "source": "API-Sports",
                 },
                 published_at=None,
@@ -406,6 +442,18 @@ def _game_scores(item: dict, sport: str) -> tuple[tuple, tuple, dict]:
     # volleyball: sets won is the match score
     final = (scores.get("home"), scores.get("away"))
     return final, final, item.get("periods") or {}
+
+
+def _inconsistency(sport: str, short: str, regular: tuple, final: tuple) -> str | None:
+    """Periods must add up: a regular-time finish equals the total; after OT or a shoot-out
+    the regular time is a draw. Real NHL data contained FT records breaking both rules."""
+    if sport not in {"basketball", "ice_hockey"} or None in regular or None in final:
+        return None
+    if short == "FT" and regular != final:
+        return f"suma okresów {regular[0]}:{regular[1]} ≠ wynik {final[0]}:{final[1]}"
+    if short in {"AOT", "AP"} and regular[0] != regular[1]:
+        return f"po dogrywce, ale czas regulaminowy {regular[0]}:{regular[1]} nie jest remisem"
+    return None
 
 
 def _pair(value) -> tuple[int, int] | None:
