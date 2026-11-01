@@ -19,22 +19,33 @@ from sports_edge.paper import (
     record_result,
     settle_coupon,
 )
+from sports_edge.performance import coupon_performance, selection_outcomes, selection_summary
 from sports_edge.repository import offer_days, offer_table
-from sports_edge.services import normalizer, team_aliases
+from sports_edge.services import normalizer, team_aliases, team_identities
 
 
 def history_page() -> None:
     c.setup_page()
     st.title("Historia i wyniki")
     db = c.store()
-    tabs = st.tabs(["Kupony wirtualne", "Wyniki i rozliczenia", "Skuteczność i CLV", "Analizy"])
+    tabs = st.tabs(
+        [
+            "Kupony wirtualne",
+            "Wyniki i rozliczenia",
+            "Skuteczność kreatora kuponów",
+            "Skuteczność i CLV",
+            "Analizy",
+        ]
+    )
     with tabs[0]:
         _coupons(db)
     with tabs[1]:
         _results(db)
     with tabs[2]:
-        _performance(db)
+        _builder_performance(db)
     with tabs[3]:
+        _performance(db)
+    with tabs[4]:
         rows = db.rows("SELECT * FROM analyses ORDER BY created_at DESC LIMIT 200")
         if not rows:
             st.info("Brak zapisanych analiz.")
@@ -150,7 +161,11 @@ def _results(db) -> None:
     )
     if st.button("Przenieś pewne wyniki z danych niezależnych (lokalnie)"):
         out = import_source_results(
-            db, now=c.now(), normalizer=normalizer(c.paths()), team_aliases=team_aliases(c.paths())
+            db,
+            now=c.now(),
+            normalizer=normalizer(c.paths()),
+            team_aliases=team_aliases(c.paths()),
+            identities=team_identities(c.paths()),
         )
         st.write(f"Zapisano wyników: {out['recorded']}")
         for line in out["unresolved"][:20]:
@@ -206,6 +221,91 @@ def _results(db) -> None:
                 outcome.get("reason", ""),
                 "; ".join(outcome.get("reasons", [])),
             )
+
+
+def _pct(value, digits: int = 0) -> str:
+    return f"{value:.{digits}%}" if value is not None else "—"
+
+
+GROUPS = {
+    "range": "Przedział prawdopodobieństwa",
+    "market_family": "Rynek",
+    "league": "Liga",
+    "sport": "Dyscyplina",
+}
+
+
+def _builder_performance(db) -> None:
+    stats = coupon_performance(db)
+    if not stats:
+        st.info("Brak zapisanych kuponów kreatora — wygeneruj je w zakładce Kupon dnia.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Profil": s["label"],
+                    "Kupony": s["coupons"],
+                    "Oczekujące": s["pending"],
+                    "Rozliczone": s["settled"],
+                    "Wygrane": s["wins"],
+                    "Trafność": _pct(s["hit_rate"]),
+                    "Trafność (95%)": "—"
+                    if s["hit_rate_ci95"] is None
+                    else f"{s['hit_rate_ci95'][0]:.0%}–{s['hit_rate_ci95'][1]:.0%}",
+                    "Śr. przewidywana szansa": _pct(s["avg_predicted"]),
+                    "Śr. szansa ostrożnie": _pct(s["avg_predicted_conservative"]),
+                    "Śr. liczba selekcji": round(s["avg_legs"], 2),
+                    "Śr. kurs": round(s["avg_odds"], 2),
+                    "Stawki": str(s["stake"]),
+                    "Zysk netto": str(s["profit"]),
+                    "ROI": _pct(s["roi"], 1),
+                    "Maks. obsunięcie": str(s["max_drawdown"]),
+                    "Najdłuższa seria wygranych": s["longest_win_streak"],
+                    "Najdłuższa seria przegranych": s["longest_loss_streak"],
+                    "Bieżąca seria": s["current_streak"],
+                }
+                for s in stats.values()
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.caption(
+        "Trafność porównujemy ze średnią przewidywaną szansą rozliczonych kuponów; przedział 95% "
+        "(Wilson) pokazuje, jak mało mówi kilka rozliczeń. ROI po współczynniku 0,88 i podatku."
+    )
+    rows = selection_outcomes(db)
+    decided = [r for r in rows if r["outcome"] in {"win", "loss"}]
+    st.subheader("Selekcje kreatora")
+    st.caption(
+        f"Selekcje w zapisanych kuponach: {len(rows)} (każda liczona raz), rozstrzygnięte: "
+        f"{len(decided)}. Kalibracja: trafność selekcji w grupie wobec średniej prognozy."
+    )
+    by = st.radio("Grupuj według", list(GROUPS), format_func=GROUPS.get, horizontal=True)
+    summary = selection_summary(rows, by)
+    if not summary:
+        st.info("Brak rozstrzygniętych selekcji.")
+        return
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    GROUPS[by]: s["group"],
+                    "Selekcje": s["n"],
+                    "Trafione": s["hits"],
+                    "Trafność": _pct(s["hit_rate"]),
+                    "Trafność (95%)": f"{s['ci95'][0]:.0%}–{s['ci95'][1]:.0%}",
+                    "Śr. prognoza": _pct(s["mean_p_model"]),
+                    "Śr. prognoza ostrożna": _pct(s["mean_p_conservative"]),
+                    "Ocena kalibracji": s["flag"],
+                }
+                for s in summary
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
 
 
 def _performance(db) -> None:

@@ -92,6 +92,13 @@ def research(step: str) -> None:
         _print({k: v for k, v in report.items() if k not in {"selection", "holdout"}})
     elif step == "predict":
         _print(services.generate_predictions(store, paths, now=now))
+    elif step == "goals-experiment":
+        report = services.run_goals_experiment(store, paths, now=now)
+        _print(
+            {k: report[k] for k in ("version_id", "predictive", "markets_served") if k in report}
+        )
+    elif step == "goals-predict":
+        _print(services.generate_goals_predictions(store, paths, now=now))
     elif step == "update-results":
         _print(services.update_results_data(store, paths, settings, now=now, progress=print))
     elif step == "results":
@@ -103,6 +110,7 @@ def research(step: str) -> None:
                 now=now,
                 normalizer=services.normalizer(paths),
                 team_aliases=services.team_aliases(paths),
+                identities=services.team_identities(paths),
             )
         )
 
@@ -124,12 +132,21 @@ def analyse(day: str | None, *, refresh_offer: bool, refresh_results: bool) -> N
         now=now,
         refresh_offer=refresh_offer,
         refresh_results=refresh_results,
-        progress=lambda i, name, detail: print(f"[{i + 1}/8] {name}: {detail}"),
+        progress=lambda i, name, detail: print(
+            f"[{i + 1}/{len(services.STAGES)}] {name}: {detail}"
+        ),
     )
+    rules = services.probability_policy(paths)
     _print(
         {
-            "headline": run.report.headline,
-            "diagnosis": list(run.report.diagnosis),
+            "coupons": {
+                name: services.proposal_payload(p, policy_version=rules.version)
+                if p
+                else {"refusal": run.coupons.refusals.get(name)}
+                for name, p in run.coupons.proposals.items()
+            },
+            "saved_coupons": run.coupon_ids,
+            "headline_ev": run.report.headline,
             "counts": run.report.counts,
             "analysis_id": run.analysis_id,
         }
@@ -181,9 +198,20 @@ def main() -> None:
     res = commands.add_parser("research", help="independent data, experiment, forecasts")
     res.add_argument(
         "step",
-        choices=["fetch-data", "import-data", "update-results", "experiment", "predict", "results"],
+        choices=[
+            "fetch-data",
+            "import-data",
+            "update-results",
+            "experiment",
+            "predict",
+            "goals-experiment",
+            "goals-predict",
+            "results",
+        ],
     )
-    ana = commands.add_parser("analyse", help="one-button daily analysis (offer → coupon)")
+    ana = commands.add_parser(
+        "analyse", help="GENERUJ KUPONY DNIA without the interface (14 stages, saved proposals)"
+    )
     ana.add_argument("day", nargs="?", help="YYYY-MM-DD (default: today, Warsaw)")
     ana.add_argument("--refresh-offer", action="store_true", help="download the STS PDF (opt-in)")
     ana.add_argument("--no-results", action="store_true", help="skip the results update")

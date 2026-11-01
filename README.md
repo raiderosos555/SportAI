@@ -1,19 +1,27 @@
 # Sports Edge AI
 
 Lokalna aplikacja Windows do analizy oferty **STS** (od TASK 003 jedyny obsługiwany
-bukmacher): import PDF, historia kursów, aktualne wyniki sportowe (football-data.org +
-openfootball), prognozy przedmeczowe (baseline Elo), EV brutto/netto ze zweryfikowanym profilem
-podatkowym i regułami rynków STS, analiza dnia jednym przyciskiem, kupon dnia (SOLO/AKO)
-z bramkami dowodowymi, paper trading i automatyczne rozliczenia.
+bukmacher). Od TASK 005 jej głównym zadaniem jest **tworzenie kuponów STS o możliwie
+najwyższej, rzetelnie oszacowanej szansie trafienia** przy realnym zysku po podatku.
+
+Funkcje:
+- import PDF i historia kursów;
+- aktualne wyniki (football-data.org, PitchAPI, openfootball);
+- statystyki meczowe i składy (PitchAPI), cechy przedmeczowe as-of;
+- modele Elo (1X2, podwójna szansa) i Dixon–Coles (sumy goli, BTTS) z kalibracją i
+  walidacją predykcyjną;
+- kreator kuponów w trzech profilach;
+- paper trading, automatyczne rozliczenia i panel skuteczności.
+
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
-bukmachera. Poprawnym wynikiem bez zwalidowanego modelu jest komunikat
-**BRAK POTWIERDZONEJ PRZEWAGI — BRAK KUPONU DNIA**.
+bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
+predykcyjnie” nie oznacza przewagi nad STS; analiza EV zostaje jako diagnostyka.
 
 Kod jest w **prywatnym** repozytorium GitHub
 [raiderosos555/SportAI](https://github.com/raiderosos555/SportAI). Aplikacja i jej dane
 działają lokalnie: baza, oferty PDF, eksporty, kopie zapasowe i `.env` nie trafiają do
 repozytorium (`.gitignore`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 004](docs/task_004_report.md).
+Stan i ograniczenia: [raport TASK 005](docs/task_005_report.md).
 
 ## Uruchomienie na Windows
 
@@ -31,9 +39,9 @@ Start nie pobiera niczego z sieci; tryb offline jest domyślnie włączony.
 |---|---|
 | Import PDF STS, historia i zmiany kursów | **Oferta STS** (lub **Ustawienia → Import PDF**) |
 | Oficjalne PDF STS (dziś / jutro / tydzień) | **Oferta STS** — po wyłączeniu trybu offline i zgodzie w Ustawieniach |
-| Statystyki, prognoza, P rynku, EV, uzasadnienie | **Analiza AI** |
-| Analiza dnia (8 etapów: oferta → wyniki → prognozy → EV → walidacja → zapis) | **Kupon dnia** → „Uruchom analizę” |
-| Wirtualne kupony, wyniki, ROI, obsunięcie, CLV | **Historia i wyniki** |
+| Centrum analizy meczu: kursy, forma, statystyki, składy, prawdopodobieństwa AI, ryzyko | **Analiza AI** |
+| Kupony dnia: 3 profile (bezpieczny, zrównoważony, agresywny), 14 etapów od oferty do zapisu | **Kupon dnia** → „GENERUJ KUPONY DNIA” |
+| Wirtualne kupony, wyniki, rozliczenia, skuteczność kreatora, ROI, obsunięcie, CLV | **Historia i wyniki** |
 | Wyniki sportowe (źródła, świeżość lig, aktualizacja, konflikty), eksperyment, kalibracja | **Modele i eksperymenty** |
 | Profil podatkowy i reguły STS, baza, archiwum, eksport, kopie | **Ustawienia** |
 | Dane DEMO (fikcyjne, oddzielna baza) | przełącznik w pasku bocznym |
@@ -48,6 +56,14 @@ API-Sports (opcjonalnie): klucz z dashboard.api-football.com jako `API_SPORTS_KE
 w `.env`. Uwaga: darmowy plan obejmuje tylko sezony 2022–2024 (sprawdzono 01.11.2026);
 bieżące wyniki Ekstraklasy, NBA czy NHL wymagają płatnego planu.
 
+PitchAPI (zalecane): darmowy klucz z pitchapi.dev jako `PITCHAPI_KEY=…` w `.env`.
+- Daje wyniki top 5 lig i Ekstraklasy, statystyki meczowe (xG, strzały, rożne, kartki) i składy.
+- Regulamin nie jest opublikowany, więc dane służą tylko do prywatnej analizy, bez
+  redystrybucji.
+- Limit to 60 zapytań o statystyki na jedno generowanie kuponów (Ustawienia).
+
+Profile kuponów i progi walidacji: `config/probability_policy.toml` (wersjonowane).
+
 CLI (te same funkcje bez interfejsu):
 
 ```powershell
@@ -57,9 +73,11 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge research fetch-data         # openfootball CC0 (wymaga wyłączenia offline)
 .\.venv\Scripts\sports-edge research import-data
 .\.venv\Scripts\sports-edge research update-results     # brakujące wyniki (football-data.org)
-.\.venv\Scripts\sports-edge analyse 2026-11-02 --refresh-offer   # analiza dnia jednym poleceniem
+.\.venv\Scripts\sports-edge analyse 2026-11-02 --refresh-offer   # GENERUJ KUPONY DNIA bez interfejsu
 .\.venv\Scripts\sports-edge research experiment         # Elo: trening / walidacja / holdout
 .\.venv\Scripts\sports-edge research predict            # prognozy przedmeczowe (blokady czasu i danych)
+.\.venv\Scripts\sports-edge research goals-experiment   # Dixon–Coles + kalibracja + walidacja predykcyjna
+.\.venv\Scripts\sports-edge research goals-predict      # prognozy rynków bramkowych
 .\.venv\Scripts\sports-edge research results            # wyniki z danych niezależnych (pewne dopasowanie)
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
@@ -76,7 +94,7 @@ CLI (te same funkcje bez interfejsu):
 | `data/samples/sts/` | autentyczne PDF STS z 31.10.2026 do testów regresji parsera (prywatna kopia) |
 | `data/sources/openfootball/` | wyniki historyczne CC0 + manifest (URL, SHA-256, czas pobrania) |
 | `data/sources/results/` | surowe odpowiedzi dostawców wyników (pochodzenie każdej aktualizacji) |
-| `.env` | lokalne klucze API (np. `FOOTBALL_DATA_API_KEY`) — nigdy w repozytorium |
+| `.env` | lokalne klucze API (`FOOTBALL_DATA_API_KEY`, `PITCHAPI_KEY`, …) — nigdy w repozytorium |
 | `data/exports/` | eksporty JSON/CSV |
 | `backups/YYYY-MM-DD_HH-MM-SS/` | kopie zapasowe: config, baza (snapshot SQLite), ustawienia, manifest SHA-256 |
 | `config/` | profil STS i podatki, `sts_rules.toml` (zweryfikowane reguły), polityka kuponu, aliasy; `config/archive/` — wycofany Superbet |
@@ -89,7 +107,8 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-171 testów (69 z TASK 001 + 102 z TASK 002–004). Testy parserów używają oznaczonych fixture
+196 testów (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005, w tym test integracyjny od
+PDF STS do raportu skuteczności). Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
 (katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
 uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.
@@ -101,16 +120,21 @@ Dokładne wersje pakietów: `requirements-dev.lock` (TASK 001) i `requirements-a
 src/sports_edge/
   pdf/            layout (współrzędne słów), sts (oferta drukowana STS), engine (tylko STS)
   offers/         model wiersza oferty, katalog rynków, normalizacja tekstu, źródła (PDF, API)
-  analysis/       edge_engine (EV, statusy, poziomy kandydatów), coupon (SOLO/AKO), policy
-  models/         registry (wersje, prognozy, bramki walidacji), elo, calibration
-  datasources/    kontrakt dostawców wyników, rejestr rozgrywek, football-data.org, API-Sports,
-                  openfootball, STS/Superbet (nieaktywne)
+  analysis/       edge_engine (EV, statusy, poziomy kandydatów), coupon (SOLO/AKO), policy,
+                  coupon_builder (kreator kuponów: profile, szansa kuponu, wypłata po podatku)
+  models/         registry (wersje, prognozy, bramki walidacji), elo, goals (Dixon–Coles),
+                  calibration (izotoniczna, Wilson, przedziały)
+  datasources/    kontrakt dostawców wyników, rejestr rozgrywek, football-data.org, PitchAPI,
+                  API-Sports, openfootball, STS/Superbet (nieaktywne)
   app/            interfejs Streamlit (7 widoków)
-  storage.py      SQLite tylko-dopisywanie, migracja v3 z kopią;  repository.py  importy i widoki
+  storage.py      SQLite tylko-dopisywanie, migracje do v5 z kopią;  repository.py  importy i widoki
   history.py      historia kursów STS, zmiany, momenty przed meczem, CLV, braki
   results_engine.py  aktualizacja wyników: brakujący okres, duplikaty, korekty, konflikty, hierarchia
   matching.py     dopasowanie STS ↔ dane niezależne, zgodność rynków;  paper.py  kupony, ROI, CLV
   sportsdata.py   dane niezależne (as-of), eksperyment Elo, prognozy przedmeczowe
+  probability_lab.py  Dixon–Coles walk-forward, kalibracja, walidacja predykcyjna, prognozy
+  sports_intel.py statystyki meczowe, składy, cechy przedmeczowe as-of (migawki)
+  performance.py  skuteczność kuponów i selekcji kreatora
   provenance.py   stan kodu i snapshot danych;  bookmakers.py  profil STS i reguły rynków
   backup.py, export.py, services.py, settings.py, cli.py
   domain.py, settlement.py, edge.py, probability.py, temporal.py, markets.py  (fundamenty TASK 001)
@@ -120,6 +144,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 005](docs/task_005_report.md) | Źródła statystyk, Sports Intelligence, modele i kalibracja, kreator kuponów, TASK 006 |
 | [Raport TASK 004](docs/task_004_report.md) | Diagnoza, źródła wyników, aktualizacja, prognozy, analiza dnia, TASK 005 |
 | [Raport TASK 003](docs/task_003_report.md) | STS ONLY, dane, Elo, walidacja, leakage, wyniki |
 | [Raport TASK 002](docs/task_002_report.md) | Aplikacja, parser STS, API, testy (stan sprzed STS ONLY) |

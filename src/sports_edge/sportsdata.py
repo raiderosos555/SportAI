@@ -18,7 +18,7 @@ from math import sqrt
 from sports_edge.analysis.policy import Policy
 from sports_edge.datasources import openfootball
 from sports_edge.ingestion.types import canonical, digest, iso
-from sports_edge.matching import alias_map, match_participant, participant_key
+from sports_edge.matching import TeamIdentities, alias_map, match_participant
 from sports_edge.models import calibration
 from sports_edge.models.elo import (
     Elo,
@@ -30,7 +30,7 @@ from sports_edge.models.elo import (
 from sports_edge.models.registry import register_version, save_prediction
 from sports_edge.offers.text import NameNormalizer
 from sports_edge.provenance import code_state, data_snapshot
-from sports_edge.results_engine import effective_results, priority
+from sports_edge.results_engine import effective_results, known_names, priority
 from sports_edge.storage import Store
 
 REQUIRED = ("date", "home", "away", "home_score", "away_score")
@@ -226,7 +226,12 @@ def import_openfootball(
 
 
 def history(
-    store: Store, *, sport: str, until: datetime, competitions: tuple[str, ...] | None = None
+    store: Store,
+    *,
+    sport: str,
+    until: datetime,
+    competitions: tuple[str, ...] | None = None,
+    identities: TeamIdentities | None = None,
 ) -> list[HistoricalMatch]:
     """Results whose availability time is not later than ``until`` (as-of view).
 
@@ -235,7 +240,9 @@ def history(
     """
     return [
         _to_match(r)
-        for r in effective_results(store, sport=sport, until=until, competitions=competitions)
+        for r in effective_results(
+            store, sport=sport, until=until, competitions=competitions, identities=identities
+        )
     ]
 
 
@@ -358,15 +365,21 @@ def market_benchmark(store: Store, items: list[dict], *, moment: str = "closing"
     for r in rows:
         prices[(r["result_id"], r["operator"])][r["selection"]] = float(r["price"])
     by_id = {i["match"].result_id: i for i in items}
-    model_f, market_f, outcomes, operators = [], [], [], set()
+    # One observation per event: several operators of the same match are averaged into one
+    # de-margined consensus instead of being counted as independent events.
+    per_event: dict[str, list[dict]] = defaultdict(list)
+    operators = set()
     for (result_id, operator), odds in prices.items():
         if set(odds) != {"home", "draw", "away"}:
             continue
         overround = sum(1 / o for o in odds.values())
-        market_f.append({k: (1 / o) / overround for k, o in odds.items()})
+        per_event[result_id].append({k: (1 / o) / overround for k, o in odds.items()})
+        operators.add(operator)
+    model_f, market_f, outcomes = [], [], []
+    for result_id, books in sorted(per_event.items()):
+        market_f.append({k: sum(b[k] for b in books) / len(books) for k in books[0]})
         model_f.append(by_id[result_id]["forecast"])
         outcomes.append(by_id[result_id]["match"].outcome)
-        operators.add(operator)
     if not outcomes:
         return None
     return {
@@ -374,6 +387,7 @@ def market_benchmark(store: Store, items: list[dict], *, moment: str = "closing"
         "n_events": len(outcomes),
         "moment": moment,
         "operators": sorted(operators),
+        "operator_quotes": sum(len(b) for b in per_event.values()),
         "model_log_loss": round(calibration.log_loss(model_f, outcomes), 5),
         "market_log_loss": round(calibration.log_loss(market_f, outcomes), 5),
         "model_brier": round(calibration.brier(model_f, outcomes), 5),
@@ -390,9 +404,14 @@ def run_elo_experiment(
     now: datetime,
     policy: Policy,
     register: bool = True,
+    identities: TeamIdentities | None = None,
 ) -> dict:
     """Chronological train / validation / holdout experiment for 1X2 (regular time)."""
-    matches = _scoped(history(store, sport="football", until=now, competitions=competitions))
+    matches = _scoped(
+        history(
+            store, sport="football", until=now, competitions=competitions, identities=identities
+        )
+    )
     if not matches:
         raise ValueError("Brak danych historycznych dla wybranych rozgrywek")
     train = [m for m in matches if m.match_date < split.validation_from]
@@ -525,6 +544,7 @@ def predict_offer(
     normalizer: NameNormalizer,
     now: datetime,
     team_aliases: dict[tuple[str, str], str] | None = None,
+    identities: TeamIdentities | None = None,
 ) -> dict:
     """1X2 forecasts for upcoming STS football events in covered leagues (pre-match only)."""
     version = store.get("model_versions", version_id)
@@ -539,7 +559,9 @@ def predict_offer(
         if code in competitions
         for sts in league.sts_leagues
     }
-    rows = effective_results(store, sport="football", until=now, competitions=competitions)
+    rows = effective_results(
+        store, sport="football", until=now, competitions=competitions, identities=identities
+    )
     matches = [_to_match(r) for r in rows]
     providers = sorted({r["provider_resolved"] for r in rows}, key=priority)
     scoped = _scoped(matches)
@@ -550,7 +572,10 @@ def predict_offer(
     )
     walk_forward(scoped, model, three_way=True)
     aliases = alias_map(store, team_aliases)
-    known = {code: _keys(matches, code, normalizer) for code in competitions}
+    known = {
+        code: known_names([r for r in rows if r["competition"] == code], "football", normalizer)
+        for code in competitions
+    }
     bins = {(row["low"], row["high"]): row for row in validation["holdout"]["reliability"]}
     info_cutoff = max(m.available_at for m in matches)
     snapshot = data_snapshot(m.result_id for m in matches)
@@ -652,12 +677,3 @@ def _already_forecast(store: Store, version_id: str, event_id: str, snapshot: st
         if json.loads(row["inputs_json"]).get("data_snapshot") == snapshot:
             return True
     return False
-
-
-def _keys(matches: list[HistoricalMatch], code: str, normalizer: NameNormalizer) -> dict:
-    names: dict[str, str] = {}
-    for m in matches:
-        if m.competition == code:
-            for team in (m.home, m.away):
-                names.setdefault(participant_key(team, "football", normalizer), team)
-    return names

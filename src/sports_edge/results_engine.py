@@ -22,7 +22,12 @@ from zoneinfo import ZoneInfo
 from sports_edge.datasources.base import ResultRecord, SportsResultsProvider
 from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.ingestion.types import canonical, digest, iso
-from sports_edge.matching import ParticipantMatch, match_participant, participant_key
+from sports_edge.matching import (
+    ParticipantMatch,
+    TeamIdentities,
+    match_participant,
+    participant_key,
+)
 from sports_edge.offers.sources import SourceBlocked
 from sports_edge.offers.text import NameNormalizer
 from sports_edge.storage import Store
@@ -30,13 +35,15 @@ from sports_edge.storage import Store
 SOURCE_PRIORITY = {
     "manual_official": 1,
     "football_data_org": 2,
-    "api_sports": 3,
-    "openfootball": 4,
-    "csv": 5,
+    "pitchapi": 3,
+    "api_sports": 4,
+    "openfootball": 5,
+    "csv": 6,
 }
 SOURCE_LABELS = {
     "manual_official": "oficjalny organizator (wpis użytkownika)",
     "football_data_org": "football-data.org API v4",
+    "pitchapi": "PitchAPI",
     "api_sports": "API-Sports",
     "openfootball": "openfootball (CC0)",
     "csv": "import CSV użytkownika",
@@ -59,12 +66,19 @@ def priority(provider: str) -> int:
     return SOURCE_PRIORITY.get(provider, 9)
 
 
+def source_family(provider: SportsResultsProvider) -> str:
+    """Name used in the hierarchy and stored with every row (several adapters, one source:
+    e.g. API-Sports football, basketball and hockey adapters are all "api_sports")."""
+    return getattr(provider, "family", provider.id)
+
+
 def effective_results(
     store: Store,
     *,
     sport: str | None,
     until: datetime,
     competitions: Sequence[str] | None = None,
+    identities: TeamIdentities | None = None,
 ) -> list[dict]:
     """One row per match known by ``until``: best provider by hierarchy, newest observation.
 
@@ -108,7 +122,41 @@ def effective_results(
         chosen["corrections"] = sum(provider_of(r) == chosen_source for r in items) - 1
         out.append(chosen)
     out.sort(key=lambda r: (r["match_date"], r["id"]))
+    return apply_identities(out, identities) if identities else out
+
+
+def apply_identities(rows: list[dict], identities: TeamIdentities) -> list[dict]:
+    """Every spelling of a club becomes its most recent spelling (per competition).
+
+    The original spelling stays in ``home_source`` / ``away_source``.
+    """
+    latest: dict[tuple, tuple[str, str]] = {}
+    for row in rows:
+        for side in ("home", "away"):
+            name = identities.renames.get((row["competition"], row[side]), row[side])
+            key = (row["competition"], identities.key(row["competition"], row["sport"], name))
+            if key not in latest or row["match_date"] >= latest[key][0]:
+                latest[key] = (row["match_date"], name)
+    out = []
+    for row in rows:
+        renamed = dict(row)
+        for side in ("home", "away"):
+            key = (row["competition"], identities.key(row["competition"], row["sport"], row[side]))
+            renamed[f"{side}_source"] = row[side]
+            renamed[side] = latest[key][1]
+        out.append(renamed)
     return out
+
+
+def known_names(rows: Sequence[dict], sport: str, normalizer: NameNormalizer) -> dict[str, str]:
+    """Normalised key of every spelling seen (current and historical) → current spelling."""
+    known: dict[str, str] = {}
+    for row in sorted(rows, key=lambda r: r["match_date"], reverse=True):
+        for side in ("home", "away"):
+            for name in (row[side], row.get(f"{side}_source")):
+                if name:
+                    known.setdefault(participant_key(name, sport, normalizer), row[side])
+    return known
 
 
 def conflicts(store: Store, *, until: datetime, competitions: Sequence[str] | None = None):
@@ -177,10 +225,19 @@ def update_results(
     offline: bool,
     raw_dir: Path,
     progress: Callable[[str], None] | None = None,
+    identities: TeamIdentities | None = None,
 ) -> dict:
-    """Fetch only the missing window of every competition from the best active provider."""
+    """Fetch only the missing window of every competition from the best active provider.
+
+    When the preferred provider fails (network, quota, plan), the next active legal provider
+    for the same competition is tried; limits and licences are never worked around.
+    """
+    if len({p.id for p in providers}) != len(providers):
+        raise ValueError("Każdy dostawca wyników musi mieć unikalny identyfikator")
     statuses = {p.id: p.status(offline=offline) for p in providers}
-    active = sorted((p for p in providers if statuses[p.id].active), key=lambda p: priority(p.id))
+    active = sorted(
+        (p for p in providers if statuses[p.id].active), key=lambda p: priority(source_family(p))
+    )
     report: dict = {
         "started_at": iso(now),
         "providers": {
@@ -199,10 +256,13 @@ def update_results(
         "errors": [],
         "requests": 0,
     }
-    known_rows = effective_results(store, sport=None, until=now, competitions=competitions)
+    known_rows = effective_results(
+        store, sport=None, until=now, competitions=competitions, identities=identities
+    )
     for code in competitions:
         mine = [r for r in known_rows if r["competition"] == code]
-        provider = next((p for p in active if code in p.competitions), None)
+        candidates = [p for p in active if code in p.competitions]
+        provider = candidates[0] if candidates else None
         last = max((r["match_date"] for r in mine), default=None)
         league = COMPETITIONS.get(code)
         today = now.astimezone(ZoneInfo(league.zone if league else "UTC")).date()
@@ -221,13 +281,25 @@ def update_results(
         if provider is None:
             entry["status"] = "brak aktywnego źródła"
             continue
-        if progress:
-            progress(f"{code}: {provider.name}, okres {entry['window'][0]} – {entry['window'][1]}")
-        try:
-            outcome = provider.fetch(code, date_from, date_to, now=now)
-        except SourceBlocked as error:
-            entry["status"] = f"błąd: {error}"
-            report["errors"].append(f"{code}: {error}")
+        outcome, failures = None, []
+        for candidate in candidates:
+            if progress:
+                progress(
+                    f"{code}: {candidate.name}, okres {entry['window'][0]} – {entry['window'][1]}"
+                )
+            try:
+                outcome = candidate.fetch(code, date_from, date_to, now=now)
+            except SourceBlocked as error:
+                failures.append(f"{candidate.name}: {error}")
+                report["errors"].append(f"{code}: {candidate.name}: {error}")
+                continue  # fallback to the next legal provider for this competition
+            provider = candidate
+            break
+        entry["provider"] = provider.id
+        if failures:
+            entry["fallback"] = failures
+        if outcome is None:
+            entry["status"] = "błąd: " + " | ".join(failures)
             continue  # earlier competitions stay saved; a rerun resumes from their new state
         report["requests"] += outcome.requests
         applied = _apply(
@@ -272,6 +344,7 @@ def _apply(
     Without any history in the competition (e.g. Ekstraklasa, NBA) the first source's names
     become the canonical names ("source" confidence); afterwards every name must match them.
     """
+    family = source_family(provider)
     body = b"\n".join(data for _url, data in payloads)
     sha = hashlib.sha256(body).hexdigest()
     import_id = digest(["data_import", sha, "results_api"])
@@ -293,16 +366,13 @@ def _apply(
     # An identical payload is re-processed record by record (row ids deduplicate): records
     # skipped earlier, e.g. before the user confirmed an alias, can still be imported.
     seen_payload = store.get("data_imports", import_id) is not None
-    known: dict[str, str] = {}
-    for row in sorted(existing, key=lambda r: r["match_date"], reverse=True):
-        for team in (row["home"], row["away"]):
-            known.setdefault(participant_key(team, sport, normalizer), team)
+    known = known_names(existing, sport, normalizer)
     bootstrap = not existing
     by_match = {(r["match_date"], r["home"], r["away"]): r for r in existing}
     by_source = {
         r["source_event_id"]: r
         for r in existing
-        if r.get("source_event_id") and provider_of(r) == provider.id
+        if r.get("source_event_id") and provider_of(r) == family
     }
     rows = []
     for record in records:
@@ -334,7 +404,7 @@ def _apply(
                         "start_at": iso(record.start_at) if record.start_at else None,
                         "match_date": record.match_date,
                         "status": record.status,
-                        "provider": provider.id,
+                        "provider": family,
                         "source_event_id": record.source_event_id,
                     }
                 )
@@ -359,7 +429,7 @@ def _apply(
         row_id = digest(
             [
                 "hist",
-                provider.id,
+                family,
                 record.source_event_id or [record.match_date, home.target, away.target],
                 record.home_score,
                 record.away_score,
@@ -376,7 +446,7 @@ def _apply(
             out["corrections"].append(
                 f"{label}: {same['home_score']}:{same['away_score']} → {score[0]}:{score[1]}"
             )
-        elif other is not None and provider_of(other) != provider.id:
+        elif other is not None and provider_of(other) != family:
             if (other["home_score"], other["away_score"]) == score:
                 summary["confirmations"] += 1
             else:
@@ -386,7 +456,7 @@ def _apply(
                         "match_date": record.match_date,
                         "existing": f"{other['home_score']}:{other['away_score']} "
                         f"({provider_of(other)})",
-                        "new": f"{score[0]}:{score[1]} ({provider.id})",
+                        "new": f"{score[0]}:{score[1]} ({family})",
                     }
                 )
         rows.append(
@@ -405,7 +475,7 @@ def _apply(
                 "available_at_basis": basis,
                 "start_at": iso(record.start_at) if record.start_at else None,
                 "details_json": canonical(record.details),
-                "provider": provider.id,
+                "provider": family,
                 "source_event_id": record.source_event_id,
                 "status": record.status,
                 "home_raw": record.home,

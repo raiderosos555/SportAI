@@ -1,0 +1,35 @@
+# Club identities inside the independent results history (TASK 005).
+#
+# openfootball changed its spelling of many clubs around 2020 (France: 2023), e.g.
+# "Aston Villa" -> "Aston Villa FC". Without this step a model sees two different teams and
+# restarts the rating in the middle of the history. Spellings whose normalised key is equal
+# (FC / AFC / Calcio / numbers) are merged automatically; the pairs below differ in their key
+# and were reviewed one by one on 2026-11-01 (same club, new official spelling).
+#
+# Deliberately NOT merged (different clubs despite similar names): Paris FC / Paris
+# Saint-Germain, Gazélec Ajaccio / AC Ajaccio, Chievo Verona / Hellas Verona,
+# Real Valladolid / Real Oviedo, Stoke City / Manchester City and similar look-alikes.
+#
+# Format: old spelling = current spelling, per competition code.
+
+["es.1"]
+"RC Celta" = "RC Celta de Vigo"
+"Espanyol Barcelona" = "RCD Espanyol de Barcelona"
+"Real Betis" = "Real Betis Balompié"
+"Real Sociedad" = "Real Sociedad de Fútbol"
+"Rayo Vallecano" = "Rayo Vallecano de Madrid"
+"Deportivo La Coruña" = "RC Deportivo La Coruña"
+"CD Alavés" = "Deportivo Alavés"
+
+["de.1"]
+"Bor. Mönchengladbach" = "Borussia Mönchengladbach"
+"1899 Hoffenheim" = "TSG 1899 Hoffenheim"
+
+["it.1"]
+"Sampdoria" = "UC Sampdoria"
+"Lazio Roma" = "SS Lazio"
+
+["fr.1"]
+"RC Lens" = "Racing Club de Lens"
+"ESTAC Troyes" = "ES Troyes AC"
+"RC Strasbourg" = "RC Strasbourg Alsace"

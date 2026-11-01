@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -25,10 +25,16 @@ ADDED_COLUMNS = (
     ("historical_results", "published_at", "TEXT"),
     ("historical_results", "observed_at", "TEXT"),
     ("data_imports", "summary_json", "TEXT NOT NULL DEFAULT '{}'"),
+    # v5: coupon proposals of the probability-first builder (profile, policy, prediction)
+    ("coupons", "profile", "TEXT"),
+    ("coupons", "policy_version", "TEXT"),
+    ("coupons", "predicted_probability", "TEXT"),
+    ("coupons", "proposal_json", "TEXT"),
 )
 MIGRATIONS = {
     3: "STS ONLY, archive, odds metadata",
     4: "results providers: provenance columns and update reports",
+    5: "sports statistics store, feature snapshots, coupon proposals",
 }
 
 SCHEMA = """
@@ -174,6 +180,22 @@ CREATE TABLE IF NOT EXISTS benchmark_odds (
  market_key TEXT NOT NULL, selection TEXT NOT NULL, price TEXT NOT NULL, observed_at TEXT,
  UNIQUE(result_id, operator, moment, market_key, selection)
 );
+CREATE TABLE IF NOT EXISTS stat_observations (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL, sport TEXT NOT NULL, competition TEXT, season TEXT,
+ entity_type TEXT NOT NULL CHECK(entity_type IN ('event','team','player','competition')),
+ entity_key TEXT NOT NULL, event_date TEXT, source TEXT NOT NULL, source_ref TEXT,
+ payload_json TEXT NOT NULL, data_version TEXT NOT NULL,
+ quality TEXT NOT NULL CHECK(quality IN ('complete','partial','unverified')),
+ published_at TEXT, fetched_at TEXT NOT NULL, observed_at TEXT NOT NULL,
+ available_at TEXT NOT NULL, available_basis TEXT NOT NULL, import_id TEXT
+);
+CREATE TABLE IF NOT EXISTS feature_snapshots (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id), decision_time TEXT NOT NULL,
+ feature_set TEXT NOT NULL, features_json TEXT NOT NULL, inputs_json TEXT NOT NULL,
+ created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS stat_entity ON stat_observations(kind, entity_key, available_at);
+CREATE INDEX IF NOT EXISTS feature_event ON feature_snapshots(event_id, decision_time);
 CREATE INDEX IF NOT EXISTS event_day ON events(bookmaker_id, offer_date);
 CREATE INDEX IF NOT EXISTS market_event ON markets(event_id);
 CREATE INDEX IF NOT EXISTS quote_market ON quote_sets(market_id, valid_at);
@@ -234,6 +256,7 @@ class Store:
 
         v3: Superbet and generic sources leave the active flow; their rows stay archived.
         v4: only new nullable/default columns (ALTER TABLE above); existing rows are kept.
+        v5: new append-only tables (statistics, feature snapshots) and nullable coupon columns.
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

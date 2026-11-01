@@ -76,6 +76,7 @@ class CouponReport:
     ako: AkoAnalysis
     experimental: tuple[Candidate, ...] = ()
     probable: tuple[Candidate, ...] = ()  # informational: highest model win probability
+    probable_unconfirmed: tuple[Candidate, ...] = ()  # same, but the price needs confirmation
     counts: dict[str, int] = field(default_factory=dict)
     warnings: tuple[str, ...] = field(default_factory=tuple)
     diagnosis: tuple[str, ...] = field(default_factory=tuple)
@@ -120,7 +121,9 @@ def build_daily_coupon(
             reverse=True,
         )
     )
-    probable = probable_ranking(candidates, policy)
+    probable_all = probable_ranking(candidates, policy)
+    probable = tuple(c for c in probable_all if c.freshness == "fresh")
+    probable_unconfirmed = tuple(c for c in probable_all if c.freshness != "fresh")
     counts = {
         "probable": len(probable),
         "events": len({c.event_id for c in candidates}),
@@ -154,6 +157,7 @@ def build_daily_coupon(
         ako=ako,
         experimental=experimental,
         probable=probable,
+        probable_unconfirmed=probable_unconfirmed,
         counts=counts,
         warnings=tuple(warnings),
         diagnosis=diagnose(counts),
@@ -299,6 +303,7 @@ def save_analysis(
         "accepted": [c.key for c in report.solo],
         "experimental": [c.key for c in report.experimental],
         "probable": [c.key for c in report.probable],
+        "probable_unconfirmed": [c.key for c in report.probable_unconfirmed],
         "counts": report.counts,
         "rejection_reasons": report.rejection_reasons,
         "ako": {"created": report.ako.created, "reason": report.ako.reason},

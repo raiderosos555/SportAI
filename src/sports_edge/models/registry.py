@@ -136,11 +136,15 @@ def save_prediction(
     return key
 
 
-def latest_predictions(store: Store, *, as_of: datetime) -> dict[tuple, dict]:
+def latest_predictions(
+    store: Store, *, as_of: datetime, prefer: dict[str, str] | None = None
+) -> dict[tuple, dict]:
     """Newest pre-match prediction per (event, market, period, line).
 
     Only prospective forecasts created no later than ``as_of`` and strictly before the event
-    start qualify; anything made after kick-off is never a pre-match forecast.
+    start qualify; anything made after kick-off is never a pre-match forecast. ``prefer``
+    maps a market to the model family chosen for it on validation (e.g. 1X2 → Elo or
+    Dixon–Coles); a newer forecast of another family never replaces the preferred one.
     """
     rows = store.rows(
         """SELECT p.*, v.status version_status, v.version, v.validation_json, m.family,
@@ -159,7 +163,12 @@ def latest_predictions(store: Store, *, as_of: datetime) -> dict[tuple, dict]:
         row["uncertainty"] = json.loads(row["uncertainty_json"])
         row["inputs"] = json.loads(row["inputs_json"])
         row["validation"] = json.loads(row["validation_json"])
-        latest[(row["event_id"], row["market_key"], row["period"], row["line"])] = row
+        key = (row["event_id"], row["market_key"], row["period"], row["line"])
+        wanted = (prefer or {}).get(row["market_key"])
+        current = latest.get(key)
+        if wanted and current is not None and current["family"] == wanted != row["family"]:
+            continue
+        latest[key] = row
     return latest
 
 

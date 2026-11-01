@@ -117,6 +117,29 @@ def confirm_alias(
     return key
 
 
+@dataclass(frozen=True)
+class TeamIdentities:
+    """One club, one identity across the spellings of the results history.
+
+    Spellings with the same normalised key are the same club; reviewed renames (config
+    ``team_identities.toml``) join spellings whose keys differ.
+    """
+
+    normalizer: NameNormalizer
+    renames: dict[tuple[str, str], str]
+
+    def key(self, competition: str, sport: str, name: str) -> str:
+        return participant_key(self.renames.get((competition, name), name), sport, self.normalizer)
+
+
+def load_team_identities(path: Path, normalizer: NameNormalizer) -> TeamIdentities:
+    data = tomllib.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    renames = {
+        (competition, old): new for competition, pairs in data.items() for old, new in pairs.items()
+    }
+    return TeamIdentities(normalizer, renames)
+
+
 def market_identity(market: dict) -> tuple:
     return (market["market_key"], market["period"], market["overtime"], market["line"])
 

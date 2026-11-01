@@ -68,6 +68,8 @@ class AppSettings:
     football_data_enabled: bool = True  # needs the user's own free FOOTBALL_DATA_API_KEY
     openfootball_update_enabled: bool = True  # re-reads current-season CC0 files
     api_sports_enabled: bool = True  # needs the user's own free API_SPORTS_KEY
+    pitchapi_enabled: bool = True  # results + match statistics, user's PITCHAPI_KEY
+    stats_requests_per_run: int = 60  # polite cap for match statistics per analysis
 
 
 def local_secret(name: str, root: Path | None = None) -> str | None:

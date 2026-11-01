@@ -17,7 +17,7 @@ from sports_edge.bookmakers import BookmakerProfile
 from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.matching import alias_map, match_participant, participant_key
-from sports_edge.results_engine import SOURCE_LABELS, effective_results
+from sports_edge.results_engine import SOURCE_LABELS, effective_results, known_names
 from sports_edge.settlement import Outcome, settle
 from sports_edge.storage import Store
 
@@ -50,7 +50,13 @@ def create_coupon(
     analysis_id: str | None = None,
     prediction_ids: dict[str, str] | None = None,
     note: str = "",
+    proposal: dict | None = None,
+    key: str | None = None,
 ) -> str:
+    """Store a virtual coupon before its first event. ``proposal`` keeps the builder's profile,
+    policy, predicted probability and snapshots; ``key`` makes a proposal idempotent."""
+    if key is not None and store.get("coupons", key) is not None:
+        return key
     if mode not in MODES:
         raise ValueError("Unknown coupon mode")
     if profile.id != "sts":
@@ -81,7 +87,15 @@ def create_coupon(
     if cap and stake * total > cap:
         raise ValueError(f"Potencjalna wygrana przekracza limit operatora {cap} zł (R 17.2)")
     first = min(leg["start_at"] for leg in legs)
-    key = digest(["coupon", mode, sorted(odds_ids), str(stake), iso(now)])
+    key = key or digest(["coupon", mode, sorted(odds_ids), str(stake), iso(now)])
+    extra = {}
+    if proposal is not None:
+        extra = {
+            "profile": proposal.get("profile"),
+            "policy_version": proposal.get("policy_version"),
+            "predicted_probability": canonical(proposal.get("probability", {})),
+            "proposal_json": canonical(proposal),
+        }
     with store.transaction():
         store.insert(
             "coupons",
@@ -97,6 +111,7 @@ def create_coupon(
             total_odds=str(total),
             first_start_at=first,
             note=note,
+            **extra,
         )
         for leg in legs:
             store.insert(
@@ -454,6 +469,7 @@ def import_source_results(
     normalizer,
     team_aliases,
     only_coupons: bool = True,
+    identities=None,
 ) -> dict:
     """Copy results of STS events from the independent results when the match is certain.
 
@@ -483,7 +499,9 @@ def import_source_results(
     )
     by_day: dict[tuple, list[dict]] = {}
     if codes:
-        for row in effective_results(store, sport=None, until=now, competitions=codes):
+        for row in effective_results(
+            store, sport=None, until=now, competitions=codes, identities=identities
+        ):
             by_day.setdefault((row["competition"], row["match_date"]), []).append(row)
     recorded, unresolved = 0, []
     for event in events:
@@ -503,11 +521,7 @@ def import_source_results(
             .isoformat()
         )
         rows = by_day.get((code, local_day), [])
-        known = {
-            participant_key(r[side], sport, normalizer): r[side]
-            for r in rows
-            for side in ("home", "away")
-        }
+        known = known_names(rows, sport, normalizer)
         home = match_participant(event["home"] or "", sport, known, normalizer, aliases)
         away = match_participant(event["away"] or "", sport, known, normalizer, aliases)
         found = [r for r in rows if r["home"] == home.target and r["away"] == away.target]

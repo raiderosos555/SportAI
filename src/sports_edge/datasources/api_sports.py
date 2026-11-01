@@ -172,7 +172,8 @@ class DailyQuota:
 
 
 class _ApiSportsBase:
-    id = "api_sports"
+    id = "api_sports_football"  # unique per adapter (status, raw files)
+    family = "api_sports"  # one source in the hierarchy and in stored rows
     license = LICENSE
     requires_network = True
     paid = False
@@ -293,6 +294,7 @@ class ApiSportsGamesProvider(_ApiSportsBase):
     def __init__(self, key: str | None, *, sport: str, **kwargs):
         super().__init__(key, **kwargs)
         self.sport = sport
+        self.id = f"api_sports_{sport}"
         self.sports = (sport,)
         self.name = f"API-Sports {sport} v1"
         self.competitions = {

@@ -56,7 +56,24 @@ DERIVED_FROM_1X2 = {
 
 
 def derive_from_1x2(prediction: dict, market_key: str) -> dict:
-    """Double chance from the same 1X2 forecast; interval bounds are added (conservative)."""
+    """Double chance from the same 1X2 forecast; interval bounds are added (conservative).
+
+    A model that calibrated the derived market separately (Dixon–Coles) ships its calibrated
+    values and status inside the 1X2 row; those are used as they are.
+    """
+    shipped = (prediction["uncertainty"].get("derived") or {}).get(market_key)
+    if shipped:
+        return {
+            **prediction,
+            "probabilities": shipped["calibrated"],
+            "uncertainty": {
+                **prediction["uncertainty"],
+                "interval": shipped.get("interval", {}),
+                "predictive_status": shipped.get("predictive_status", "experimental"),
+                "family": market_key,
+            },
+            "derived_from": "1x2",
+        }
     parts = DERIVED_FROM_1X2[market_key]
     probabilities = prediction["probabilities"]
     interval = prediction["uncertainty"].get("interval", {})
@@ -73,10 +90,19 @@ def derive_from_1x2(prediction: dict, market_key: str) -> dict:
         for selection, keys in parts.items()
         if all(k in interval for k in keys)
     }
+    uncertainty = prediction["uncertainty"]
     return {
         **prediction,
         "probabilities": derived_p,
-        "uncertainty": {**prediction["uncertainty"], "interval": derived_i},
+        "uncertainty": {
+            **uncertainty,
+            "interval": derived_i,
+            "family": market_key,
+            # a derived market has its own validation status (never the one of 1X2)
+            "predictive_status": (uncertainty.get("derived_status") or {}).get(
+                market_key, "experimental"
+            ),
+        },
         "derived_from": "1x2",
     }
 
@@ -93,6 +119,18 @@ def calibration_note(prediction: dict | None, p: float | None) -> str:
     """How often holdout forecasts in the same probability bin came true (1X2 outcomes)."""
     if prediction is None or p is None:
         return "—"
+    family = prediction["uncertainty"].get("family")
+    ranges = ((prediction["validation"].get("families") or {}).get(family) or {}).get("ranges")
+    if ranges:
+        for row in ranges:
+            low, high = (float(x.strip("%")) / 100 for x in row["range"].split("–"))
+            if row["n"] and low <= p < high + (1e-9 if high == 1.0 else 0):
+                lo, hi = row["ci95"]
+                return (
+                    f"holdout {row['range']}: trafione {row['freq']:.0%} "
+                    f"(95%: {lo:.0%}–{hi:.0%}, n={row['n']})"
+                )
+        return "brak prognoz holdoutu w tym przedziale"
     if prediction.get("derived_from"):
         return "prognoza pochodna z 1X2 — bez osobnej kalibracji"
     for row in (prediction["validation"].get("holdout") or {}).get("reliability", []):
@@ -147,6 +185,7 @@ class Candidate:
     warnings: tuple[str, ...] = ()
     explanation: dict = field(default_factory=dict)
     event_status: str = "unknown"
+    predictive_status: str = "brak prognozy"  # accuracy/calibration, never the economic edge
     break_even: float | None = None  # win probability needed for zero net EV (STS tax)
     calibration: str = "—"
     odds_age_hours: float | None = None
@@ -430,6 +469,11 @@ def _candidate(
             else None
         ),
         calibration=calibration_note(prediction, p_model),
+        predictive_status=(
+            prediction["uncertainty"].get("predictive_status", "experimental")
+            if prediction
+            else "brak prognozy"
+        ),
         odds_age_hours=age_hours,
         document_at=row.get("valid_at"),
         fetched_at=row.get("fetched_at"),

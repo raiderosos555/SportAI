@@ -848,7 +848,9 @@ def test_one_button_flow_from_pdf_to_settlement(app_paths, sts_fixture_pdf):
         flow.report.headline == NO_EDGE and "Brak potwierdzonej przewagi" in flow.report.diagnosis
     )
     saved = json.loads(store.get("analyses", flow.analysis_id)["summary_json"])
-    assert [s["stage"] for s in saved["pipeline"]["stages"]] == list(services.STAGES)[:7]
+    assert [s["stage"] for s in saved["pipeline"]["stages"]] == list(services.STAGES)[
+        : services.STAGES.index("Zapis")
+    ]
     home = next(c for c in real if c.selection == "home")
     coupon = create_coupon(
         store,
