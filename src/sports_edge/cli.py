@@ -40,34 +40,25 @@ def demo() -> None:
 
 
 def _context():
-    from sports_edge.repository import ensure_reference_data
+    from sports_edge.services import open_store
     from sports_edge.settings import AppPaths, load_settings, project_root
-    from sports_edge.storage import Store
 
     paths = AppPaths(project_root())
-    store = Store(paths.database)
-    ensure_reference_data(store)
-    return paths, load_settings(paths), store
+    return paths, load_settings(paths), open_store(paths)
 
 
-def import_pdf(path: Path, bookmaker: str | None) -> None:
+def _print(data: dict) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
+
+
+def import_pdf(path: Path) -> None:
     from sports_edge.services import import_pdf_bytes
 
     paths, settings, store = _context()
     outcome = import_pdf_bytes(
-        store,
-        paths,
-        settings,
-        path.read_bytes(),
-        file_name=path.name,
-        bookmaker=bookmaker,
-        now=datetime.now(UTC),
+        store, paths, settings, path.read_bytes(), file_name=path.name, now=datetime.now(UTC)
     )
-    print(
-        json.dumps(
-            {"duplicate": outcome.duplicate, **outcome.summary}, indent=2, ensure_ascii=False
-        )
-    )
+    _print({"duplicate": outcome.duplicate, **outcome.summary})
 
 
 def fetch_sts(day: str) -> None:
@@ -75,11 +66,43 @@ def fetch_sts(day: str) -> None:
 
     paths, settings, store = _context()
     outcome = fetch_sts_offer(store, paths, settings, day, now=datetime.now(UTC))
-    print(
-        json.dumps(
-            {"duplicate": outcome.duplicate, **outcome.summary}, indent=2, ensure_ascii=False
+    _print({"duplicate": outcome.duplicate, **outcome.summary})
+
+
+def research(step: str) -> None:
+    """Independent data and the first experiment; downloads respect the offline setting."""
+    from sports_edge import services
+    from sports_edge.datasources import openfootball
+
+    paths, settings, store = _context()
+    now = datetime.now(UTC)
+    if step == "fetch-data":
+        _print(
+            openfootball.fetch(
+                paths.data / "sources" / "openfootball",
+                leagues=list(openfootball.LEAGUES),
+                seasons=openfootball.season_range("2012-13", "2026-27"),
+                offline=settings.offline_mode,
+            )
         )
-    )
+    elif step == "import-data":
+        _print(services.import_openfootball_files(store, paths, now=now))
+    elif step == "experiment":
+        report = services.run_research_experiment(store, paths, now=now)
+        _print({k: v for k, v in report.items() if k not in {"selection", "holdout"}})
+    elif step == "predict":
+        _print(services.generate_predictions(store, paths, now=now))
+    elif step == "results":
+        from sports_edge.paper import import_source_results
+
+        _print(
+            import_source_results(
+                store,
+                now=now,
+                normalizer=services.normalizer(paths),
+                team_aliases=services.team_aliases(paths),
+            )
+        )
 
 
 def export(kind: str) -> None:
@@ -115,9 +138,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Sports Edge AI: local analysis, paper only")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("demo", help="synthetic arithmetic example (no data)")
-    pdf = commands.add_parser("import-pdf", help="import an STS/Superbet PDF offer")
+    pdf = commands.add_parser("import-pdf", help="import an STS printed-offer PDF")
     pdf.add_argument("path", type=Path)
-    pdf.add_argument("--bookmaker", choices=["sts", "superbet"], default=None)
     sts = commands.add_parser("fetch-sts", help="download an official STS PDF (opt-in)")
     sts.add_argument("day", choices=["today", "tomorrow", "week"])
     exp = commands.add_parser("export", help="export local results")
@@ -125,11 +147,15 @@ def main() -> None:
     bak = commands.add_parser("backup", help="create backups/YYYY-MM-DD_HH-MM-SS")
     bak.add_argument("--include-raw", action="store_true")
     commands.add_parser("check", help="verify configuration before starting the app")
+    res = commands.add_parser("research", help="independent data, experiment, forecasts")
+    res.add_argument(
+        "step", choices=["fetch-data", "import-data", "experiment", "predict", "results"]
+    )
     args = parser.parse_args()
     if args.command == "demo":
         demo()
     elif args.command == "import-pdf":
-        import_pdf(args.path, args.bookmaker)
+        import_pdf(args.path)
     elif args.command == "fetch-sts":
         fetch_sts(args.day)
     elif args.command == "export":
@@ -138,6 +164,8 @@ def main() -> None:
         backup(args.include_raw)
     elif args.command == "check":
         sys.exit(check())
+    elif args.command == "research":
+        research(args.step)
 
 
 if __name__ == "__main__":

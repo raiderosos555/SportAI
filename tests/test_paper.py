@@ -1,6 +1,7 @@
 """Virtual coupons, predictions history, settlement with taxes, ROI and CLV."""
 
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -23,14 +24,17 @@ pytest.importorskip("pymupdf")
 NOW = datetime(2026, 10, 31, 12, tzinfo=UTC)
 
 
-def odds_id(store, home, market="1x2", selection="home", bookmaker="sts"):
-    for row in offer_table(store, bookmaker=bookmaker, day="2026-10-31"):
+def odds_id(store, home, market="1x2", selection="home"):
+    for row in offer_table(store, day="2026-10-31"):
         if row["home"] == home and row["market_key"] == market:
             return row["selections"][selection]["odds_id"], row["event_id"]
     raise LookupError(home)
 
 
-def test_prediction_history_is_immutable(store, import_both):
+INPUTS = {"info_cutoff": "2026-10-30T00:00:00+00:00", "data_snapshot": "s", "code_state": "c"}
+
+
+def test_prediction_history_is_immutable_and_pre_match_only(store, import_sts):
     from sports_edge.analysis.policy import Policy
 
     version_id, status, reasons = register_version(
@@ -42,56 +46,69 @@ def test_prediction_history_is_immutable(store, import_both):
         created_at=NOW,
         trained_through=None,
         training_data={},
-        validation={"n_out_of_sample": 10},
+        validation={"holdout": {"n": 10}},
         policy=Policy(),
     )
     assert status == "experimental" and len(reasons) == 4
-    first = save_prediction(
-        store,
-        model_version_id=version_id,
-        event_id=None,
-        market_key="1x2",
-        period="FT",
-        line=None,
-        probabilities={"home": 0.5, "draw": 0.3, "away": 0.2},
-        uncertainty={},
-        inputs={},
-        kind="prospective",
-        created_at=NOW,
-    )
-    second = save_prediction(
-        store,
-        model_version_id=version_id,
-        event_id=None,
-        market_key="1x2",
-        period="FT",
-        line=None,
-        probabilities={"home": 0.4, "draw": 0.3, "away": 0.3},
-        uncertainty={},
-        inputs={},
-        kind="prospective",
-        created_at=NOW + timedelta(hours=1),
-    )
+    _, event = odds_id(store, "Legia Warszawa")
+
+    def save(probabilities, created_at, **overrides):
+        return save_prediction(
+            store,
+            model_version_id=version_id,
+            event_id=event,
+            market_key="1x2",
+            period="FT",
+            line=None,
+            probabilities=probabilities,
+            uncertainty={},
+            inputs=INPUTS,
+            kind="prospective",
+            created_at=created_at,
+            **overrides,
+        )
+
+    first = save({"home": 0.5, "draw": 0.3, "away": 0.2}, NOW)
+    second = save({"home": 0.4, "draw": 0.3, "away": 0.3}, NOW + timedelta(hours=1))
     assert first != second and store.scalar("SELECT COUNT(*) FROM predictions") == 2
     with pytest.raises(sqlite3.IntegrityError):
         store.connection.execute("UPDATE predictions SET probabilities_json='{}'")
     with pytest.raises(ValueError):
+        save({"home": 0.9}, NOW)
+    kickoff = datetime(2026, 10, 31, 19, 30, tzinfo=UTC)  # Legia - Lech 20:30 Warsaw time
+    with pytest.raises(ValueError, match="rozpoczęło"):
+        save({"home": 0.5, "draw": 0.3, "away": 0.2}, kickoff)
+    with pytest.raises(ValueError, match="wersjonowania"):
         save_prediction(
             store,
             model_version_id=version_id,
-            event_id=None,
+            event_id=event,
             market_key="1x2",
             period="FT",
             line=None,
-            probabilities={"home": 0.9},
+            probabilities={"home": 1.0},
             uncertainty={},
             inputs={},
             kind="prospective",
             created_at=NOW,
         )
+    with pytest.raises(ValueError, match="przyszłości"):
+        save_prediction(
+            store,
+            model_version_id=version_id,
+            event_id=event,
+            market_key="1x2",
+            period="FT",
+            line=None,
+            probabilities={"home": 1.0},
+            uncertainty={},
+            inputs={**INPUTS, "info_cutoff": "2026-10-31T13:00:00+00:00"},
+            kind="prospective",
+            created_at=NOW,
+        )
 
 
-def test_coupon_must_be_saved_before_start(store, import_both, profiles):
+def test_coupon_must_be_saved_before_start(store, import_sts, profiles):
     leg, _ = odds_id(store, "Legia Warszawa")
     coupon = create_coupon(
         store,
@@ -111,13 +128,22 @@ def test_coupon_must_be_saved_before_start(store, import_both, profiles):
             profile=profiles["sts"],
             now=datetime(2026, 10, 31, 20, tzinfo=UTC),
         )
-    with pytest.raises(ValueError, match="bookmaker"):
+    with pytest.raises(ValueError, match="wyłącznie STS"):
         create_coupon(
             store,
             odds_ids=[leg],
             stake=Decimal("10.00"),
             mode="paper_manual",
-            profile=profiles["superbet"],
+            profile=replace(profiles["sts"], id="superbet"),
+            now=NOW,
+        )
+    with pytest.raises(ValueError, match="1000000"):
+        create_coupon(
+            store,
+            odds_ids=[leg],
+            stake=Decimal("500000.00"),
+            mode="paper_manual",
+            profile=profiles["sts"],
             now=NOW,
         )
     same_event, _ = odds_id(store, "Legia Warszawa", "double_chance", "home_draw")
@@ -132,7 +158,7 @@ def test_coupon_must_be_saved_before_start(store, import_both, profiles):
         )
 
 
-def test_solo_settlement_with_stake_tax_and_result_correction(store, import_both, profiles):
+def test_solo_settlement_with_stake_tax_and_result_correction(store, import_sts, profiles):
     leg, event = odds_id(store, "Legia Warszawa")
     coupon = create_coupon(
         store,
@@ -177,9 +203,10 @@ def test_solo_settlement_with_stake_tax_and_result_correction(store, import_both
     assert len(rows) == 2 and rows[1]["supersedes_id"] == rows[0]["id"]
     stats = performance(store)["paper_system"]
     assert stats["settled"] == 1 and stats["profit"] == Decimal("-10.00") and stats["roi"] == -1
+    assert stats["max_drawdown"] == Decimal("10.00")
 
 
-def test_ako_settlement_and_separate_modes(store, import_both, profiles):
+def test_ako_settlement_and_separate_modes(store, import_sts, profiles):
     legia, legia_event = odds_id(store, "Legia Warszawa")
     gornik, gornik_event = odds_id(store, "Górnik Zabrze")
     ako = create_coupon(
@@ -236,7 +263,12 @@ def test_generic_resolution_rules():
     )
 
 
-def test_clv_uses_last_quote_before_start(store, import_both, profiles):
+def test_clv_requires_a_closing_window_observation(store, import_sts, profiles):
+    from dataclasses import replace as dc_replace
+
+    from sports_edge.pdf.engine import parse_pdf
+    from sports_edge.repository import import_offer
+
     leg, _ = odds_id(store, "Legia Warszawa")
     coupon = create_coupon(
         store,
@@ -246,7 +278,35 @@ def test_clv_uses_last_quote_before_start(store, import_both, profiles):
         profile=profiles["sts"],
         now=NOW,
     )
-    clv = closing_line_value(store, coupon)
-    assert clv == [
-        {"entry": "2.40", "close": "2.40", "clv": 0.0, "close_valid_at": clv[0]["close_valid_at"]}
-    ]
+    first = closing_line_value(store, coupon)
+    assert first[0]["clv"] is None and first[0]["status"].startswith("niedostępne")
+    # A document published 15 minutes before kick-off (19:30 UTC) is a closing reference.
+    import offer_fixtures
+
+    result, _ = parse_pdf(offer_fixtures.sts_pdf(), file_name="oferta-dzisiaj-www.pdf")
+    rows = []
+    for row in result.rows:
+        if row.offer_code == "4201" and row.market_key == "1x2":
+            row = dc_replace(
+                row,
+                selections=tuple(
+                    dc_replace(s, odds=Decimal("2.20")) if s.key == "home" else s
+                    for s in row.selections
+                ),
+            )
+        rows.append(row)
+    late = dc_replace(
+        result, rows=tuple(rows), document_generated_at=datetime(2026, 10, 31, 19, 15, tzinfo=UTC)
+    )
+    import_offer(
+        store,
+        late,
+        sha256="e" * 64,
+        file_name="late.pdf",
+        source_id="sts_pdf_manual",
+        data_kind="prospective",
+        ingested_at=datetime(2026, 10, 31, 19, 16, tzinfo=UTC),
+    )
+    clv = closing_line_value(store, coupon)[0]
+    assert clv["status"] == "dostępne" and clv["closing_price"] == Decimal("2.20")
+    assert clv["clv"] == pytest.approx(2.40 / 2.20 - 1)

@@ -1,17 +1,21 @@
-"""Cross-bookmaker event matching and market compatibility."""
+"""Participant matching (STS ↔ independent data) and market compatibility."""
 
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
-from sports_edge.matching import compatible, find_matches, latest_decisions, record_decision
+from sports_edge.matching import (
+    alias_map,
+    compatible,
+    confirm_alias,
+    load_team_aliases,
+    match_participant,
+    participant_key,
+)
 from sports_edge.offers.text import NameNormalizer, load_normalizer
 
-pytest.importorskip("pymupdf")
-
 ROOT = Path(__file__).resolve().parents[1]
-DAY = "2026-10-31"
 
 
 @pytest.fixture
@@ -19,61 +23,79 @@ def normalizer() -> NameNormalizer:
     return load_normalizer(ROOT / "config/aliases.toml")
 
 
-def by_home(matches):
-    return {m.event_a["home"]: m for m in matches}
+def index(names, sport, normalizer):
+    return {participant_key(n, sport, normalizer): n for n in names}
 
 
-def test_real_madrid_matches_real_madryt_fc_barcelona(store, import_both, normalizer):
-    matches = by_home(find_matches(store, day=DAY, normalizer=normalizer))
-    real = matches["Real Madrid"]
-    assert real.event_b["home"] == "Real Madryt" and real.event_b["away"] == "FC Barcelona"
-    assert real.status == "auto" and real.method == "exact_keys+sport+time"
-    assert real.evidence["keys_a"] == real.evidence["keys_b"] == ["real madrid", "barcelona"]
-    assert matches["Legia Warszawa"].status == "auto"
-    # Five minutes apart: still linked, with lower confidence than an identical start.
-    assert matches["Górnik Zabrze"].status == "auto"
-    assert matches["Górnik Zabrze"].confidence < real.confidence
-    assert "Zagłębie Lubin" not in {m.event_b["home"] for m in matches.values()}
-
-
-def test_names_alone_never_link_events(store, import_both, normalizer):
-    strict = find_matches(store, day=DAY, normalizer=normalizer, tolerance_minutes=0)
-    linked = {m.event_a["home"] for m in strict}
-    assert "Real Madrid" in linked
-    assert "Górnik Zabrze" not in linked  # same names, different start time
-    # Women's teams keep a distinct key and never merge with the men's team.
-    assert NameNormalizer().key("Lech Poznań [K]") != NameNormalizer().key("Lech Poznań")
-
-
-def test_similar_names_are_candidates_until_confirmed(store, import_both):
-    weak = NameNormalizer()  # no token aliases: "Madrid" and "Madryt" differ
-    real = by_home(find_matches(store, day=DAY, normalizer=weak))["Real Madrid"]
-    assert real.status == "candidate"
-    at = datetime(2026, 10, 31, 13, tzinfo=UTC)
-    record_decision(store, real, "confirmed", at=at)
-    again = by_home(find_matches(store, day=DAY, normalizer=weak))["Real Madrid"]
-    assert again.status == "confirmed"
-    aliases = store.rows("SELECT alias_key, canonical_key, origin FROM aliases")
-    assert {
-        "alias_key": "real madryt",
-        "canonical_key": "real madrid",
-        "origin": "user_confirmed_match",
-    } in aliases
-    with pytest.raises(ValueError):
-        record_decision(store, real, "auto", at=at)
-
-
-def test_rejection_is_appended_not_overwritten(store, import_both, normalizer):
-    real = by_home(find_matches(store, day=DAY, normalizer=normalizer))["Real Madrid"]
-    record_decision(store, real, "rejected", at=datetime(2026, 10, 31, 13, tzinfo=UTC))
-    assert "Real Madrid" not in by_home(find_matches(store, day=DAY, normalizer=normalizer))
-    record_decision(store, real, "confirmed", at=datetime(2026, 10, 31, 14, tzinfo=UTC))
-    assert (
-        by_home(find_matches(store, day=DAY, normalizer=normalizer))["Real Madrid"].status
-        == "confirmed"
+def test_sts_spellings_match_data_source_spellings(normalizer):
+    known = index(
+        [
+            "Real Madrid CF",
+            "FC Barcelona",
+            "FC Bayern München",
+            "1. FSV Mainz 05",
+            "RB Leipzig",
+            "SV Werder Bremen",
+            "Como 1907",
+            "SSC Napoli",
+            "Olympique de Marseille",
+        ],
+        "football",
+        normalizer,
     )
-    assert store.scalar("SELECT COUNT(*) FROM event_links") == 2
-    assert len(latest_decisions(store)) == 1
+    for sts, expected in (
+        ("Real Madryt", "Real Madrid CF"),
+        ("Barcelona", "FC Barcelona"),
+        ("Bayern Monachium", "FC Bayern München"),
+        ("FSV Mainz", "1. FSV Mainz 05"),
+        ("RB Lipsk", "RB Leipzig"),
+        ("Werder Brema", "SV Werder Bremen"),
+        ("Como", "Como 1907"),
+        ("Napoli", "SSC Napoli"),
+        ("Olympique Marsylia", "Olympique de Marseille"),
+    ):
+        found = match_participant(sts, "football", known, normalizer, {})
+        assert (found.status, found.target) == ("exact", expected), sts
+
+
+def test_reviewed_aliases_and_order_free_individual_names(normalizer):
+    aliases = load_team_aliases(ROOT / "config/team_aliases.toml", normalizer)
+    known = index(["Paris Saint-Germain FC", "Tottenham Hotspur FC"], "football", normalizer)
+    assert match_participant("PSG", "football", known, normalizer, aliases).status == "alias"
+    tennis = index(["Hubert Hurkacz"], "tennis", normalizer)
+    assert match_participant("Hurkacz Hubert", "tennis", tennis, normalizer, {}).status == "exact"
+
+
+def test_similar_names_are_only_candidates(normalizer, store):
+    known = index(["Olympique Lyonnais"], "football", normalizer)
+    found = match_participant("Olympique Lyon", "football", known, normalizer, {})
+    assert found.status == "candidate" and found.target == "Olympique Lyonnais"
+    confirm_alias(
+        store,
+        sport="football",
+        alias="Olympique Lyon",
+        canonical="Olympique Lyonnais",
+        normalizer=normalizer,
+        at=datetime(2026, 11, 1, tzinfo=UTC),
+    )
+    again = match_participant("Olympique Lyon", "football", known, normalizer, alias_map(store))
+    assert again.status == "alias"
+    assert store.rows("SELECT origin FROM aliases") == [{"origin": "user_confirmed"}]
+    with pytest.raises(ValueError):
+        confirm_alias(
+            store,
+            sport="football",
+            alias="Napoli",
+            canonical="SSC Napoli",
+            normalizer=normalizer,
+            at=datetime(2026, 11, 1, tzinfo=UTC),
+        )
+
+
+def test_women_teams_never_merge_with_men(normalizer):
+    assert NameNormalizer().key("Lech Poznań [K]") != NameNormalizer().key("Lech Poznań")
+    known = index(["Lech Poznań"], "football", normalizer)
+    assert match_participant("Lech Poznań [K]", "football", known, normalizer, {}).status != "exact"
 
 
 def market(**overrides):
@@ -103,13 +125,8 @@ def test_markets_with_different_terms_are_not_compared(other, reason):
     assert not ok and reason in note
 
 
-def test_identical_markets_are_compared_with_rules_caveat():
-    assert compatible(market(), market()) == (
-        True,
-        "Zgodne według etykiet; regulaminy rozliczeń niezweryfikowane",
-    )
-    verified = market(rules_ref="sts:verified")
-    assert compatible(verified, market(rules_ref="superbet:verified")) == (True, "Zgodne")
+def test_identical_markets_and_unsigned_handicap():
+    assert compatible(market(), market())[0] is True
     ok, note = compatible(
         market(market_key="handicap_unsigned"), market(market_key="handicap_unsigned")
     )

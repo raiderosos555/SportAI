@@ -1,8 +1,15 @@
-"""Per-selection metrics and acceptance gates.
+"""Per-selection metrics and acceptance gates for the STS offer.
 
-Price comparison (odds after stake tax) is separated from expected value, which needs an
-independent, validated model probability. A bookmaker's own de-margined price is shown as a
-market benchmark only; it is never treated as an independent forecast against that bookmaker.
+Price information (implied probability, odds after the stake coefficient) is kept separate
+from expected value, which needs an independent model probability. STS's own de-margined
+price is a market benchmark only; it is never used as a forecast against STS.
+
+Tiers:
+* ``validated`` — every gate passed (validated model, verified market rules and tax profile,
+  fresh current quote, positive lower bound of net EV);
+* ``experimental`` — a model forecast shows positive net EV, but at least one validation gate
+  failed (e.g. the model is not validated): an observation, not a recommendation;
+* ``rejected`` — data, freshness, rules or EV gates failed.
 """
 
 from dataclasses import dataclass, field
@@ -10,7 +17,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from sports_edge.analysis.policy import Policy
-from sports_edge.bookmakers import BookmakerProfile
+from sports_edge.bookmakers import BookmakerProfile, MarketRules
 from sports_edge.edge import binary_ev, net_ev
 from sports_edge.probability import market_probabilities
 from sports_edge.repository import freshness
@@ -30,14 +37,12 @@ COMPLETE_SETS = {
     "away_to_score": {"yes", "no"},
     "red_card": {"yes", "no"},
 }
-VOID_MARKETS = {"draw_no_bet"}
 NOT_ANALYSED = {"unknown", "handicap_unsigned"}
 
 
 @dataclass(frozen=True)
 class Candidate:
     key: str
-    bookmaker: str
     event_id: str
     market_id: str
     quote_set_id: str
@@ -47,30 +52,40 @@ class Candidate:
     sport: str
     league: str
     start_at: str | None
+    offer_code: str | None
     market_key: str
     period: str
     line: str | None
     selection: str
     odds: Decimal
-    net_multiplier: Decimal | None  # payout per 1 PLN staked after stake tax (no model needed)
+    implied: float
+    net_multiplier: Decimal | None  # payout per 1 PLN after the stake coefficient
     margin: float | None
     p_market: float | None
     p_model: float | None
     p_low: float | None
     p_high: float | None
     model: str | None
-    model_status: str | None
+    model_version_id: str | None
+    model_status: str
+    validation: str
     ev_gross: float | None
     ev_net: Decimal | None
     ev_net_low: Decimal | None
     quality: float
-    parser_verified: bool
+    data_status: str
+    rules_status: str
+    tax_status: str
     freshness: str
-    accepted: bool
+    presence: str
+    tier: str
     reasons: tuple[str, ...]
     warnings: tuple[str, ...] = ()
-    other: dict = field(default_factory=dict)  # same selection at the other bookmaker
     explanation: dict = field(default_factory=dict)
+
+    @property
+    def accepted(self) -> bool:
+        return self.tier == "validated"
 
 
 def devig(row: dict) -> tuple[dict[str, float] | None, float | None]:
@@ -82,49 +97,45 @@ def devig(row: dict) -> tuple[dict[str, float] | None, float | None]:
     return market_probabilities(prices), margin
 
 
-def _void_possible(row: dict) -> bool:
-    if row["market_key"] in VOID_MARKETS:
-        return True
+def _payoff(row: dict, rules: MarketRules) -> tuple[str, str | None]:
+    """(rules_status, payoff) — integer total lines can push, never treated as binary."""
+    rule = rules.lookup(row["sport"], row["market_key"], row["period"])
+    if rule is None:
+        return "niezweryfikowane", None
     line = row.get("line")
     if line and row["market_key"].startswith(("total", "team_total")):
-        return Decimal(line) == Decimal(line).to_integral_value()
-    return False
-
-
-def _event_name(row: dict) -> str:
-    return " - ".join(row["participants"]) if row["participants"] else row["name_raw"]
+        if Decimal(line) == Decimal(line).to_integral_value():
+            return "niezweryfikowane", None
+    return "zweryfikowane", rule.payoff
 
 
 def evaluate(
     rows: list[dict],
     *,
     predictions: dict,
-    profiles: dict[str, BookmakerProfile],
+    profile: BookmakerProfile,
+    market_rules: MarketRules,
     policy: Policy,
     now: datetime,
     max_age: timedelta,
     stake: Decimal,
-    counterparts: dict[str, dict] | None = None,
 ) -> list[Candidate]:
-    counterparts = counterparts or {}
     out: list[Candidate] = []
     for row in rows:
         if row["market_key"] in NOT_ANALYSED:
             continue
         fair, margin = devig(row)
-        profile = profiles.get(row["bookmaker_id"])
+        start = datetime.fromisoformat(row["start_at"]) if row["start_at"] else None
         event_day = (
-            datetime.fromisoformat(row["start_at"]).date()
-            if row["start_at"]
-            else date.fromisoformat(row["offer_date"])
-            if row["offer_date"]
-            else None
+            start.date()
+            if start
+            else (date.fromisoformat(row["offer_date"]) if row["offer_date"] else None)
         )
         status = freshness(row["valid_at"], row["start_at"], now, max_age)
         prediction = predictions.get(
             (row["event_id"], row["market_key"], row["period"], row["line"])
         )
-        other_row = counterparts.get(row["quote_set_id"])
+        rules_status, payoff = _payoff(row, market_rules)
         for selection, quote in row["selections"].items():
             out.append(
                 _candidate(
@@ -137,7 +148,8 @@ def evaluate(
                     event_day,
                     status,
                     prediction,
-                    other_row,
+                    rules_status,
+                    payoff,
                     policy,
                     stake,
                 )
@@ -151,126 +163,141 @@ def _candidate(
     quote,
     fair,
     margin,
-    profile,
+    profile: BookmakerProfile,
     event_day,
     status,
     prediction,
-    other_row,
+    rules_status,
+    payoff,
     policy: Policy,
     stake: Decimal,
 ) -> Candidate:
-    reasons: list[str] = []
+    blocking: list[str] = []  # data and EV problems: the selection is rejected
+    unproven: list[str] = []  # validation problems: at best an experimental candidate
     warnings: list[str] = []
     odds: Decimal = quote["price"]
+    data_status = "ok"
     if row["status"] != "ok":
-        reasons.append("Wiersz oferty wymaga ręcznej weryfikacji")
+        blocking.append("Wiersz oferty wymaga ręcznej weryfikacji")
+        data_status = "do weryfikacji"
     if row["quality"] < policy.min_data_quality:
-        reasons.append(f"Jakość odczytu {row['quality']:.2f} < {policy.min_data_quality}")
+        blocking.append(f"Jakość odczytu {row['quality']:.2f} < {policy.min_data_quality}")
+        data_status = "niska jakość"
     if policy.require_verified_parser and not row["parser_verified"]:
-        reasons.append("Parser niezweryfikowany na autentycznym dokumencie operatora")
+        blocking.append("Parser niezweryfikowany na autentycznym dokumencie")
+        data_status = "parser niezweryfikowany"
+    if row.get("presence") == "withdrawn":
+        blocking.append("Rynek wycofany — nie występuje w nowszej ofercie tego samego rodzaju")
     if policy.require_fresh_quote and status != "fresh":
-        reasons.append(
+        blocking.append(
             {
                 "expired": "Kurs wygasł — wydarzenie już się rozpoczęło",
                 "stale": "Kurs nieaktualny — przekroczony maksymalny wiek oferty",
                 "unknown": "Nieznany czas publikacji kursu",
             }[status]
         )
-    if "unverified" in row["rules_ref"]:
-        warnings.append("Reguły rozliczenia wywnioskowane z etykiety oferty, nie z regulaminu")
+    if odds > Decimal(str(policy.max_odds)):
+        blocking.append(f"Kurs {odds} powyżej limitu polityki {policy.max_odds}")
+    profile_ok = event_day is not None and profile.cost_valid_on(event_day)
+    tax_status = "zweryfikowany" if profile.tax_verified else "założenie"
     net_multiplier = None
-    profile_ok = profile is not None and event_day is not None and profile.cost_valid_on(event_day)
-    if profile is None:
-        reasons.append("Brak profilu kosztów bukmachera")
-    elif not profile_ok:
-        reasons.append("Profil podatkowy nieważny dla daty wydarzenia — wymaga weryfikacji")
+    if not profile_ok:
+        blocking.append("Profil podatkowy nieważny dla daty wydarzenia — wymaga weryfikacji")
+        tax_status = "nieważny"
     else:
         net_multiplier = (odds * (1 - profile.cost.stake_tax_rate)).quantize(Decimal("0.0001"))
         if not profile.tax_verified:
-            warnings.append("Profil podatkowy oparty na założeniu (niezweryfikowany)")
-    if odds > Decimal(str(policy.max_odds)):
-        reasons.append(f"Kurs {odds} powyżej limitu polityki {policy.max_odds}")
+            unproven.append("Profil podatkowy niezweryfikowany")
+    if rules_status != "zweryfikowane":
+        unproven.append("Zasady rozliczenia rynku STS niezweryfikowane")
     p_model = p_low = p_high = None
-    model_name = model_status = None
+    model_name = model_version_id = None
+    model_status = "brak prognozy"
     ev_gross = ev_net_value = ev_net_low = None
     validation_text = "Brak niezależnej walidacji"
     if prediction is None:
-        reasons.append("Brak niezależnej prognozy modelu dla tego rynku")
+        blocking.append("Brak niezależnej prognozy modelu dla tego rynku")
     else:
         model_name = f"{prediction['family']} {prediction['version']}"
+        model_version_id = prediction["model_version_id"]
         model_status = prediction["version_status"]
         p_model = prediction["probabilities"].get(selection)
         interval = prediction["uncertainty"].get("interval", {}).get(selection)
         if interval:
             p_low, p_high = interval
         validation = prediction["validation"]
+        holdout = validation.get("holdout") or {}
         validation_text = (
-            f"n={validation.get('n_out_of_sample')}, ECE={validation.get('ece')}, "
-            f"log-loss={validation.get('log_loss')}, rynek: {validation.get('beats_market')}"
+            f"holdout n={holdout.get('n')}, log loss={holdout.get('log_loss')}, "
+            f"ECE={holdout.get('ece')}, rynek: {validation.get('beats_market')}"
         )
         if policy.require_validated_model and model_status != "validated":
-            reasons.append("Model bez zatwierdzonej walidacji — dodatnie EV nie jest przewagą")
+            unproven.append("Model bez zatwierdzonej walidacji — dodatnie EV nie jest przewagą")
         if p_model is None:
-            reasons.append("Prognoza nie obejmuje tej selekcji")
+            blocking.append("Prognoza nie obejmuje tej selekcji")
         if p_low is None:
-            reasons.append("Brak oszacowania niepewności prognozy")
+            unproven.append("Brak oszacowania niepewności prognozy")
     if p_model is not None:
         ev_gross = binary_ev(p_model, float(odds))
-        if _void_possible(row):
-            reasons.append("Możliwy zwrot stawki — uproszczony wzór EV netto nie ma zastosowania")
+        if payoff not in {None, "binary"}:
+            blocking.append("Możliwy zwrot stawki — wzór binarny EV netto nie ma zastosowania")
         elif profile_ok:
             try:
                 ev_net_value = _net(p_model, stake, odds, profile, event_day)
                 if p_low is not None:
                     ev_net_low = _net(p_low, stake, odds, profile, event_day)
             except ValueError as error:
-                reasons.append(f"EV netto nieobliczalne: {error}")
-        if ev_net_low is not None and ev_net_low <= Decimal(str(policy.min_net_ev_lower_bound)):
-            reasons.append(
-                f"EV netto (dolna granica) {ev_net_low:.3f} ≤ próg {policy.min_net_ev_lower_bound}"
-            )
+                blocking.append(f"EV netto nieobliczalne: {error}")
+        if ev_net_value is not None and ev_net_value <= 0:
+            blocking.append(f"EV netto {ev_net_value:.3f} ≤ 0")
+        threshold = Decimal(str(policy.min_net_ev_lower_bound))
+        if ev_net_low is not None and ev_net_low <= threshold:
+            unproven.append(f"Dolna granica EV netto {ev_net_low:.3f} ≤ próg {threshold}")
+    if profile.tax_verified and profile_ok:
+        warnings.append("EV netto przy standardowym współczynniku stawki 0,88 (R 17.1)")
+    tier = "rejected" if blocking else ("experimental" if unproven else "validated")
+    reasons = tuple(blocking + unproven)
     p_market = fair.get(selection) if fair else None
-    other = {}
-    if other_row is not None and selection in other_row["selections"]:
-        other = {
-            "bookmaker": other_row["bookmaker_id"],
-            "odds": other_row["selections"][selection]["price"],
-            "valid_at": other_row["valid_at"],
-        }
+    implied = 1 / float(odds)
     explanation = {
         "Model": model_name or "brak",
         "Co wykrył model": (
-            f"P_model={p_model:.3f}, P_rynek(bez marży)={p_market:.3f}"
+            f"P_model={p_model:.3f}, P_rynek STS bez marży={p_market:.3f}"
             if p_model is not None and p_market is not None
             else "Brak prognozy modelu — nie można ocenić przewagi"
         ),
         "Dane modelu": prediction["inputs"] if prediction else "brak",
         "Dlaczego kurs może być nieefektywny": (
-            f"Kurs {odds} implikuje {1 / float(odds):.1%} (z marżą {margin:.1%})"
+            f"Kurs {odds} implikuje {implied:.1%} (marża STS {margin:.1%})"
             if margin is not None
-            else f"Kurs {odds} implikuje {1 / float(odds):.1%}; marża nieznana (rynek niepełny)"
+            else f"Kurs {odds} implikuje {implied:.1%}; marża nieznana (rynek niepełny)"
         ),
         "Niepewność": f"[{p_low:.3f}, {p_high:.3f}]" if p_low is not None else "nieoszacowana",
         "Walidacja": validation_text,
-        "Decyzja": "PRZYJĘTA" if not reasons else "ODRZUCONA: " + "; ".join(reasons),
+        "Decyzja": {
+            "validated": "ZWALIDOWANY KANDYDAT (analiza, nie gwarancja)",
+            "experimental": "EKSPERYMENTALNY — przewaga niepotwierdzona: " + "; ".join(unproven),
+            "rejected": "ODRZUCONY: " + "; ".join(reasons),
+        }[tier],
     }
     return Candidate(
         key=f"{row['quote_set_id']}:{selection}",
-        bookmaker=row["bookmaker_id"],
         event_id=row["event_id"],
         market_id=row["market_id"],
         quote_set_id=row["quote_set_id"],
         odds_id=quote["odds_id"],
         selection_id=quote["selection_id"],
-        event=_event_name(row),
+        event=" - ".join(row["participants"]) if row["participants"] else row["name_raw"],
         sport=row["sport"],
         league=row["league"],
         start_at=row["start_at"],
+        offer_code=row.get("offer_code"),
         market_key=row["market_key"],
         period=row["period"],
         line=row["line"],
         selection=selection,
         odds=odds,
+        implied=implied,
         net_multiplier=net_multiplier,
         margin=margin,
         p_market=p_market,
@@ -278,17 +305,21 @@ def _candidate(
         p_low=p_low,
         p_high=p_high,
         model=model_name,
+        model_version_id=model_version_id,
         model_status=model_status,
+        validation=validation_text,
         ev_gross=ev_gross,
         ev_net=ev_net_value,
         ev_net_low=ev_net_low,
         quality=row["quality"],
-        parser_verified=bool(row["parser_verified"]),
+        data_status=data_status,
+        rules_status=rules_status,
+        tax_status=tax_status,
         freshness=status,
-        accepted=not reasons,
-        reasons=tuple(reasons),
+        presence=row.get("presence", "current"),
+        tier=tier,
+        reasons=reasons,
         warnings=tuple(warnings),
-        other=other,
         explanation=explanation,
     )
 

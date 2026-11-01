@@ -1,4 +1,10 @@
-"""Model versions and append-only predictions. Validation status follows the policy only."""
+"""Model versions and append-only predictions with temporal guards.
+
+* ``validation_status`` derives every piece of evidence itself; a caller cannot declare a
+  model "validated" or "better than the market" by passing a flag.
+* Prospective predictions must be made before the event starts and must carry the model
+  version, information cutoff, data snapshot and code state.
+"""
 
 import json
 from datetime import datetime
@@ -7,20 +13,38 @@ from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.probability import validate_probabilities
 from sports_edge.storage import Store
 
+REQUIRED_INPUTS = ("info_cutoff", "data_snapshot", "code_state")
+
+
+def beats_market(benchmark: dict | None, policy) -> tuple[bool, str]:
+    """Model beats the market only on the same events, enough of them, lower log loss."""
+    if not benchmark:
+        return False, "Brak porównania z rynkiem na tych samych wydarzeniach"
+    n = benchmark.get("n_events", 0)
+    if not benchmark.get("same_events"):
+        return False, "Porównanie z rynkiem nie dotyczy tych samych wydarzeń"
+    if n < policy.min_validation_events:
+        return False, f"Za mało wspólnych wydarzeń z rynkiem: {n} < {policy.min_validation_events}"
+    model_ll, market_ll = benchmark.get("model_log_loss"), benchmark.get("market_log_loss")
+    if model_ll is None or market_ll is None or model_ll >= market_ll:
+        return False, f"Log loss modelu {model_ll} nie jest niższy niż rynku {market_ll}"
+    return True, "Model ma niższy log loss niż rynek na tych samych wydarzeniach"
+
 
 def validation_status(validation: dict, policy) -> tuple[str, list[str]]:
-    """'validated' only with enough out-of-sample events, calibration and a market benchmark."""
+    """'validated' requires holdout size and calibration, a market benchmark and as-of data."""
     reasons = []
-    if validation.get("n_out_of_sample", 0) < policy.min_validation_events:
-        reasons.append(
-            f"Za mało prognoz poza próbą: {validation.get('n_out_of_sample', 0)} "
-            f"< {policy.min_validation_events}"
-        )
-    ece = validation.get("ece")
+    holdout = validation.get("holdout") or {}
+    n = holdout.get("n", 0)
+    if n < policy.min_validation_events:
+        reasons.append(f"Za mało prognoz w holdoucie: {n} < {policy.min_validation_events}")
+    ece = holdout.get("ece")
     if ece is None or ece > policy.max_calibration_ece:
-        reasons.append(f"Kalibracja ECE={ece} powyżej progu {policy.max_calibration_ece}")
-    if policy.require_beats_market_benchmark and validation.get("beats_market") is not True:
-        reasons.append("Brak dowodu, że model jest lepszy od rynku na tych samych zdarzeniach")
+        reasons.append(f"Kalibracja holdoutu ECE={ece} powyżej progu {policy.max_calibration_ece}")
+    if policy.require_beats_market_benchmark:
+        ok, why = beats_market(validation.get("market_benchmark"), policy)
+        if not ok:
+            reasons.append(why)
     if validation.get("leakage_checked") is not True:
         reasons.append("Brak potwierdzonej kontroli wycieku danych (as-of)")
     return ("validated" if not reasons else "experimental"), reasons
@@ -41,6 +65,8 @@ def register_version(
 ) -> tuple[str, str, list[str]]:
     model_id = digest(["model", family, sport])
     status, reasons = validation_status(validation, policy)
+    derived, _ = beats_market(validation.get("market_benchmark"), policy)
+    stored = {**validation, "beats_market": derived, "status_reasons": reasons}
     version_id = digest(["model_version", model_id, version])
     with store.transaction():
         store.insert("models", id=model_id, family=family, sport=sport, description=description)
@@ -52,7 +78,7 @@ def register_version(
             created_at=iso(created_at),
             trained_through=iso(trained_through) if trained_through else None,
             training_data_json=canonical(training_data),
-            validation_json=canonical({**validation, "status_reasons": reasons}),
+            validation_json=canonical(stored),
             status=status,
         )
     return version_id, status, reasons
@@ -72,8 +98,23 @@ def save_prediction(
     kind: str,
     created_at: datetime,
 ) -> str:
-    """Predictions are immutable: a new forecast is a new row, history is never rewritten."""
+    """Immutable forecast. Prospective ones are refused at or after the event start."""
     validate_probabilities(probabilities)
+    if kind == "prospective":
+        if event_id is None:
+            raise ValueError("Prognoza prospektywna wymaga wydarzenia")
+        event = store.get("events", event_id)
+        if event is None or not event["start_at"]:
+            raise ValueError("Nieznany czas rozpoczęcia — prognoza przedmeczowa niemożliwa")
+        if created_at >= datetime.fromisoformat(event["start_at"]):
+            raise ValueError("Wydarzenie już się rozpoczęło — odmowa prognozy przedmeczowej")
+        missing = [key for key in REQUIRED_INPUTS if not inputs.get(key)]
+        if missing:
+            raise ValueError(f"Brak wersjonowania prognozy: {', '.join(missing)}")
+        if datetime.fromisoformat(inputs["info_cutoff"]) > created_at:
+            raise ValueError("Dane wejściowe z przyszłości względem chwili prognozy")
+    if store.get("model_versions", model_version_id) is None:
+        raise ValueError("Nieznana wersja modelu")
     key = digest(
         ["prediction", model_version_id, event_id, market_key, period, line, iso(created_at)]
     )
@@ -96,16 +137,24 @@ def save_prediction(
 
 
 def latest_predictions(store: Store, *, as_of: datetime) -> dict[tuple, dict]:
-    """Newest prospective prediction per (event, market, period, line) made before ``as_of``."""
+    """Newest pre-match prediction per (event, market, period, line).
+
+    Only prospective forecasts created no later than ``as_of`` and strictly before the event
+    start qualify; anything made after kick-off is never a pre-match forecast.
+    """
     rows = store.rows(
-        """SELECT p.*, v.status version_status, v.version, v.validation_json, m.family
+        """SELECT p.*, v.status version_status, v.version, v.validation_json, m.family,
+        e.start_at event_start
         FROM predictions p JOIN model_versions v ON v.id=p.model_version_id
-        JOIN models m ON m.id=v.model_id
-        WHERE p.kind='prospective' AND p.created_at<=? ORDER BY p.created_at""",
+        JOIN models m ON m.id=v.model_id JOIN events e ON e.id=p.event_id
+        WHERE p.kind='prospective' AND p.created_at<=? AND e.start_at IS NOT NULL
+        ORDER BY p.created_at""",
         (iso(as_of),),
     )
     latest: dict[tuple, dict] = {}
     for row in rows:
+        if datetime.fromisoformat(row["created_at"]) >= datetime.fromisoformat(row["event_start"]):
+            continue
         row["probabilities"] = json.loads(row["probabilities_json"])
         row["uncertainty"] = json.loads(row["uncertainty_json"])
         row["inputs"] = json.loads(row["inputs_json"])
@@ -116,7 +165,7 @@ def latest_predictions(store: Store, *, as_of: datetime) -> dict[tuple, dict]:
 
 def model_overview(store: Store) -> list[dict]:
     return store.rows(
-        """SELECT m.family, m.sport, m.description, v.version, v.status, v.created_at,
-        v.trained_through, v.validation_json FROM model_versions v JOIN models m
-        ON m.id=v.model_id ORDER BY v.created_at DESC"""
+        """SELECT v.id version_id, m.family, m.sport, m.description, v.version, v.status,
+        v.created_at, v.trained_through, v.training_data_json, v.validation_json
+        FROM model_versions v JOIN models m ON m.id=v.model_id ORDER BY v.created_at DESC"""
     )

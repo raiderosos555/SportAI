@@ -78,10 +78,30 @@ w dedykowanym adapterze rynku/operatora, oddzielnie od kalkulatora przepływów.
 `config/tax/pl_sts_app.toml` i `config/tax/pl_superbet_app.toml` używają tych samych stawek
 ustawowych (12% od stawki, 10% od wygranej powyżej 2280 zł, `reject_equal` na granicy,
 wyłącznie win/loss), z oknem ważności 31.10–30.11.2026 wymagającym ponownej weryfikacji.
-Profil Superbet jest **założeniem** — nie potwierdzono go w regulaminie operatora.
+Profil Superbet jest **założeniem** — nie potwierdzono go w regulaminie operatora. Od TASK 003
+jest zarchiwizowany w `config/archive/tax/` i nie jest wczytywany.
 Profil badawczy `pl_sts_research.toml` z TASK 001 pozostaje bez zmian. EV netto
 liczone jest przez `settle()` dla każdego wyniku osobno (próg wygranej przed wartością
 oczekiwaną); uproszczenie `p × kurs × (1 − t) − 1` obowiązuje tylko poniżej progu
 i tylko dla rynków bez zwrotu stawki (np. zakład bez remisu jest odrzucany).
 AKO rozliczane jest jako jeden kupon z kursem łącznym; zwrot pojedynczej nogi w AKO
 wymaga reguł operatora i trafia do rozliczenia ręcznego.
+
+## TASK 003 — zasady STS potwierdzone w regulaminie
+
+Źródła: „Regulamin Internetowych Zakładów Bukmacherskich” (plik 2025-07-08, **R**) i „Zasady
+dot. zakładów na poszczególne sporty” (plik 2026-09-08, **Z**), odczytane 01.11.2026. Zapis
+w `config/sts_rules.toml` z datą obowiązywania od 01.11.2026; rynek spoza listy jest
+**niezweryfikowany** i nie może dać kandydata zwalidowanego.
+
+| Zasada | Źródło | Zastosowanie w aplikacji |
+|---|---|---|
+| Wygrana = współczynnik stawki × kurs (przykład 0,88) | R 17.1 | EV netto i rozliczenie przez `settle()`; ostrzeżenie, że wiążący jest współczynnik z kuponu |
+| Maksymalna wygrana 1 000 000 zł | R 17.2 | `create_coupon` odrzuca kupon, gdy stawka × kurs przekracza `limits.max_payout_pln` (ostrożnie: bez współczynnika) |
+| 10% PIT od wygranej powyżej progu według odrębnych przepisów | R 17.5 | Profil `pl_sts_app.toml` bez zmian (próg 2280 zł, `reject_equal`) |
+| Zwrot przy meczu nierozegranym, przerwanym lub przełożonym o ponad 24 h | R 15.3.c, Z 15.1.3 | Brak automatycznego zwrotu: wynik inny niż „zakończony” zostawia kupon do rozliczenia ręcznego |
+| Anulowana noga AKO liczona z kursem 1,00 | R 15.7 | Zapisana w regułach; AKO z anulowaną nogą nadal rozliczane ręcznie |
+| Zakład bez remisu: remis = zwrot | Z 1.8 | `payoff = void_on_draw`; EV z formułą binarną jest odrzucane |
+| Linie całkowite sum (np. 2,0) mogą dać zwrot | — | Traktowane jako niezweryfikowane, nawet gdy rynek jest na liście |
+| Piłka: czas regulaminowy z doliczonym, połowy osobno | Z 15.1.1, Z 15.2.1 | Rynki 1X2, podwójna szansa, sumy, obie strzelą, połowy — zweryfikowane |
+| Koszykówka „mecz” bez dogrywki, „zwycięzca” z dogrywką; hokej — czas regulaminowy | Z 13.2.1–13.2.4, Z 11.1.1 | Zweryfikowane tylko rynki wpisane w `sts_rules.toml` |

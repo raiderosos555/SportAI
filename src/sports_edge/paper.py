@@ -10,9 +10,13 @@ from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal
 from math import prod
+from zoneinfo import ZoneInfo
 
+from sports_edge import history
 from sports_edge.bookmakers import BookmakerProfile
+from sports_edge.datasources import openfootball
 from sports_edge.ingestion.types import canonical, digest, iso
+from sports_edge.matching import alias_map, match_participant, participant_key
 from sports_edge.settlement import Outcome, settle
 from sports_edge.storage import Store
 
@@ -48,6 +52,8 @@ def create_coupon(
 ) -> str:
     if mode not in MODES:
         raise ValueError("Unknown coupon mode")
+    if profile.id != "sts":
+        raise ValueError("Kupony wirtualne obsługują wyłącznie STS")
     if not odds_ids or len(set(odds_ids)) != len(odds_ids):
         raise ValueError("At least one distinct leg is required")
     if not isinstance(stake, Decimal) or stake <= 0 or stake != stake.quantize(Decimal("0.01")):
@@ -70,6 +76,9 @@ def create_coupon(
     if len({leg["event_id"] for leg in legs}) != len(legs):
         raise ValueError("Several legs from one event are correlated; not supported")
     total = prod(Decimal(leg["price"]) for leg in legs)
+    cap = Decimal(str(profile.sections.get("limits", {}).get("max_payout_pln", "0")))
+    if cap and stake * total > cap:
+        raise ValueError(f"Potencjalna wygrana przekracza limit operatora {cap} zł (R 17.2)")
     first = min(leg["start_at"] for leg in legs)
     key = digest(["coupon", mode, sorted(odds_ids), str(stake), iso(now)])
     with store.transaction():
@@ -280,7 +289,11 @@ def settle_coupon(
     elif len(outcomes) == 1:
         outcome = outcomes[0]
     else:
-        return {"status": "manual", "reason": "Zwrot w AKO wymaga reguł operatora", "legs": details}
+        return {
+            "status": "manual",
+            "reason": "Zwrot nogi w AKO (R 15.7: kurs 1,00) — rozliczenie ręczne",
+            "legs": details,
+        }
     profile = profiles[coupon["bookmaker_id"]]
     if profile.cost.id != coupon["cost_profile_id"]:
         return {"status": "manual", "reason": "Profil kosztów kuponu niedostępny", "legs": details}
@@ -333,12 +346,22 @@ def latest_settlement(store: Store, coupon_id: str) -> dict | None:
 
 
 def performance(store: Store) -> dict[str, dict]:
-    """ROI = sum(net profit) / sum(stake) over settled coupons, separately for each mode."""
+    """ROI = sum(net profit) / sum(stake) over settled coupons, separately for each mode.
+
+    Max drawdown is measured on the cumulative profit in settlement order.
+    """
     out: dict[str, dict] = {}
     for coupon in store.rows("SELECT * FROM coupons ORDER BY created_at"):
         stats = out.setdefault(
             coupon["mode"],
-            {"coupons": 0, "settled": 0, "stake": Decimal(0), "profit": Decimal(0), "wins": 0},
+            {
+                "coupons": 0,
+                "settled": 0,
+                "stake": Decimal(0),
+                "profit": Decimal(0),
+                "wins": 0,
+                "_series": [],
+            },
         )
         stats["coupons"] += 1
         settlement = latest_settlement(store, coupon["id"])
@@ -348,14 +371,21 @@ def performance(store: Store) -> dict[str, dict]:
         stats["stake"] += Decimal(coupon["stake"])
         stats["profit"] += Decimal(settlement["net_profit"])
         stats["wins"] += settlement["outcome"] == "win"
+        stats["_series"].append((settlement["settled_at"], Decimal(settlement["net_profit"])))
     for stats in out.values():
         stats["roi"] = (stats["profit"] / stats["stake"]) if stats["stake"] else None
         stats["hit_rate"] = stats["wins"] / stats["settled"] if stats["settled"] else None
+        peak = running = drawdown = Decimal(0)
+        for _when, profit in sorted(stats.pop("_series")):
+            running += profit
+            peak = max(peak, running)
+            drawdown = max(drawdown, peak - running)
+        stats["max_drawdown"] = drawdown
     return out
 
 
 def closing_line_value(store: Store, coupon_id: str) -> list[dict]:
-    """Entry price vs the last observed price of the same selection before the start."""
+    """CLV per leg against the STS price observed in the closing window before the start."""
     rows = store.rows(
         """SELECT l.price entry, l.selection_id, e.start_at FROM coupon_legs l
         JOIN selections s ON s.id=l.selection_id JOIN markets m ON m.id=s.market_id
@@ -364,25 +394,81 @@ def closing_line_value(store: Store, coupon_id: str) -> list[dict]:
     )
     out = []
     for row in rows:
-        closing = store.rows(
-            """SELECT o.price, q.valid_at FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id
-            WHERE o.selection_id=? AND q.status='ok' AND q.valid_at IS NOT NULL
-            AND q.valid_at < ? ORDER BY q.valid_at DESC LIMIT 1""",
-            (row["selection_id"], row["start_at"]),
+        start = datetime.fromisoformat(row["start_at"])
+        result = history.clv(
+            Decimal(row["entry"]), history.selection_history(store, row["selection_id"]), start
         )
-        if not closing:
-            out.append({"entry": row["entry"], "close": None, "clv": None})
-            continue
-        entry, close = Decimal(row["entry"]), Decimal(closing[0]["price"])
-        out.append(
-            {
-                "entry": str(entry),
-                "close": str(close),
-                "clv": float(entry / close - 1),
-                "close_valid_at": closing[0]["valid_at"],
-            }
-        )
+        out.append({"entry": row["entry"], **result})
     return out
+
+
+def import_source_results(store: Store, *, now: datetime, normalizer, team_aliases) -> dict:
+    """Copy results of STS events from the independent data store when the match is certain.
+
+    Certain = same sport and competition, same local match date and both teams matched
+    exactly or through a verified alias. Anything else stays for manual entry.
+    """
+    aliases = alias_map(store, team_aliases)
+    league_for = {s: code for code, lg in openfootball.LEAGUES.items() for s in lg.sts_leagues}
+    events = store.rows(
+        """SELECT e.* FROM events e WHERE e.bookmaker_id='sts' AND e.sport='football'
+        AND e.start_at IS NOT NULL AND e.start_at < ? AND e.id IN (
+          SELECT m.event_id FROM coupon_legs l JOIN selections s ON s.id=l.selection_id
+          JOIN markets m ON m.id=s.market_id)""",
+        (iso(now),),
+    )
+    recorded, unresolved = 0, []
+    for event in events:
+        if latest_result(store, event["id"]) is not None:
+            continue
+        code = league_for.get(event["league"])
+        if code is None:
+            unresolved.append(f"{event['name_raw']}: liga bez niezależnego źródła wyników")
+            continue
+        local_day = (
+            datetime.fromisoformat(event["start_at"])
+            .astimezone(ZoneInfo(openfootball.LEAGUES[code].zone))
+            .date()
+            .isoformat()
+        )
+        rows = store.rows(
+            """SELECT * FROM historical_results WHERE competition=? AND match_date=?
+            AND available_at<=?""",
+            (code, local_day, iso(now)),
+        )
+        known = {
+            participant_key(r[side], "football", normalizer): r[side]
+            for r in rows
+            for side in ("home", "away")
+        }
+        home = match_participant(event["home"], "football", known, normalizer, aliases)
+        away = match_participant(event["away"], "football", known, normalizer, aliases)
+        found = [r for r in rows if r["home"] == home.target and r["away"] == away.target]
+        if (
+            home.status not in {"exact", "alias"}
+            or away.status not in {"exact", "alias"}
+            or len(found) != 1
+        ):
+            unresolved.append(f"{event['name_raw']}: brak pewnego wyniku w źródle")
+            continue
+        match = found[0]
+        details = json.loads(match["details_json"] or "{}")
+        ht = details.get("ht") or [None, None]
+        record_result(
+            store,
+            event_id=event["id"],
+            status="completed",
+            now=now,
+            home_score=match["home_score"],
+            away_score=match["away_score"],
+            ht_home=ht[0],
+            ht_away=ht[1],
+            details={"source_result_id": match["id"], "source": "openfootball (CC0)"},
+            source="openfootball",
+            verified=True,
+        )
+        recorded += 1
+    return {"recorded": recorded, "unresolved": unresolved}
 
 
 def coupons_table(store: Store) -> list[dict]:

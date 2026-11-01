@@ -1,6 +1,29 @@
 """Labelled synthetic offer documents (FIXTURE TESTOWY). Odds are invented for tests only."""
 
-from sports_edge.demo import build_generic_pdf, build_sts_pdf
+from sports_edge.demo import build_sts_pdf
+
+
+def build_generic_pdf(rows: list[tuple], *, title: str) -> bytes:
+    """A non-STS table document (e.g. Superbet-like). Used only to test that it is refused."""
+    import pymupdf
+
+    font = pymupdf.Font("cjk")
+    doc = pymupdf.open()
+    doc.set_metadata({"title": title, "subject": "synthetic fixture"})
+    page = doc.new_page(width=595.28, height=841.89)
+    writer = pymupdf.TextWriter(page.rect)
+    y = 40.0
+    for row in rows:
+        y += 16
+        text = " ".join(
+            str(part) if not isinstance(part, list) else " ".join(part) for part in row[1:]
+        )
+        writer.append((40, y), text, font=font, fontsize=9)
+    writer.write_text(page)
+    data = doc.tobytes()
+    doc.close()
+    return data
+
 
 SIX = ["1", "X", "2", "1X", "X2", "12"]
 SUPERBET_TITLE = "SUPERBET - OFERTA DZIENNA - FIXTURE TESTOWY (DANE SYNTETYCZNE)"

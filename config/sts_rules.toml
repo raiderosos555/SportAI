@@ -1,0 +1,94 @@
+# STS market settlement rules verified against the operator's documents on 2026-11-01.
+# R = "Regulamin Internetowych Zakładów Bukmacherskich" (title of file: 2025.07.08, 26 pages)
+#     https://static-content.sts.pl/assets/regulations/regulamin-internetowych-zakladow-bukmacherskich-pl-1.pdf
+# Z = "Zasady dot. zakładów na poszczególne sporty" (title of file: 2026.09.08, 35 pages)
+#     https://static-content.sts.pl/assets/regulations/zasady-dot-zakladow-na-poszczegolne-sporty-pl.pdf
+# Rules valid for offers from 2026-11-01; earlier seasons need their own dated versions.
+# A (sport, market, period) combination that is not listed here is UNVERIFIED.
+# payoff: binary = win/loss only (lines ending in .5); void_on_draw = stake returned on draw.
+
+[documents.R]
+title = "Regulamin Internetowych Zakładów Bukmacherskich"
+version = "2025-07-08"
+sha256 = "c80c92fbd7d4d8c5"  # first 16 hex digits of the file read on 2026-11-01
+[documents.Z]
+title = "Zasady dot. zakładów na poszczególne sporty"
+version = "2026-09-08"
+sha256 = "313e7d4b84f8cb36"
+
+[general]
+valid_from = 2026-11-01
+void = "R 15.3.c i Z 15.1.3: wydarzenie nierozegrane, przerwane lub przełożone o ponad 24 h — zwrot stawki"
+ako_void = "R 15.7: anulowane typowanie w AKO liczone z kursem 1,00"
+stake_coefficient = "R 17.1: wygrana = współczynnik stawki × kurs; przykład 0,88 (12% podatku) — obowiązuje współczynnik z kuponu"
+max_payout = "R 17.2: maksymalna wygrana 1 000 000 zł na zakład"
+home_side = "Z 1.3: pierwsza drużyna w ofercie to gospodarz (także na terenie neutralnym, Z 1.4)"
+
+[[rule]]
+sport = "football"
+markets = ["1x2", "double_chance", "total", "team_total_home", "team_total_away", "btts", "home_to_score", "away_to_score", "ht_ft"]
+period = "FT"
+payoff = "binary"
+source = "Z 15.1.1: wynik po regulaminowym czasie gry z doliczonym czasem; Z 15.2.1 dla połów"
+
+[[rule]]
+sport = "football"
+markets = ["1x2", "double_chance", "total", "home_to_score", "away_to_score"]
+period = "H1"
+payoff = "binary"
+source = "Z 15.2.1: wynik wskazanej połowy wraz z doliczonym czasem"
+
+[[rule]]
+sport = "football"
+markets = ["1x2", "double_chance"]
+period = "H2"
+payoff = "binary"
+source = "Z 15.2.1: wynik wskazanej połowy wraz z doliczonym czasem"
+
+[[rule]]
+sport = "football"
+markets = ["draw_no_bet"]
+period = "FT"
+payoff = "void_on_draw"
+source = "Z 1.8: remis w regulaminowym czasie gry — zakład anulowany (zwrot stawki)"
+
+[[rule]]
+sport = "football"
+markets = ["handicap_1x2"]
+period = "FT"
+payoff = "binary"
+source = "Z 1.7.4–1.7.5: handicap europejski, zapis 0:1 dodawany do wyniku obu stron"
+
+[[rule]]
+sport = "basketball"
+markets = ["1x2"]
+period = "FT"
+payoff = "binary"
+source = "Z 13.2.1: „mecz” (1X2) po regulaminowym czasie gry, bez dogrywek"
+
+[[rule]]
+sport = "basketball"
+markets = ["match_winner"]
+period = "MATCH"
+payoff = "binary"
+source = "Z 13.2.2: „zwycięzca” z uwzględnieniem dogrywek (poza rewanżami w dwumeczach)"
+
+[[rule]]
+sport = "basketball"
+markets = ["total", "team_total_home", "team_total_away"]
+period = "FT_OT"
+payoff = "binary"
+source = "Z 13.2.4: punkty bez dogrywki, chyba że opis stanowi inaczej — w PDF STS „(z dogrywką)”"
+
+[[rule]]
+sport = "ice_hockey"
+markets = ["total"]
+period = "FT"
+payoff = "binary"
+source = "Z 11.1.1: liczba goli w regulaminowym czasie gry"
+
+# Explicitly unverified (kept for the record):
+# - handicap_unsigned (1. połowa - handicap): Z 1.7.2 odnosi wartość do 1. drużyny, ale PDF drukuje
+#   ją bez znaku, a kursy wskazują wartość ujemną — semantyka niepewna, rynek wyłączony.
+# - ht_or_ft, red_card, correct_score, set_winner, tennis match_winner (krecz), hockey 1X2:
+#   nie znaleziono jednoznacznych zapisów w przeczytanych fragmentach.

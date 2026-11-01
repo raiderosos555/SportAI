@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from sports_edge.ingestion.types import canonical, digest, iso
@@ -11,7 +11,8 @@ from sports_edge.offers.model import OfferRow, ParseResult
 from sports_edge.offers.text import fold
 from sports_edge.storage import Store
 
-BOOKMAKERS = {"sts": "STS", "superbet": "Superbet", "unknown": "Nieznany operator"}
+BOOKMAKER = "sts"  # TASK 003: the only operator in the active flow
+BOOKMAKERS = {BOOKMAKER: "STS"}
 
 SOURCES = {
     "sts_pdf_manual": (
@@ -24,12 +25,6 @@ SOURCES = {
         "pdf_download",
         "https://www.sts.pl/oferta-pdf",
     ),
-    "superbet_pdf_manual": (
-        "Superbet — ręczny import PDF (układ niezweryfikowany)",
-        "pdf_manual",
-        "https://superbet.pl/wiki/regulamin",
-    ),
-    "generic_pdf_manual": ("Inny PDF — ręczny import", "pdf_manual", "user_supplied"),
     "fixture": ("Fixture testowy / DEMO — dane syntetyczne", "synthetic", "none"),
 }
 
@@ -80,8 +75,17 @@ def import_offer(
     data_kind: str,
     ingested_at: datetime,
     raw_path: str | None = None,
+    fetched_at: datetime | None = None,
+    source_url: str | None = None,
 ) -> ImportOutcome:
-    """Idempotent: the same file parsed by the same parser version is imported once."""
+    """Idempotent: the same file parsed by the same parser version is imported once.
+
+    Only STS offers enter the active store; anything else is refused before writing.
+    """
+    if result.bookmaker != BOOKMAKER or any(r.bookmaker != BOOKMAKER for r in result.rows):
+        raise ValueError("Aplikacja przyjmuje wyłącznie ofertę STS")
+    if source_id not in SOURCES:
+        raise ValueError("Nieaktywne źródło danych")
     parser = f"{result.parser}@{result.parser_version}"
     import_key = digest(["import", sha256, parser, data_kind])
     summary = result.summary()
@@ -94,7 +98,7 @@ def import_offer(
             "imports",
             id=import_key,
             source_id=source_id,
-            bookmaker_id=result.bookmaker if result.bookmaker in BOOKMAKERS else "unknown",
+            bookmaker_id=BOOKMAKER,
             parser=parser,
             parser_verified=int(result.parser_verified),
             raw_sha256=sha256,
@@ -110,6 +114,8 @@ def import_offer(
             unparsed=summary["unparsed_lines"],
             quality=summary["quality"],
             summary_json=canonical(summary),
+            fetched_at=iso(fetched_at) if fetched_at else None,
+            source_url=source_url,
         )
         for row in result.rows:
             _insert_row(store, row, import_key, valid_at, ingested)
@@ -127,12 +133,11 @@ def import_offer(
 
 
 def _insert_row(store: Store, row: OfferRow, import_key: str, valid_at, ingested: str) -> None:
-    bookmaker = row.bookmaker if row.bookmaker in BOOKMAKERS else "unknown"
     event_key = event_id(row)
     store.insert(
         "events",
         id=event_key,
-        bookmaker_id=bookmaker,
+        bookmaker_id=BOOKMAKER,
         sport=row.sport or "unknown",
         sport_raw=row.sport_raw,
         league=row.league_raw,
@@ -200,17 +205,49 @@ def _first_import(store: Store, event_key: str, import_key: str) -> str:
 # ---------------------------------------------------------------- read models
 
 
-def imports(store: Store) -> list[dict]:
-    return store.rows("SELECT * FROM imports ORDER BY ingested_at DESC")
+def imports(store: Store, *, include_archived: bool = False) -> list[dict]:
+    sql = "SELECT * FROM imports"
+    if not include_archived:
+        sql += " WHERE bookmaker_id=?"
+        return store.rows(sql + " ORDER BY ingested_at DESC", (BOOKMAKER,))
+    return store.rows(sql + " ORDER BY ingested_at DESC")
 
 
-def offer_days(store: Store, bookmaker: str | None = None) -> list[str]:
-    sql = "SELECT DISTINCT offer_date FROM events WHERE offer_date IS NOT NULL"
-    params: tuple = ()
-    if bookmaker:
-        sql += " AND bookmaker_id=?"
-        params = (bookmaker,)
-    return [r["offer_date"] for r in store.rows(sql + " ORDER BY offer_date", params)]
+def offer_days(store: Store) -> list[str]:
+    return [
+        r["offer_date"]
+        for r in store.rows(
+            """SELECT DISTINCT offer_date FROM events WHERE offer_date IS NOT NULL
+            AND bookmaker_id=? ORDER BY offer_date""",
+            (BOOKMAKER,),
+        )
+    ]
+
+
+def archived_summary(store: Store) -> list[dict]:
+    """Rows kept from archived operators (e.g. Superbet); never used in active analyses."""
+    return store.rows(
+        """SELECT a.entity_id bookmaker, a.archived_at, a.reason,
+        (SELECT COUNT(*) FROM imports i WHERE i.bookmaker_id=a.entity_id) imports,
+        (SELECT COUNT(*) FROM events e WHERE e.bookmaker_id=a.entity_id) events
+        FROM archived_entities a WHERE a.entity_type='bookmaker' ORDER BY a.entity_id"""
+    )
+
+
+def _coverage(store: Store) -> list[dict]:
+    """STS imports with offer kind, document time and the offer dates they cover.
+
+    Empty documents (no rows at all) never prove that a market was withdrawn.
+    """
+    out = []
+    for row in store.rows(
+        "SELECT id, offer_kind, generated_at, ingested_at, summary_json FROM imports "
+        "WHERE bookmaker_id=? AND rows_total > 0",
+        (BOOKMAKER,),
+    ):
+        dates = set(json.loads(row["summary_json"]).get("offer_dates", []))
+        out.append({**row, "dates": dates})
+    return out
 
 
 def freshness(valid_at: str | None, start_at: str | None, now: datetime, max_age: timedelta) -> str:
@@ -228,17 +265,17 @@ def freshness(valid_at: str | None, start_at: str | None, now: datetime, max_age
 def offer_table(
     store: Store,
     *,
-    bookmaker: str | None = None,
     day: str | None = None,
     include_review: bool = True,
     data_kinds: tuple[str, ...] = ("prospective", "archive"),
 ) -> list[dict]:
-    """Latest quote per market (by document time, then ingestion) with selections pivoted."""
-    where = [f"i.data_kind IN ({','.join('?' for _ in data_kinds)})"]
-    params: list = list(data_kinds)
-    if bookmaker:
-        where.append("e.bookmaker_id=?")
-        params.append(bookmaker)
+    """Latest STS quote per market (document time, then ingestion), selections pivoted.
+
+    ``presence`` is 'withdrawn' when a newer document of the same offer kind covering the
+    event's date no longer lists the market; such prices must not be analysed as current.
+    """
+    where = [f"i.data_kind IN ({','.join('?' for _ in data_kinds)})", "e.bookmaker_id=?"]
+    params: list = [*data_kinds, BOOKMAKER]
     if day:
         where.append("e.offer_date=?")
         params.append(day)
@@ -248,7 +285,7 @@ def offer_table(
              m.id market_id, m.market_key, m.period, m.overtime, m.line, m.label_raw, m.rules_ref,
              q.id quote_set_id, q.offer_code, q.page, q.source_text, q.status, q.quality,
              q.issues_json, q.valid_at, q.ingested_at, q.import_id, i.parser_verified,
-             i.data_kind
+             i.data_kind, i.offer_kind, i.fetched_at, i.raw_sha256, i.parser
       FROM quote_sets q JOIN markets m ON m.id=q.market_id JOIN events e ON e.id=m.event_id
       JOIN imports i ON i.id=q.import_id
       WHERE {" AND ".join(where)}
@@ -276,12 +313,22 @@ def offer_table(
             "odds_id": o["odds_id"],
             "selection_id": o["selection_id"],
         }
+    coverage = _coverage(store)
     result = []
     for row in latest.values():
         row = dict(row)
         row["participants"] = json.loads(row.pop("participants_json"))
         row["issues"] = json.loads(row.pop("issues_json"))
         row["selections"] = by_quote.get(row["quote_set_id"], {})
+        newer = [
+            c
+            for c in coverage
+            if c["offer_kind"] == row["offer_kind"] != "unknown"
+            and row["offer_date"] in c["dates"]
+            and (c["generated_at"] or "", c["ingested_at"])
+            > (row["valid_at"] or "", row["ingested_at"])
+        ]
+        row["presence"] = "withdrawn" if newer else "current"
         result.append(row)
     result.sort(key=lambda r: (r["start_at"] or "", r["league"], r["event_id"], r["market_key"]))
     return result
@@ -299,9 +346,26 @@ def quote_history(store: Store, market_id: str) -> list[dict]:
 
 
 def counts(store: Store) -> dict:
-    tables = ("imports", "events", "markets", "quote_sets", "odds", "review_items", "predictions")
-    return {t: store.scalar(f"SELECT COUNT(*) FROM {t}") for t in tables}
-
-
-def day_bounds(day: date) -> tuple[str, str]:
-    return day.isoformat(), (day + timedelta(days=1)).isoformat()
+    """Active (STS) record counts; archived operators are reported separately."""
+    sts = (BOOKMAKER,)
+    return {
+        "imports": store.scalar("SELECT COUNT(*) FROM imports WHERE bookmaker_id=?", sts),
+        "events": store.scalar("SELECT COUNT(*) FROM events WHERE bookmaker_id=?", sts),
+        "markets": store.scalar(
+            "SELECT COUNT(*) FROM markets m JOIN events e ON e.id=m.event_id "
+            "WHERE e.bookmaker_id=?",
+            sts,
+        ),
+        "quote_sets": store.scalar(
+            "SELECT COUNT(*) FROM quote_sets q JOIN imports i ON i.id=q.import_id "
+            "WHERE i.bookmaker_id=?",
+            sts,
+        ),
+        "odds": store.scalar(
+            "SELECT COUNT(*) FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id "
+            "JOIN imports i ON i.id=q.import_id WHERE i.bookmaker_id=?",
+            sts,
+        ),
+        "review_items": store.scalar("SELECT COUNT(*) FROM review_items"),
+        "predictions": store.scalar("SELECT COUNT(*) FROM predictions"),
+    }

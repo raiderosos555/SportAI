@@ -133,6 +133,9 @@ def parse(document: Document, *, file_name: str | None = None) -> ParseResult:
             if market.specs is None:
                 warnings.append(f"Nieskatalogowany rynek: {market.header!r}")
     result_rows = _resolve(pending)
+    if not result_rows and not review:
+        # Observed on 2026-11-01 07:45: the "today" file had only the title, day and footer.
+        warnings.append("Dokument STS nie zawiera żadnych wydarzeń (pusty wydruk oferty)")
     generated = document.created_at or footer_at
     return ParseResult(
         bookmaker="sts",

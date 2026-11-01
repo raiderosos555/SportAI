@@ -11,7 +11,7 @@ from sports_edge.offers.text import parse_odds, split_line, split_participants
 pymupdf = pytest.importorskip("pymupdf")
 
 from sports_edge.pdf import layout, sts  # noqa: E402
-from sports_edge.pdf.engine import ParseError, detect_bookmaker, parse_pdf  # noqa: E402
+from sports_edge.pdf.engine import ParseError, parse_pdf  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -34,7 +34,6 @@ def test_sts_import_reads_document_metadata(sts_result, sts_fixture_pdf):
     assert sts_result.pages_total == 2  # long offer continues on a second page
     document = layout.load(sts_fixture_pdf)
     assert sts.looks_like_sts(document)
-    assert detect_bookmaker(document) == "sts"
 
 
 def test_sts_reads_events_with_polish_characters(sts_result):
@@ -136,23 +135,33 @@ def test_odds_are_not_guessed_when_outside_columns():
     assert "missing_selection" in partial.rows[0].issues
 
 
-def test_superbet_import_generic_parser_is_marked_unverified(superbet_fixture_pdf):
-    result, document = parse_pdf(superbet_fixture_pdf, file_name="superbet.pdf")
-    assert detect_bookmaker(document) == "superbet"
-    assert result.bookmaker == "superbet" and result.parser_verified is False
-    assert result.warnings and "niezweryfikowany" in result.warnings[0]
-    real = {r.market_key: r for r in result.rows if r.offer_code == "7101"}
-    assert real["1x2"].participants == ("Real Madryt", "FC Barcelona")
-    assert {s.key: s.odds for s in real["1x2"].selections} == {
-        "home": Decimal("2.15"),
-        "draw": Decimal("3.50"),
-        "away": Decimal("3.20"),
-    }  # decimal commas
-    assert all("layout_unverified" in r.issues for r in result.rows)
-    assert all(r.quality <= 0.7 for r in result.rows)
-    total = next(r for r in result.rows if r.offer_code == "7102")
-    assert total.market_key == "total" and total.line == "2.5"
-    assert result.offer_dates == (date(2026, 10, 31),)
+def test_superbet_and_other_operators_are_refused(foreign_fixture_pdf, store):
+    """TASK 003 STS ONLY: a Superbet-like document cannot be imported by accident."""
+    from sports_edge.repository import counts
+
+    before = counts(store)
+    with pytest.raises(ParseError, match="wyłącznie STS"):
+        parse_pdf(foreign_fixture_pdf, file_name="superbet.pdf")
+    assert counts(store) == before
+
+
+def test_empty_sts_document_is_flagged():
+    """Observed 2026-11-01 07:45: the 'today' PDF contained only title, day and footer."""
+    font = pymupdf.Font("cjk")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595.28, height=841.89)
+    writer = pymupdf.TextWriter(page.rect)
+    for (x, y), text, size in (
+        ((25.5, 26), "OFERTA KURSOWA", 12),
+        ((90, 60), "NIEDZIELA 2026-11-01", 17),
+        ((31.2, 825), "2026-11-01 07:45", 12),
+        ((508.2, 825), "Strona 1/1", 12),
+    ):
+        writer.append((x, y), text, font=font, fontsize=size)
+    writer.write_text(page)
+    result, _ = parse_pdf(doc.tobytes())
+    assert result.rows == () and result.review == ()
+    assert any("nie zawiera" in w for w in result.warnings)
 
 
 def test_engine_refuses_non_pdf_and_image_only_documents():
@@ -167,7 +176,7 @@ def test_engine_refuses_non_pdf_and_image_only_documents():
     with pytest.raises(ParseError, match="STS"):
         doc2 = pymupdf.open()
         doc2.new_page().insert_text((50, 50), "Inny dokument 1.50 2.50")
-        parse_pdf(doc2.tobytes(), bookmaker="sts")
+        parse_pdf(doc2.tobytes())
 
 
 @pytest.mark.parametrize(

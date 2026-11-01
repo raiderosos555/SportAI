@@ -1,4 +1,4 @@
-"""Event analysis and the Daily Coupon (SOLO / AKO) with justifications."""
+"""Event analysis and the Daily Coupon (SOLO / AKO) for the STS offer."""
 
 from decimal import Decimal
 
@@ -6,95 +6,106 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge.analysis.coupon import NO_EDGE, save_analysis
-from sports_edge.analysis.edge_engine import devig
 from sports_edge.app import common as c
 from sports_edge.bookmakers import load_profiles
-from sports_edge.models.registry import latest_predictions
 from sports_edge.paper import create_coupon
-from sports_edge.repository import offer_days, offer_table
+from sports_edge.repository import offer_days
 from sports_edge.services import analyse_day, policy
+
+
+def _candidate_rows(items) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Dyscyplina": x.sport,
+                "Liga": x.league,
+                "Wydarzenie": x.event,
+                "Godzina": c.local_time(x.start_at, "%m-%d %H:%M"),
+                "Rynek": c.MARKETS.get(x.market_key, x.market_key),
+                "Nr zakładu STS": x.offer_code or "",
+                "Typ": c.SELECTIONS.get(x.selection, x.selection),
+                "Kurs": float(x.odds),
+                "P model": round(x.p_model, 4) if x.p_model is not None else None,
+                "P rynek STS (bez marży)": round(x.p_market, 4) if x.p_market is not None else None,
+                "EV brutto": round(x.ev_gross, 4) if x.ev_gross is not None else None,
+                "EV netto": float(x.ev_net) if x.ev_net is not None else None,
+                "EV netto (dolna)": float(x.ev_net_low) if x.ev_net_low is not None else None,
+                "Niepewność p": f"[{x.p_low:.3f}, {x.p_high:.3f}]" if x.p_low is not None else "—",
+                "Model": x.model or "—",
+                "Walidacja": x.validation,
+                "Status": c.TIERS[x.tier],
+            }
+            for x in items
+        ]
+    )
 
 
 def analysis_page() -> None:
     c.setup_page()
     st.title("Analiza AI")
     st.caption(
-        "Szczegóły wydarzenia: kursy obu bukmacherów, prawdopodobieństwa rynkowe (bez marży), "
-        "prognozy modeli i ich niepewność. Kurs bukmachera nie jest niezależną prognozą."
+        "Statystyki niezależne, prognoza modelu, prawdopodobieństwo rynkowe STS, EV i "
+        "niepewność. Kurs STS nie jest niezależną prognozą przeciwko STS."
     )
     db = c.store()
     days = offer_days(db)
     if not days:
-        st.info("Brak danych. Zaimportuj ofertę.")
+        st.info("Brak danych. Zaimportuj ofertę STS.")
         return
     day = st.selectbox("Dzień", days, index=len(days) - 1)
-    rows = offer_table(db, day=day, data_kinds=c.data_kinds())
-    events: dict[str, dict] = {}
-    for row in rows:
-        events.setdefault(row["event_id"], row)
+    _report, candidates = analyse_day(
+        db, c.paths(), c.settings(), day, now=c.now(), data_kinds=c.data_kinds()
+    )
+    events = {}
+    for x in candidates:
+        events.setdefault(x.event_id, x)
     if not events:
         st.info("Brak wydarzeń w tym dniu.")
         return
     labels = {
-        eid: f"{c.local_time(r['start_at'], '%H:%M')} · {c.BOOKMAKER_NAMES.get(r['bookmaker_id'])} · "
-        f"{' - '.join(r['participants']) or r['name_raw']} ({r['league']})"
-        for eid, r in events.items()
+        eid: f"{c.local_time(x.start_at, '%H:%M')} · {x.event} ({x.league})"
+        for eid, x in events.items()
     }
     choice = st.selectbox("Wydarzenie", list(labels), format_func=labels.get)
-    event_rows = [r for r in rows if r["event_id"] == choice]
-    head = event_rows[0]
-    c.pills(head["sport"], head["league"], f"start {c.local_time(head['start_at'])}")
-    predictions = latest_predictions(db, as_of=c.now())
-    records = []
-    for row in event_rows:
-        fair, margin = devig(row)
-        prediction = predictions.get(
-            (row["event_id"], row["market_key"], row["period"], row["line"])
-        )
-        for key, quote in row["selections"].items():
-            p_model = prediction["probabilities"].get(key) if prediction else None
-            interval = (
-                prediction["uncertainty"].get("interval", {}).get(key) if prediction else None
+    rows = [x for x in candidates if x.event_id == choice]
+    head = rows[0]
+    c.pills(head.sport, head.league, f"start {c.local_time(head.start_at)}")
+    st.subheader("Prognoza i EV")
+    st.dataframe(_candidate_rows(rows), hide_index=True, width="stretch")
+    st.subheader("Statystyki niezależne (as-of)")
+    teams = head.event.split(" - ")
+    history_rows = []
+    for team in teams:
+        history_rows.extend(
+            db.rows(
+                """SELECT match_date, competition, home, away, home_score, away_score,
+                available_at_basis FROM historical_results
+                WHERE (home LIKE ? OR away LIKE ?) AND available_at <= ?
+                ORDER BY match_date DESC LIMIT 5""",
+                (f"%{team}%", f"%{team}%", c.now().isoformat()),
             )
-            records.append(
-                {
-                    "Rynek": c.MARKETS.get(row["market_key"], row["market_key"]),
-                    "Okres": c.PERIODS.get(row["period"], row["period"]),
-                    "Linia": row["line"] or "",
-                    "Typ": c.SELECTIONS.get(key, key),
-                    "Kurs": float(quote["price"]),
-                    "P implikowane": round(1 / float(quote["price"]), 4),
-                    "P rynek bez marży": round(fair[key], 4) if fair else None,
-                    "Marża": round(margin, 4) if margin is not None else None,
-                    "P model": round(p_model, 4) if p_model is not None else None,
-                    "Niepewność": f"[{interval[0]:.3f}, {interval[1]:.3f}]" if interval else "—",
-                    "Model": f"{prediction['family']} {prediction['version']} ({prediction['version_status']})"
-                    if prediction
-                    else "brak",
-                }
-            )
-    st.dataframe(pd.DataFrame(records), hide_index=True, width="stretch")
-    st.subheader("Źródła")
-    for row in event_rows[:1]:
-        st.write(
-            f"Import `{row['import_id'][:12]}…`, dokument z {c.local_time(row['valid_at'])}, "
-            f"pobrany {c.local_time(row['ingested_at'])}, strona PDF {row['page']}, kod {row['offer_code']}."
         )
-        st.code(row["source_text"], language=None)
-    st.subheader("Statystyki niezależne")
-    history = db.scalar("SELECT COUNT(*) FROM historical_results WHERE sport=?", (head["sport"],))
-    if history:
-        st.write(f"W bazie {history} historycznych wyników dla sportu `{head['sport']}`.")
+    if history_rows:
+        st.dataframe(pd.DataFrame(history_rows), hide_index=True, width="stretch")
+        st.caption(
+            "Wyszukiwanie po fragmencie nazwy — do modelu używane są tylko zweryfikowane dopasowania."
+        )
     else:
         st.warning(
-            "Brak niezależnych danych statystycznych dla tej dyscypliny — wydarzenie nie kwalifikuje "
-            "się do analizy EV. Zaimportuj licencjonowane wyniki historyczne (Ustawienia → Modele)."
+            "Brak niezależnych danych dla tego wydarzenia — nie kwalifikuje się do analizy EV."
         )
-    st.subheader("LLM / Astra")
-    st.info(
-        "Adapter LLM nie jest skonfigurowany: brak klucza i weryfikacji dostępności modelu "
-        "(np. Astra). Odpowiedzi LLM nie są używane jako prognozy."
+    st.subheader("Uzasadnienie")
+    for x in rows[:6]:
+        with st.expander(
+            f"{c.MARKETS.get(x.market_key)} · {c.SELECTIONS.get(x.selection, x.selection)} @ {x.odds}"
+        ):
+            st.json(x.explanation, expanded=True)
+    st.subheader("Źródła")
+    st.write(
+        "Oferta: STS PDF (oficjalny wydruk), migawka użyta w analizie; wyniki: openfootball "
+        "(CC0); reguły rynków: config/sts_rules.toml (regulamin STS 2025-07-08, zasady 2026-09-08)."
     )
+    st.info("LLM (np. Astra) nie jest skonfigurowany i nie jest źródłem prognoz.")
 
 
 def coupon_page() -> None:
@@ -103,7 +114,7 @@ def coupon_page() -> None:
     db = c.store()
     days = offer_days(db)
     if not days:
-        st.info("Brak danych. Zaimportuj ofertę.")
+        st.info("Brak danych. Zaimportuj ofertę STS.")
         return
     today = str(c.today_local())
     day = st.selectbox(
@@ -111,21 +122,19 @@ def coupon_page() -> None:
     )
     rules = policy(c.paths())
     st.caption(
-        f"Polityka {rules.version}: jakość ≥ {rules.min_data_quality}, zweryfikowany parser, aktualny kurs, "
-        f"zwalidowany model (n ≥ {rules.min_validation_events}, ECE ≤ {rules.max_calibration_ece}, "
-        f"lepszy od rynku), dolna granica EV netto > {rules.min_net_ev_lower_bound}, kurs ≤ {rules.max_odds}."
+        f"Polityka {rules.version}: jakość ≥ {rules.min_data_quality}, aktualny i obecny w ofercie "
+        f"kurs, zwalidowany model (holdout n ≥ {rules.min_validation_events}, ECE ≤ "
+        f"{rules.max_calibration_ece}, lepszy od rynku), zweryfikowane reguły rynku i podatek, "
+        f"dolna granica EV netto > {rules.min_net_ev_lower_bound}, kurs ≤ {rules.max_odds}."
     )
     if st.button("▶ Uruchom analizę", type="primary"):
-        settings = c.settings()
-        report, candidates, _comparison, _ = analyse_day(
-            db, c.paths(), settings, day, now=c.now(), data_kinds=c.data_kinds()
+        report, candidates = analyse_day(
+            db, c.paths(), c.settings(), day, now=c.now(), data_kinds=c.data_kinds()
         )
         analysis_id = save_analysis(db, report, candidates, rules)
         st.session_state["coupon"] = (report, candidates, analysis_id)
     if "coupon" not in st.session_state:
-        st.info(
-            "Kliknij „Uruchom analizę”. Każde uruchomienie jest zapisywane w historii bez nadpisywania."
-        )
+        st.info("Kliknij „Uruchom analizę”. Każde uruchomienie jest zapisywane bez nadpisywania.")
         return
     report, candidates, analysis_id = st.session_state["coupon"]
     if report.day != day:
@@ -134,46 +143,28 @@ def coupon_page() -> None:
         c.banner(NO_EDGE, "noedge")
     else:
         c.banner(report.headline + " — analiza, nie rekomendacja gry", "ok")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Przeanalizowane selekcje", report.analysed)
-    m2.metric("Przyjęte SOLO", len(report.solo))
-    m3.metric("Analiza", analysis_id[:10] + "…")
-    st.subheader("Ranking SOLO")
+    counts = report.counts
+    cols = st.columns(5)
+    cols[0].metric("Przeanalizowane selekcje", counts.get("analysed", 0))
+    cols[1].metric("Z prognozą modelu", counts.get("with_forecast", 0))
+    cols[2].metric("EV netto > 0", counts.get("ev_positive", 0))
+    cols[3].metric("Eksperymentalne", counts.get("experimental", 0))
+    cols[4].metric("Zwalidowane", counts.get("validated", 0))
+    st.subheader("B. Kandydaci zwalidowani — ranking SOLO")
     if report.solo:
-        st.dataframe(
-            pd.DataFrame(
-                [
-                    {
-                        "Bukmacher": c.BOOKMAKER_NAMES.get(s.bookmaker),
-                        "Wydarzenie": s.event,
-                        "Rynek": c.MARKETS.get(s.market_key),
-                        "Typ": c.SELECTIONS.get(s.selection, s.selection),
-                        "Kurs": float(s.odds),
-                        "P model": s.p_model,
-                        "Przedział p": f"[{s.p_low:.3f}, {s.p_high:.3f}]",
-                        "EV brutto": round(s.ev_gross, 4),
-                        "EV netto": float(s.ev_net),
-                        "EV netto (dolna)": float(s.ev_net_low),
-                        "Inny bukmacher": f"{s.other.get('bookmaker', '')} {s.other.get('odds', '')}",
-                    }
-                    for s in report.solo
-                ]
-            ),
-            hide_index=True,
-            width="stretch",
-        )
-        profiles = load_profiles(c.paths().config)
-        for s in report.solo:
+        st.dataframe(_candidate_rows(report.solo), hide_index=True, width="stretch")
+        profile = load_profiles(c.paths().config)["sts"]
+        for x in report.solo:
             if st.button(
-                f"Zapisz jako wirtualny kupon: {s.event} / {s.selection}", key=f"paper_{s.key}"
+                f"Zapisz jako wirtualny kupon: {x.event} / {x.selection}", key=f"paper_{x.key}"
             ):
                 try:
                     create_coupon(
                         db,
-                        odds_ids=[s.odds_id],
+                        odds_ids=[x.odds_id],
                         stake=Decimal(c.settings().nominal_stake),
                         mode="paper_system",
-                        profile=profiles[s.bookmaker],
+                        profile=profile,
                         now=c.now(),
                         analysis_id=analysis_id,
                     )
@@ -182,17 +173,23 @@ def coupon_page() -> None:
                     st.error(str(error))
     else:
         st.write(
-            "Brak selekcji spełniających wszystkie warunki. Ranking nie jest uzupełniany przypadkowymi typami."
+            "Brak selekcji spełniających wszystkie warunki. Ranking nie jest uzupełniany typami."
         )
-    st.subheader("Analiza AKO")
+    st.subheader("A. Kandydaci eksperymentalni — przewaga niepotwierdzona")
+    if report.experimental:
+        st.warning("To nie są typy do gry: model nie przeszedł walidacji lub brakuje dowodów.")
+        st.dataframe(_candidate_rows(report.experimental[:50]), hide_index=True, width="stretch")
+    else:
+        st.write("Brak kandydatów eksperymentalnych (brak prognoz z dodatnim EV netto).")
+    st.subheader("AKO")
     st.write(("✅ " if report.ako.created else "⛔ ") + report.ako.reason)
-    st.subheader("Dlaczego odrzucono")
+    st.subheader("Powody odrzuceń")
     if report.rejection_reasons:
         st.dataframe(
             pd.DataFrame(
                 [
                     {"Powód": k, "Liczba selekcji": v}
-                    for k, v in list(report.rejection_reasons.items())[:20]
+                    for k, v in list(report.rejection_reasons.items())[:25]
                 ]
             ),
             hide_index=True,
@@ -203,17 +200,15 @@ def coupon_page() -> None:
         shown = (
             [x for x in candidates if query in x.event.lower()][:30] if query else candidates[:10]
         )
-        for candidate in shown:
+        for x in shown:
             st.markdown(
-                f"**{candidate.event}** · {c.MARKETS.get(candidate.market_key)} · "
-                f"{c.SELECTIONS.get(candidate.selection, candidate.selection)} @ {candidate.odds}"
+                f"**{x.event}** · {c.MARKETS.get(x.market_key)} · "
+                f"{c.SELECTIONS.get(x.selection, x.selection)} @ {x.odds} — {c.TIERS[x.tier]}"
             )
-            st.json(candidate.explanation, expanded=False)
-    if report.warnings:
-        st.subheader("Ostrzeżenia")
-        for warning in report.warnings:
-            st.warning(warning)
+            st.json(x.explanation, expanded=False)
+    for warning in report.warnings:
+        st.warning(warning)
     st.caption(
-        "Aplikacja nie obstawia i nie gwarantuje wygranej. Dodatnie EV z modelu bez walidacji nie jest "
-        "potwierdzoną przewagą; wynik pojedynczego dnia nie jest dowodem skuteczności."
+        "Aplikacja nie obstawia i nie gwarantuje wygranej. Dodatnie EV z niezwalidowanego modelu "
+        "nie jest przewagą; wynik jednego dnia nie jest dowodem skuteczności."
     )

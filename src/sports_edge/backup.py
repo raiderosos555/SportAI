@@ -8,7 +8,7 @@ from pathlib import Path
 
 from sports_edge import __version__
 from sports_edge.settings import AppPaths
-from sports_edge.storage import Store
+from sports_edge.storage import snapshot_file
 
 RESTORE = """Przywracanie kopii Sports Edge AI
 1. Zamknij aplikację (okno start.bat).
@@ -34,8 +34,8 @@ def create_backup(paths: AppPaths, *, now: datetime, include_raw: bool = False) 
     target.mkdir(parents=True)
     shutil.copytree(paths.config, target / "config")
     if paths.database.is_file():
-        with Store(paths.database) as store:
-            store.backup_to(target / "sports_edge.db")
+        # Read-only copy: opening through Store could migrate the schema before the backup.
+        snapshot_file(paths.database, target / "sports_edge.db")
     if paths.settings_file.is_file():
         shutil.copy2(paths.settings_file, target / "settings.json")
     if include_raw and paths.raw.is_dir():

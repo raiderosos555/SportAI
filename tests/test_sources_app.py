@@ -131,12 +131,11 @@ def test_startup_check_reports_configuration(app_paths):
 
 PAGES = {
     "dashboard": "from sports_edge.app.pages_offers import dashboard; dashboard()",
-    "sts": "from sports_edge.app.pages_offers import sts_page; sts_page()",
-    "superbet": "from sports_edge.app.pages_offers import superbet_page; superbet_page()",
-    "porownanie": "from sports_edge.app.pages_offers import comparison_page; comparison_page()",
+    "oferta": "from sports_edge.app.pages_offers import offer_page; offer_page()",
     "analiza": "from sports_edge.app.pages_analysis import analysis_page; analysis_page()",
     "kupon": "from sports_edge.app.pages_analysis import coupon_page; coupon_page()",
     "historia": "from sports_edge.app.pages_history import history_page; history_page()",
+    "modele": "from sports_edge.app.pages_models import models_page; models_page()",
     "ustawienia": "from sports_edge.app.pages_settings import settings_page; settings_page()",
 }
 

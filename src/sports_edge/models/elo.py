@@ -1,23 +1,32 @@
-"""Elo baseline with an ordered draw margin. Walk-forward: predict first, then update.
+"""Elo baseline with an ordered draw margin and a strictly as-of walk-forward.
 
 Chosen as the first baseline because it needs only legally obtainable historical results
-(date, teams, score) and its predictions for match t use matches available before t.
+(date, teams, score). All matches of one calendar day are forecast with ratings built from
+results of earlier days only; the day's results are applied after all of its forecasts.
 """
 
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
+from itertools import groupby
 from math import log
 
 
 @dataclass(frozen=True)
 class HistoricalMatch:
-    available_at: datetime  # when the result was known; used for as-of ordering
-    match_date: str
+    available_at: datetime  # when the result is treated as known (see availability basis)
+    match_date: str  # ISO date of the match; the as-of forecast group
     home: str
     away: str
     home_score: int
     away_score: int
+    start_at: datetime | None = None
+    competition: str = ""
+    result_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.available_at.date().isoformat() < self.match_date:
+            raise ValueError("Result marked available before the match day (data leakage)")
 
     @property
     def outcome(self) -> str:
@@ -60,14 +69,22 @@ class Elo:
             self.games[team] = self.games.get(team, 0) + 1
 
 
+def _days(matches: Iterable[HistoricalMatch]):
+    ordered = sorted(matches, key=lambda m: (m.match_date, m.competition, m.home, m.away))
+    for _day, group in groupby(ordered, key=lambda m: m.match_date):
+        yield list(group)
+
+
 def walk_forward(matches: Iterable[HistoricalMatch], model: Elo, *, three_way: bool) -> list[dict]:
-    """Out-of-sample forecast for every match, made before its own result is used."""
+    """Out-of-sample forecasts; a day's results are used only from the next day on."""
     out = []
-    for match in sorted(matches, key=lambda m: (m.available_at, m.home, m.away)):
-        experience = min(model.games.get(match.home, 0), model.games.get(match.away, 0))
-        forecast = model.probabilities(match.home, match.away, three_way=three_way)
-        out.append({"match": match, "forecast": forecast, "experience": experience})
-        model.update(match)
+    for day in _days(matches):
+        for match in day:
+            experience = min(model.games.get(match.home, 0), model.games.get(match.away, 0))
+            forecast = model.probabilities(match.home, match.away, three_way=three_way)
+            out.append({"match": match, "forecast": forecast, "experience": experience})
+        for match in day:
+            model.update(match)
     return out
 
 
@@ -90,9 +107,10 @@ def fit_draw_margin(predictions: Sequence[dict], grid_step: float = 0.01) -> flo
 
 
 def rating_differences(matches: Iterable[HistoricalMatch], model: Elo) -> list[dict]:
-    """Pre-match rating differences for draw-margin fitting (updates the model)."""
+    """Pre-match rating differences (same as-of grouping) for draw-margin fitting."""
     out = []
-    for match in sorted(matches, key=lambda m: (m.available_at, m.home, m.away)):
-        out.append({"match": match, "d": model.diff(match.home, match.away)})
-        model.update(match)
+    for day in _days(matches):
+        out.extend({"match": m, "d": model.diff(m.home, m.away)} for m in day)
+        for match in day:
+            model.update(match)
     return out

@@ -49,3 +49,20 @@ Sama kolumna closing/date nie spełnia tego warunku.
 W TASK 001 testy pokrywają strefy, kolejność, granicę startu, brak/future/stale quote.
 Testy transformacji cech i archiwalnego replay zostaną dodane wraz z ich implementacją.
 Nie twierdzimy, że sam zestaw aktualnych walidatorów wyklucza każdy przeciek.
+
+## TASK 003 — zabezpieczenia prognoz i treningu
+
+| Ryzyko | Zabezpieczenie | Test |
+|---|---|---|
+| Prognoza po rozpoczęciu meczu | `save_prediction` odrzuca prognozę `prospective` bez wydarzenia, bez godziny startu lub z `created_at ≥ start`; `predict_offer` pomija rozpoczęte mecze | `test_forecasts_only_before_start_and_with_current_data`, `test_prediction_history_is_immutable_and_pre_match_only` |
+| Prognoza utworzona po decyzji lub po starcie w odczycie | `latest_predictions(as_of)` zwraca tylko `created_at ≤ as_of` i `created_at < start` | jw. |
+| Wynik meczu z tego samego dnia w cechach | Walk-forward grupuje mecze po dniach: prognozy dnia D używają wyłącznie dni < D | `test_walk_forward_does_not_use_the_current_or_same_day_results` |
+| Wynik „dostępny” przed meczem | Import odrzuca wiersz z `available_at` przed dniem meczu, `HistoricalMatch` również; `history(until=…)` filtruje po dostępności | `test_result_cannot_be_available_before_its_match`, `test_history_is_as_of`, `test_source_timestamps_are_kept_apart_from_the_assumed_lag` |
+| Założony czas dostępności traktowany jak potwierdzony | `available_at_basis`: `assumed_lag_36h` (openfootball, CSV bez czasu) vs `source_timestamp` (CSV z kolumną `available_at` ze strefą) | `test_history_is_as_of`, `test_source_timestamps_are_kept_apart_from_the_assumed_lag` |
+| Dobór parametrów na holdoucie | Siatka wybierana na walidacji, margines remisu z danych sprzed holdoutu, holdout oceniany raz | `test_chronological_experiment_keeps_the_holdout_untouched` |
+| Brak odtwarzalności | `info_cutoff ≤ created_at`, `data_snapshot` (SHA-256 wierszy), `code_state` (SHA-256 kodu + HEAD git) w każdej prognozie | `test_experiment_is_reproducible` |
+| „Lepszy od rynku” bez dowodu | `beats_market` wyliczane z benchmarku na tych samych meczach; flaga wywołującego ignorowana | `test_validated_status_needs_derived_market_evidence`, `test_market_benchmark_uses_the_same_events` |
+| Kurs zamknięcia jako cecha | Kursy innych operatorów tylko w `benchmark_odds`, bez joinu do cech modelu | — (brak danych; kontrola przy pierwszym imporcie) |
+| Nieaktualne dane w prognozie | Prognoza wstrzymana, gdy ostatni wynik drużyny jest starszy niż 21 dni lub drużyna ma < 10 meczów | `test_forecasts_only_before_start_and_with_current_data` |
+
+Wyniki: [raport TASK 003, sekcja C](task_003_report.md).

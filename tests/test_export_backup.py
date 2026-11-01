@@ -14,7 +14,7 @@ from sports_edge.storage import Store
 pytest.importorskip("pymupdf")
 
 
-def test_json_export_contains_offers_and_history(store, import_both, tmp_path):
+def test_json_export_contains_offers_and_history(store, import_sts, tmp_path):
     target = export_json(
         store, tmp_path / "out" / "export.json", now=datetime(2026, 10, 31, tzinfo=UTC)
     )
@@ -22,14 +22,14 @@ def test_json_export_contains_offers_and_history(store, import_both, tmp_path):
     assert payload["exported_at"].startswith("2026-10-31")
     data = payload["data"]
     assert {"imports", "predictions", "coupons", "settlements", "offers_latest"} <= set(data)
-    assert len(data["imports"]) == 2
+    assert len(data["imports"]) == 1
     legia = [o for o in data["offers_latest"] if o["event"] == "Legia Warszawa - Lech Poznań"]
-    assert {o["bookmaker"] for o in legia} == {"sts", "superbet"}
+    assert legia and {o["bookmaker"] for o in legia} == {"sts"}
     assert all(isinstance(o["odds"], str) for o in legia)  # Decimal kept exact as text
     assert len(offers_flat(store)) == len(data["offers_latest"])
 
 
-def test_csv_export(store, import_both, tmp_path):
+def test_csv_export(store, import_sts, tmp_path):
     files = export_csv(store, tmp_path / "csv")
     names = {f.name for f in files}
     assert "offers_latest.csv" in names and "coupons.csv" in names
@@ -53,7 +53,7 @@ def test_backup_snapshot_and_manifest(app_paths):
     )
     assert not (target / "raw").exists()  # large raw files only on request
     with Store(target / "sports_edge.db") as copy:
-        assert copy.scalar("SELECT COUNT(*) FROM bookmakers") == 3
+        assert copy.scalar("SELECT COUNT(*) FROM bookmakers") == 1
     with_raw = create_backup(app_paths, now=datetime(2026, 10, 31, 22, 16), include_raw=True)
     assert (with_raw / "raw" / "sts" / "big.pdf").is_file()
     assert [b["folder"] for b in list_backups(app_paths)] == [with_raw.name, target.name]
@@ -70,3 +70,20 @@ def test_settings_defaults_and_persistence(app_paths):
     assert load_settings(app_paths).offline_mode is False
     app_paths.settings_file.write_text("{broken", encoding="utf-8")
     assert load_settings(app_paths).offline_mode is True  # corrupt file -> safe defaults
+
+
+def test_backup_never_migrates_the_source_database(app_paths):
+    """The copy is read-only: an old schema stays old until the application opens it."""
+    import sqlite3
+
+    app_paths.database.parent.mkdir(parents=True)
+    legacy = sqlite3.connect(app_paths.database)
+    legacy.execute("CREATE TABLE t (x)")
+    legacy.execute("PRAGMA user_version=2")
+    legacy.commit()
+    legacy.close()
+    target = create_backup(app_paths, now=datetime(2026, 11, 1, 8, 0, 0))
+    for path in (app_paths.database, target / "sports_edge.db"):
+        check = sqlite3.connect(path)
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 2
+        check.close()

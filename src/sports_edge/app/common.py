@@ -6,14 +6,13 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from sports_edge.demo import demo_documents
+from sports_edge.demo import demo_document
 from sports_edge.repository import ensure_reference_data
-from sports_edge.services import import_pdf_bytes
+from sports_edge.services import import_pdf_bytes, open_store
 from sports_edge.settings import AppPaths, AppSettings, load_settings, project_root
 from sports_edge.storage import Store
 
 WARSAW = ZoneInfo("Europe/Warsaw")
-BOOKMAKER_NAMES = {"sts": "STS", "superbet": "Superbet", "unknown": "Inny"}
 MARKETS = {
     "1x2": "1X2",
     "double_chance": "Podwójna szansa",
@@ -63,6 +62,12 @@ FRESHNESS = {
     "stale": "🟠 nieaktualny",
     "expired": "🔴 wygasł",
     "unknown": "⚪ brak czasu",
+}
+PRESENCE = {"current": "obecny", "withdrawn": "⛔ wycofany"}
+TIERS = {
+    "validated": "✅ zwalidowany",
+    "experimental": "🧪 eksperymentalny",
+    "rejected": "odrzucony",
 }
 
 CSS = """
@@ -121,40 +126,35 @@ def data_kinds() -> tuple[str, ...]:
 
 
 def store() -> Store:
-    """One connection per browser session and database file."""
-    target = paths().demo_database if demo_mode() else paths().database
+    """One connection per browser session and database file (migration backs up first)."""
+    demo = demo_mode()
+    target = paths().demo_database if demo else paths().database
     key = f"store::{target}"
     if key not in st.session_state:
-        db = Store(target)
-        ensure_reference_data(db)
+        if demo:
+            db = Store(target)
+            ensure_reference_data(db)
+        else:
+            db = open_store(paths())
         st.session_state[key] = db
     return st.session_state[key]
 
 
 def load_demo_data() -> dict:
-    """Synthetic DEMO offers for today+1, stored only in data/demo/demo.db."""
+    """Synthetic DEMO offer (STS-like layout) stored only in data/demo/demo.db."""
     day = today_local() + timedelta(days=1)
     generated = now().astimezone(WARSAW).replace(tzinfo=None)
-    sts_pdf, superbet_pdf = demo_documents(day, generated)
-    db = store()
-    out = {}
-    for name, data, bookmaker in (
-        ("DEMO_sts.pdf", sts_pdf, "sts"),
-        ("DEMO_superbet.pdf", superbet_pdf, "superbet"),
-    ):
-        outcome = import_pdf_bytes(
-            db,
-            paths(),
-            settings(),
-            data,
-            file_name=name,
-            bookmaker=bookmaker,
-            now=now(),
-            source_id="fixture",
-            data_kind="demo",
-        )
-        out[name] = outcome.summary
-    return out
+    outcome = import_pdf_bytes(
+        store(),
+        paths(),
+        settings(),
+        demo_document(day, generated),
+        file_name="DEMO_sts.pdf",
+        now=now(),
+        source_id="fixture",
+        data_kind="demo",
+    )
+    return outcome.summary
 
 
 def setup_page() -> None:
@@ -162,7 +162,7 @@ def setup_page() -> None:
     if demo_mode():
         banner(
             "TRYB DEMO — dane syntetyczne z fikcyjnymi drużynami i kursami. "
-            "Nie są to oferty STS ani Superbet i nie wolno ich analizować jak danych rzeczywistych.",
+            "To nie jest oferta STS i nie wolno jej analizować jak danych rzeczywistych.",
             "demo",
         )
 
@@ -197,6 +197,7 @@ def offers_frame(
                 "Jakość": row["quality"],
                 "Status": "✅ ok" if row["status"] == "ok" else "⚠️ weryfikacja",
                 "Aktualność": FRESHNESS.get((fresh or {}).get(row["quote_set_id"], ""), "—"),
+                "Rynek w ofercie": PRESENCE.get(row.get("presence", "current"), "—"),
                 "Kod": row["offer_code"] or "",
                 "Strona": row["page"],
             }

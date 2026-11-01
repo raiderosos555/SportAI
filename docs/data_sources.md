@@ -59,6 +59,9 @@ opóźnieniem. Brak notowania nie jest przegraną ani zakładem po sztucznym kur
 
 ## TASK 002 — źródła ofert STS i Superbet (sprawdzono 31.10.2026)
 
+> Stan historyczny. Od TASK 003 aplikacja obsługuje wyłącznie STS; profil Superbet przeniesiono
+> do `config/archive/`, a wiersze Superbet, PropLine i JoJ nie dotyczą już aplikacji.
+
 | Źródło | Ustalenia | Status w aplikacji |
 |---|---|---|
 | STS — [sts.pl/oferta-pdf](https://www.sts.pl/oferta-pdf) | Oficjalne linki `retail-api.sts.pl/printed-offer?day=today/tomorrow/week`; HTTP 200, PDF z warstwą tekstową, odświeżany co ok. 5 min (`max-age=300`); brak `robots.txt` na hoście retail-api; regulaminu pod kątem automatycznych odczytów nie przeanalizowano | Import ręczny + pobranie na kliknięcie (opt-in, limit 1/10 min), bez harmonogramu |
@@ -68,3 +71,20 @@ opóźnieniem. Brak notowania nie jest przegraną ani zakładem po sztucznym kur
 | JoJ API / ArbPlay | Rynek grecki (Superbet GR), 0,01 USD/wywołanie lub RapidAPI 29–399 USD | Nie dotyczy PL |
 
 Szczegóły, koszty i decyzje: [raport TASK 002](task_002_report.md), sekcje 4–8.
+
+## TASK 003 — niezależne dane historyczne (sprawdzono 01.11.2026)
+
+| Źródło | Zakres | Dostęp i aktualizacja | Czas dostępności | Licencja / koszt | Decyzja |
+|---|---|---|---|---|---|
+| openfootball/football.json | 5 czołowych lig, użyte sezony 2012-13 – 2026-27; wynik końcowy i do przerwy, data i godzina lokalna | JSON z repozytorium GitHub, bez klucza; ostatnia zmiana repozytorium 22.09.2026 | brak czasu publikacji → `available_at = start + 36 h`, `available_at_basis = assumed_lag_36h` | CC0-1.0, 0 zł | **Użyte** (`datasources/openfootball.py`): 24 330 meczów do 20.09.2026, manifest SHA-256; bieżące wyniki nieaktualne |
+| football-data.org | zob. tabele wyżej | API z kluczem (rejestracja użytkownika) | metadane aktualizacji nie gwarantują dawnego czasu dostępności | plan bezpłatny z limitami (zob. wyżej) | Kandydat na aktualne wyniki w TASK 004 — wymaga decyzji użytkownika |
+| football-data.co.uk | wyniki i kursy wielu lig (kolumny pre-closing i closing) | CSV | brak czasu notowania | strona ogranicza wykorzystanie przez boty/AI | Nie używamy do treningu bez uzyskania praw |
+| tennis-data.co.uk | wyniki i kursy ATP/WTA | CSV/XLS | brak czasu notowania | wyłącznie użytek prywatny, zakaz wykorzystania do trenowania AI | Zablokowane |
+| JeffSackmann/tennis_atp, tennis_wta | — | repozytoria niedostępne (HTTP 404) | — | — | Niedostępne |
+| The Odds API, PropLine, ArbiScan | kursy wielu operatorów | API płatne | znaczniki notowań | płatne | Nie używamy bez zgody na koszt |
+| Oferta STS (prospektywnie) | PDF od 31.10.2026 | import ręczny, pobranie na żądanie | `document_generated_at`, `fetched_at`, `ingested_at` | — | Jedyny rynek referencyjny; CLV wymaga notowania w oknie 30 min przed startem |
+
+Kursy innych operatorów (gdy pojawi się legalne źródło) trafiają do osobnej tabeli
+`benchmark_odds` z momentem `opening` / `pre_match` / `closing` / `unknown` — wyłącznie jako
+benchmark badawczy, nigdy jako oferta STS ani cecha modelu. Ranking obszarów badawczych
+i braki: [raport TASK 003, sekcja B](task_003_report.md).

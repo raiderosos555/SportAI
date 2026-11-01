@@ -91,7 +91,8 @@ def sts_fixture_pdf():
 
 
 @pytest.fixture(scope="session")
-def superbet_fixture_pdf():
+def foreign_fixture_pdf():
+    """Superbet-like table (synthetic): must be refused by the STS-only importer."""
     pytest.importorskip("pymupdf")
     from offer_fixtures import superbet_pdf
 
@@ -106,25 +107,25 @@ def profiles():
 
 
 @pytest.fixture
-def import_both(store, sts_fixture_pdf, superbet_fixture_pdf):
-    """Import both fixtures as prospective data observed on 2026-10-31 12:30 UTC."""
+def import_sts(store, sts_fixture_pdf):
+    """Import the STS fixture as prospective data observed on 2026-10-31 12:30 UTC."""
     from sports_edge.pdf.engine import parse_pdf
     from sports_edge.repository import import_offer
 
-    ingested = datetime(2026, 10, 31, 12, 30, tzinfo=UTC)
-    outcomes = {}
-    for name, data, source in (
-        ("sts", sts_fixture_pdf, "sts_pdf_manual"),
-        ("superbet", superbet_fixture_pdf, "superbet_pdf_manual"),
-    ):
-        result, document = parse_pdf(data, file_name=f"fixture_{name}.pdf")
-        outcomes[name] = import_offer(
-            store,
-            result,
-            sha256=document.sha256,
-            file_name=f"fixture_{name}.pdf",
-            source_id=source,
-            data_kind="prospective",
-            ingested_at=ingested,
-        )
-    return outcomes
+    result, document = parse_pdf(sts_fixture_pdf, file_name="fixture_sts.pdf")
+    return import_offer(
+        store,
+        result,
+        sha256=document.sha256,
+        file_name="fixture_sts.pdf",
+        source_id="sts_pdf_manual",
+        data_kind="prospective",
+        ingested_at=datetime(2026, 10, 31, 12, 30, tzinfo=UTC),
+    )
+
+
+@pytest.fixture
+def rules():
+    from sports_edge.bookmakers import load_rules
+
+    return load_rules(ROOT / "config")

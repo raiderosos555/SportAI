@@ -1,0 +1,21 @@
+# Verified club identities: STS spelling = spelling in the independent data source.
+# Reviewed 2026-11-01 against openfootball 2025-26/2026-27 team lists and the STS offer of
+# 31.10.2026. Only pairs observed in the STS offer are listed (no guessed STS spellings);
+# new pairs are confirmed in the application and stored in the database (table aliases).
+
+[football]
+"Leeds" = "Leeds United FC"
+"Newcastle" = "Newcastle United FC"
+"Nottingham" = "Nottingham Forest FC"
+"Tottenham" = "Tottenham Hotspur FC"
+"Athletic Bilbao" = "Athletic Club"
+"Deportivo A Coruna" = "RC Deportivo La Coruña"
+"Espanyol" = "RCD Espanyol de Barcelona"
+"Racing Santander" = "Real Racing Club de Santander"
+"Real Sociedad" = "Real Sociedad de Fútbol"
+"Lazio Rzym" = "SS Lazio"
+"Olympique Lyon" = "Olympique Lyonnais"
+"PSG" = "Paris Saint-Germain FC"
+"RC Strasbourg" = "RC Strasbourg Alsace"
+"Stade Brest" = "Stade Brestois 29"
+"Troyes AC" = "ES Troyes AC"

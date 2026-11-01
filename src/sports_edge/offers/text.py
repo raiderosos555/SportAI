@@ -79,12 +79,15 @@ class NameNormalizer:
 
     affixes: frozenset[str] = frozenset()
     token_aliases: dict[str, str] = field(default_factory=dict)
+    drop_numbers: bool = False  # founding years / "1." prefixes, e.g. "1. FSV Mainz 05"
 
     def key(self, name: str) -> str:
         text = WOMEN_MARKERS.sub(" women ", name)
         text = _PUNCT.sub(" ", fold(text))
         tokens = [self.token_aliases.get(t, t) for t in text.split()]
-        kept = [t for t in tokens if t not in self.affixes]
+        kept = [
+            t for t in tokens if t not in self.affixes and not (self.drop_numbers and t.isdigit())
+        ]
         return " ".join(kept or tokens)
 
 
@@ -92,4 +95,8 @@ def load_normalizer(path: Path) -> NameNormalizer:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     tokens = {fold(k): fold(v) for k, v in data.get("tokens", {}).items()}
     affixes = frozenset(fold(a) for a in data.get("affixes", []))
-    return NameNormalizer(affixes=affixes, token_aliases=tokens)
+    return NameNormalizer(
+        affixes=affixes,
+        token_aliases=tokens,
+        drop_numbers=bool(data.get("drop_numeric_tokens", False)),
+    )

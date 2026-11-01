@@ -44,3 +44,15 @@ i sprawdzony na autentycznych PDF STS. Etapy B–D mają działający kod (pobie
 żądanie, adapter ArbiScan, import wyników CSV, Elo, EV netto, kupon SOLO/AKO, paper, ROI,
 CLV), ale bez danych niezależnych i bez zwalidowanego modelu — aplikacja nie tworzy kuponu.
 Proponowany TASK 003: [raport TASK 002, sekcja 15](task_002_report.md).
+
+## TASK 003 — stan (01.11.2026)
+
+Na żądanie użytkownika aplikacja obsługuje wyłącznie STS; Superbet zarchiwizowano bez utraty
+danych (migracja v3 z kopią). Usunięto przecieki czasowe w prognozach (tylko przed startem,
+as-of, walk-forward po dniach, wersjonowanie danych i kodu). Pierwszy eksperyment na danych
+rzeczywistych — Elo 1X2 na 24 330 meczach 5 lig (openfootball, CC0) — jest wyraźnie lepszy od
+klimatologii na holdoucie, ale bez legalnych kursów tych samych meczów nie ma porównania
+z rynkiem, więc model pozostaje `experimental`, a aplikacja nie tworzy kuponu. Dane kończą się
+20.09.2026, dlatego prognozy dla bieżącej oferty są wstrzymane (próg 21 dni).
+Proponowany TASK 004 (aktualne wyniki, kursy do walidacji, prospektywny test Elo vs STS):
+[raport TASK 003, sekcja F](task_003_report.md).

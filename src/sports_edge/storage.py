@@ -2,11 +2,31 @@
 
 import sqlite3
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
+ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
+# Columns added after v2; applied with ALTER TABLE to old and new databases alike.
+ADDED_COLUMNS = (
+    ("imports", "fetched_at", "TEXT"),
+    ("imports", "source_url", "TEXT"),
+    ("historical_results", "available_at_basis", "TEXT NOT NULL DEFAULT 'assumed_lag_36h'"),
+    ("historical_results", "start_at", "TEXT"),
+    ("historical_results", "details_json", "TEXT NOT NULL DEFAULT '{}'"),
+)
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS archived_entities (
+ id TEXT PRIMARY KEY, entity_type TEXT NOT NULL CHECK(entity_type IN ('bookmaker','source')),
+ entity_id TEXT NOT NULL, reason TEXT NOT NULL, archived_at TEXT NOT NULL,
+ UNIQUE(entity_type, entity_id)
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+ id TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at TEXT NOT NULL,
+ description TEXT NOT NULL, backup_path TEXT
+);
 CREATE TABLE IF NOT EXISTS sources (
  id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, terms_ref TEXT NOT NULL,
  retention TEXT NOT NULL, checked_on TEXT NOT NULL
@@ -133,6 +153,13 @@ CREATE TABLE IF NOT EXISTS historical_results (
  home TEXT NOT NULL, away TEXT NOT NULL, home_score INTEGER NOT NULL,
  away_score INTEGER NOT NULL, available_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS benchmark_odds (
+ id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES data_imports(id),
+ result_id TEXT NOT NULL REFERENCES historical_results(id), operator TEXT NOT NULL,
+ moment TEXT NOT NULL CHECK(moment IN ('opening','pre_match','closing','unknown')),
+ market_key TEXT NOT NULL, selection TEXT NOT NULL, price TEXT NOT NULL, observed_at TEXT,
+ UNIQUE(result_id, operator, moment, market_key, selection)
+);
 CREATE INDEX IF NOT EXISTS event_day ON events(bookmaker_id, offer_date);
 CREATE INDEX IF NOT EXISTS market_event ON markets(event_id);
 CREATE INDEX IF NOT EXISTS quote_market ON quote_sets(market_id, valid_at);
@@ -147,8 +174,9 @@ BEGIN SELECT RAISE(ABORT, 'incompatible_market'); END;
 
 
 class Store:
-    def __init__(self, path: Path | str):
-        if str(path) != ":memory:":
+    def __init__(self, path: Path | str, *, backup_dir: Path | None = None):
+        memory = str(path) == ":memory:"
+        if not memory:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.path = str(path)
         self.connection = sqlite3.connect(
@@ -157,9 +185,21 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA recursive_triggers=ON")
-        if str(path) != ":memory:":
+        self.version_before = self.connection.execute("PRAGMA user_version").fetchone()[0]
+        if self.version_before > SCHEMA_VERSION:
+            raise RuntimeError("Database was created by a newer version of the application")
+        self.migration_backup: Path | None = None
+        if not memory and 0 < self.version_before < SCHEMA_VERSION and backup_dir is not None:
+            stamp = datetime.now(UTC).strftime("%Y-%m-%d_%H-%M-%S")
+            self.migration_backup = backup_dir / f"pre-migration-v{SCHEMA_VERSION}_{stamp}.db"
+            self.backup_to(self.migration_backup)
+        if not memory:
             self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.executescript(SCHEMA)
+        for table, column, ddl in ADDED_COLUMNS:
+            existing = {r[1] for r in self.connection.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                self.connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         self.tables = {
             r[0]
             for r in self.connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -171,7 +211,36 @@ class Store:
                     f"""CREATE TRIGGER IF NOT EXISTS immutable_{table}_{action}
                     BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT,'append_only'); END"""
                 )
+        if self.version_before < SCHEMA_VERSION:
+            self._migrate_sts_only()
         self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    def _migrate_sts_only(self) -> None:
+        """v3: Superbet and generic sources leave the active flow; their rows stay archived."""
+        now = datetime.now(UTC).isoformat(timespec="microseconds")
+        with self.transaction():
+            for kind, table, ids in (
+                ("bookmaker", "bookmakers", ARCHIVED_BOOKMAKERS),
+                ("source", "sources", ARCHIVED_SOURCES),
+            ):
+                for entity in ids:
+                    if self.get(table, entity) is not None:
+                        self.insert(
+                            "archived_entities",
+                            id=f"{kind}:{entity}",
+                            entity_type=kind,
+                            entity_id=entity,
+                            reason="TASK 003: aplikacja obsługuje wyłącznie STS",
+                            archived_at=now,
+                        )
+            self.insert(
+                "schema_migrations",
+                id=f"v{SCHEMA_VERSION}:{now}",
+                version=SCHEMA_VERSION,
+                applied_at=now,
+                description=f"from v{self.version_before}: STS ONLY, archive, odds metadata",
+                backup_path=str(self.migration_backup) if self.migration_backup else None,
+            )
 
     def close(self):
         self.connection.close()
@@ -229,7 +298,31 @@ class Store:
 
     def backup_to(self, target: Path) -> None:
         """Consistent snapshot through SQLite's online backup API."""
-        target.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(str(target)) as destination:
-            self.connection.backup(destination)
+        snapshot(self.connection, target)
+
+
+def snapshot(source: sqlite3.Connection, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    destination = sqlite3.connect(str(target))
+    try:
+        source.backup(destination)
+    finally:
         destination.close()
+
+
+def snapshot_file(database: Path, target: Path) -> None:
+    """Copy a database file without opening it through Store (no migration side effects)."""
+    source = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True)
+    try:
+        snapshot(source, target)
+    finally:
+        source.close()
+
+
+def archived_ids(store: Store, entity_type: str) -> set[str]:
+    return {
+        r["entity_id"]
+        for r in store.rows(
+            "SELECT entity_id FROM archived_entities WHERE entity_type=?", (entity_type,)
+        )
+    }

@@ -1,8 +1,7 @@
 """Synthetic PDFs for tests and the DEMO mode. Every document is labelled as synthetic.
 
 The STS-like builder reproduces the measured geometry of the authentic printed offer (font
-sizes, two columns, label centres) so that parser logic is exercised offline. The generic
-builder is an invented Superbet-like table: it is NOT a copy of any Superbet document.
+sizes, two columns, label centres) so that parser logic is exercised offline.
 """
 
 from datetime import date, datetime
@@ -101,51 +100,11 @@ def _footer(state, font, generated):
     state["writer"].append((508.2, 825), "Strona 1/1", font=font, fontsize=12)
 
 
-def build_generic_pdf(rows: list[tuple], *, title: str) -> bytes:
-    """rows: ('text', s) | ('header', phrase, labels) | ('event', code, time, name, odds)."""
-    import pymupdf
-
-    font = _font()
-    doc = pymupdf.open()
-    doc.set_metadata({"title": title, "subject": "synthetic fixture"})
-    page = doc.new_page(width=595.28, height=841.89)
-    writer = pymupdf.TextWriter(page.rect)
-    centers: list[float] = []
-    y = 40.0
-    for row in rows:
-        y += 16
-        kind = row[0]
-        if kind == "text":
-            writer.append((40, y), row[1], font=font, fontsize=10)
-        elif kind == "header":
-            _, phrase, labels = row
-            centers = {6: [330, 365, 400, 435, 470, 505], 3: [330, 400, 470]}.get(
-                len(labels), [400, 470]
-            )
-            for x, text in ((40, "Kod"), (80, "Godz."), (120, phrase)):
-                writer.append((x, y), text, font=font, fontsize=9)
-            for label, center in zip(labels, centers, strict=True):
-                width = font.text_length(label, fontsize=9)
-                writer.append((center - width / 2, y), label, font=font, fontsize=9)
-        else:
-            _, code, start, name, odds = row
-            for x, text in ((40, code), (80, start), (120, name)):
-                writer.append((x, y), text, font=font, fontsize=9)
-            for value, center in zip(odds, centers, strict=True):
-                if value:
-                    width = font.text_length(value, fontsize=9)
-                    writer.append((center - width / 2, y), value, font=font, fontsize=9)
-    writer.write_text(page)
-    data = doc.tobytes()
-    doc.close()
-    return data
-
-
 DAYS = ["PONIEDZIAŁEK", "WTOREK", "ŚRODA", "CZWARTEK", "PIĄTEK", "SOBOTA", "NIEDZIELA"]
 
 
-def demo_documents(day: date, generated: datetime) -> tuple[bytes, bytes]:
-    """DEMO pair with fictional teams; odds are invented and must never be analysed as real."""
+def demo_document(day: date, generated: datetime) -> bytes:
+    """DEMO STS-like offer with fictional teams; odds are invented, never analysed as real."""
     header = f"{DAYS[day.weekday()]} {day.isoformat()}"
     sts = build_sts_pdf(
         [
@@ -179,30 +138,4 @@ def demo_documents(day: date, generated: datetime) -> tuple[bytes, bytes]:
         generated=generated.strftime("%Y-%m-%d %H:%M"),
         title="DEMO - DANE SYNTETYCZNE (układ jak oferta STS)",
     )
-    superbet = build_generic_pdf(
-        [
-            ("text", "SUPERBET-PODOBNY UKŁAD - DEMO - DANE SYNTETYCZNE"),
-            ("text", f"{day.day:02d}.{day.month:02d}.{day.year}"),
-            ("text", "PIŁKA NOŻNA"),
-            ("text", "Demolandia - Liga Przykładowa"),
-            ("header", "Mecz", ["1", "X", "2", "1X", "X2", "12"]),
-            (
-                "event",
-                "7001",
-                "18:00",
-                "FC Orły Testowo - Sokoły Demo",
-                ["2,10", "3,30", "3,55", "1,31", "1,72", "1,35"],
-            ),
-            (
-                "event",
-                "7002",
-                "20:30",
-                "Kruki Przykładowo - Jastrzębie Fikcja",
-                ["1,78", "3,75", "4,50", "1,21", "2,02", "1,27"],
-            ),
-            ("header", "Gole", ["Poniżej", "Powyżej"]),
-            ("event", "7003", "18:00", "FC Orły Testowo - Sokoły Demo (2.5)", ["1,92", "1,88"]),
-        ],
-        title="DEMO - DANE SYNTETYCZNE (układ Superbet-podobny, wymyślony)",
-    )
-    return sts, superbet
+    return sts

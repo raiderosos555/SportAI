@@ -2,33 +2,36 @@
 id = "sts"
 name = "STS"
 jurisdiction = "PL"
-checked_on = "2026-10-31"
+checked_on = "2026-11-01"
 license_note = "Zezwolenie MF DAG10.6831.4.2023, ważne 20.02.2024-20.02.2030 (stopka sts.pl, 31.10.2026)"
 
 [tax]
 profile = "tax/pl_sts_app.toml"
 verified = true
-notes = "Stawka x 0,88 oraz 10% od wygranej powyżej 2280 zł (pomoc.sts.pl, TASK 001). Dokładna granica 2280 zł zablokowana."
+notes = "Regulamin R 17.1: wygrana = współczynnik stawki × kurs, przykład 0,88 (12% podatku od gier); obowiązuje współczynnik pokazany na kuponie. Pomoc STS (TASK 001): 0,88 i 10% PIT od wygranej powyżej 2280 zł (R 17.5: według odrębnych przepisów). Granica równości 2280 zł zablokowana."
 
 [promotions]
 modelled = false
-notes = "Promocje, boosty i gra bez podatku nie są uwzględniane w EV."
+notes = "Promocje, boosty i gra bez podatku (inny współczynnik stawki) nie są uwzględniane w EV."
 
 [limits]
-known = false
-notes = "Limity stawek i wygranych niezweryfikowane; paper trading nie dowodzi możliwości zawarcia zakładu."
+known = true
+max_payout_pln = "1000000"
+notes = "R 17.2: maksymalna wygrana 1 000 000 zł na zakład. Limity stawek ustala STS indywidualnie (R) — nieznane; paper trading nie dowodzi możliwości zawarcia zakładu."
 
 [settlement]
 rules_url = "https://www.sts.pl/regulaminy"
-verified = false
-notes = "Okres, dogrywka i linia odczytywane z etykiet PDF; szczegółowe zasady sportów nieporównane."
+rules_file = "sts_rules.toml"
+verified = true
+notes = "Zweryfikowane rynki i okresy: config/sts_rules.toml (Z 2026-09-08, R 2025-07-08). Pozostałe rynki — niezweryfikowane i wyłączone z kandydatów zwalidowanych."
 
 [fees]
 execution_fee = "0"
-notes = "Brak znanych opłat dodatkowych od kuponu."
+notes = "Brak opłat od kuponu. R: opłata manipulacyjna 2% od wypłaty nieobróconych wpłat — nie dotyczy rozliczenia zakładu."
 
 [offer_source]
 official_pdf_page = "https://www.sts.pl/oferta-pdf"
 pdf_today = "https://retail-api.sts.pl/printed-offer?day=today"
 pdf_tomorrow = "https://retail-api.sts.pl/printed-offer?day=tomorrow"
 pdf_week = "https://retail-api.sts.pl/printed-offer?day=week"
+automation = "Brak harmonogramu: dopuszczalność cyklicznego pobierania niepotwierdzona; pobieranie tylko na żądanie użytkownika."

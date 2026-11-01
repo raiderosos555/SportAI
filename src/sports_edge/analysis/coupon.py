@@ -1,7 +1,9 @@
 """Daily Coupon Engine. No selection is produced to fill a daily quota.
 
-SOLO candidates must pass every gate of the policy. AKO is analysed only with an explicit
-joint-probability model; correlated legs (same event) are never multiplied together.
+SOLO candidates must pass every gate of the policy ("validated" tier). Experimental
+candidates (positive EV from a model whose edge is not confirmed) are listed separately and
+never presented as tips. AKO is analysed only with an explicit joint-probability model;
+correlated legs (same event) are never multiplied together.
 """
 
 from collections import Counter
@@ -65,6 +67,8 @@ class CouponReport:
     analysed: int
     rejection_reasons: dict[str, int]
     ako: AkoAnalysis
+    experimental: tuple[Candidate, ...] = ()
+    counts: dict[str, int] = field(default_factory=dict)
     warnings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -100,9 +104,29 @@ def build_daily_coupon(
         : policy.max_selections
     ]
     reasons = Counter(r for c in candidates if not c.accepted for r in c.reasons)
+    experimental = tuple(
+        sorted(
+            (c for c in candidates if c.tier == "experimental"),
+            key=lambda c: c.ev_net if c.ev_net is not None else Decimal("-9"),
+            reverse=True,
+        )
+    )
+    counts = {
+        "analysed": len(candidates),
+        "with_forecast": sum(c.p_model is not None for c in candidates),
+        "ev_positive": sum(c.ev_net is not None and c.ev_net > 0 for c in candidates),
+        "experimental": len(experimental),
+        "validated": sum(c.accepted for c in candidates),
+        "rejected": sum(c.tier == "rejected" for c in candidates),
+    }
     warnings = []
     if not candidates:
         warnings.append("Brak zaimportowanych ofert dla wybranego dnia")
+    if experimental:
+        warnings.append(
+            f"{len(experimental)} kandydatów eksperymentalnych: przewaga niepotwierdzona, "
+            "to nie są typy do gry"
+        )
     ako = analyse_ako(solo, policy, joint_model=joint_model, cost=cost, stake=stake, now=now)
     return CouponReport(
         day=day,
@@ -113,6 +137,8 @@ def build_daily_coupon(
         analysed=len(candidates),
         rejection_reasons=dict(reasons.most_common()),
         ako=ako,
+        experimental=experimental,
+        counts=counts,
         warnings=tuple(warnings),
     )
 
@@ -132,8 +158,6 @@ def analyse_ako(
         return AkoAnalysis(False, "Mniej niż dwie zaakceptowane selekcje SOLO")
     if joint_model is None:
         return AkoAnalysis(False, "Brak wiarygodnego modelu prawdopodobieństwa łącznego")
-    if len({leg.bookmaker for leg in legs}) != 1:
-        return AkoAnalysis(False, "Selekcje pochodzą od różnych bukmacherów")
     p_joint = joint_model.joint_probability(legs)
     if p_joint is None:
         return AkoAnalysis(False, "Model łączny odrzucił zestaw (zależne lub niepełne selekcje)")
@@ -163,8 +187,9 @@ def save_analysis(
     items = [
         {
             "key": c.key,
-            "bookmaker": c.bookmaker,
             "event": c.event,
+            "start_at": c.start_at,
+            "offer_code": c.offer_code,
             "market": c.market_key,
             "period": c.period,
             "line": c.line,
@@ -176,7 +201,15 @@ def save_analysis(
             "ev_net": str(c.ev_net) if c.ev_net is not None else None,
             "ev_net_low": str(c.ev_net_low) if c.ev_net_low is not None else None,
             "freshness": c.freshness,
-            "accepted": c.accepted,
+            "tier": c.tier,
+            "model_version_id": c.model_version_id,
+            "statuses": {
+                "data": c.data_status,
+                "model": c.model_status,
+                "rules": c.rules_status,
+                "tax": c.tax_status,
+                "presence": c.presence,
+            },
             "reasons": list(c.reasons),
         }
         for c in candidates
@@ -185,6 +218,8 @@ def save_analysis(
         "headline": report.headline,
         "analysed": report.analysed,
         "accepted": [c.key for c in report.solo],
+        "experimental": [c.key for c in report.experimental],
+        "counts": report.counts,
         "rejection_reasons": report.rejection_reasons,
         "ako": {"created": report.ako.created, "reason": report.ako.reason},
     }

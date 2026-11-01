@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sports-edge-ai"
-version = "0.2.0"
-description = "Local STS/Superbet offer analysis; analytical and paper trading only"
+version = "0.3.0"
+description = "Local STS offer analysis with independent forecasts; analytical and paper trading only"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []

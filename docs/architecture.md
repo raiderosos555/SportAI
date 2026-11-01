@@ -142,6 +142,9 @@ Filtry eksploracyjne są oznaczone jako eksploracja, nie tworzą nowego dowodu p
 
 ## TASK 002 — moduły zaimplementowane
 
+Stan po TASK 002 (historyczny). Superbet, parser ogólny i porównanie dwóch bukmacherów
+usunięto w TASK 003 — zob. następna sekcja.
+
 | Komponent z tabeli wyżej | Implementacja | Uwagi |
 |---|---|---|
 | Ingestion | `pdf/` (layout, sts, generic, engine), `offers/sources.py` | STS zweryfikowany na autentycznych PDF; Superbet/inne — parser ogólny niezweryfikowany |
@@ -154,3 +157,19 @@ Filtry eksploracyjne są oznaczone jako eksploracja, nie tworzą nowego dowodu p
 | Paper Trading | `paper.py` | Tryby rozdzielone; rozliczenia przez `settlement.settle` |
 | Dashboard | `app/` (Streamlit, 127.0.0.1) | 8 widoków, tryb DEMO w osobnej bazie |
 | Operacje | `backup.py`, `export.py`, `services.py`, `cli.py`, `start.bat`, `start.ps1` | Kopie `backups/RRRR-MM-DD_GG-MM-SS/`, eksport JSON/CSV |
+
+## TASK 003 — STS ONLY, dane niezależne i pierwszy eksperyment
+
+| Komponent | Implementacja | Uwagi |
+|---|---|---|
+| Ingestion | `pdf/engine.py` (wyłącznie STS), `pdf/sts.py` | Inne PDF → błąd; pusty wydruk oznaczany ostrzeżeniem; `pdf/generic.py` usunięty |
+| Magazyn | `storage.py` (SQLite v3), `repository.py` | Migracja z automatyczną kopią `backups/pre-migration-v3_*.db`; tabele `archived_entities`, `schema_migrations`, `benchmark_odds`; Superbet zarchiwizowany, nie usunięty; kopia zapasowa nie migruje bazy źródłowej |
+| Historia kursów | `history.py` | Zmiany kursów, momenty 24/12/6/3/1 h (tolerancja max(30 min, h/4), bez interpolacji), zamknięcie w oknie 30 min, CLV tylko z wiarygodnym zamknięciem, raport braków, wycofanie rynku tylko między dokumentami tego samego rodzaju |
+| Dane niezależne | `datasources/openfootball.py`, `sportsdata.py` | Manifest z SHA-256; `available_at_basis` odróżnia założenie (`assumed_lag_36h`) od czasu źródła (`source_timestamp`); historia as-of |
+| Dopasowanie | `matching.py` | STS ↔ dane niezależne: `exact` / `alias` / `candidate` / `none`; aliasy z `config/team_aliases.toml` i potwierdzeń użytkownika; podobieństwo daje tylko kandydata |
+| Prediction | `models/elo.py`, `models/registry.py`, `provenance.py` | Walk-forward po dniach; prognoza prospektywna tylko przed startem, z `info_cutoff`, `data_snapshot`, `code_state`; `beats_market` wyliczane z benchmarku na tych samych meczach |
+| Edge Detection | `analysis/edge_engine.py`, `bookmakers.py` + `config/sts_rules.toml` | Statusy danych, modelu, reguł, podatku i aktualności; poziomy `validated` / `experimental` / `rejected`; `analysis/comparison.py` usunięty |
+| Kupon dnia | `analysis/coupon.py` | Kandydaci zwalidowani i eksperymentalni osobno, liczniki analizy; AKO tylko z jawnym modelem łącznym |
+| Paper Trading | `paper.py` | Wyłącznie profil STS, limit wygranej 1 000 000 zł, wyniki automatyczne tylko przy pewnym dopasowaniu (ze źródłem), maks. obsunięcie |
+| Dashboard | `app/` (Streamlit) | 7 widoków; nowa zakładka „Modele i eksperymenty” |
+| Operacje | `cli.py` | `research fetch-data / import-data / experiment / predict / results`; `import-pdf` bez wyboru bukmachera |

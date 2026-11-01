@@ -1,11 +1,18 @@
 # Verified, language-level aliases used to normalise participant names before matching.
 # Token aliases: Polish exonyms -> local/English forms (checked dictionary forms, 2026-10-31).
-# Team-level aliases confirmed by the user are stored in the local database (table aliases).
-# Matching never relies on these alone: sport and start time must agree as well.
+# Team-level aliases: config/team_aliases.toml (reviewed pairs) and the local database
+# (pairs confirmed by the user). Matching also requires the same sport and competition.
 
-affixes = ["fc", "cf", "sc", "ac", "afc", "cd", "ca", "ud", "sk", "ks", "fk", "nk", "club", "klub"]
+# Legal-form and club-type tokens that both spellings may omit (2026-11-01: + calcio, bc,
+# cfc, us, ss, ssc, acf, sv, de — checked against Serie A / Bundesliga / LaLiga names).
+affixes = ["fc", "cf", "sc", "ac", "afc", "cd", "ca", "ud", "sk", "ks", "fk", "nk", "club", "klub",
+           "calcio", "bc", "cfc", "us", "ss", "ssc", "acf", "sv", "de"]
+# Founding years and "1." prefixes ("1. FSV Mainz 05", "Como 1907") are not part of identity.
+drop_numeric_tokens = true
 
 [tokens]
+lipsk = "leipzig"
+brema = "bremen"
 madryt = "madrid"
 monachium = "munchen"
 munich = "munchen"
