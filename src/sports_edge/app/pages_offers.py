@@ -13,8 +13,9 @@ from sports_edge.datasources import openfootball
 from sports_edge.models.registry import model_overview
 from sports_edge.offers.sources import SourceBlocked
 from sports_edge.pdf.engine import ParseError
-from sports_edge.repository import counts, freshness, imports, offer_days, offer_table
-from sports_edge.services import fetch_sts_offer, import_pdf_bytes
+from sports_edge.repository import counts, imports, odds_freshness, offer_days, offer_table
+from sports_edge.results_engine import league_freshness
+from sports_edge.services import RESEARCH_COMPETITIONS, fetch_sts_offer, import_pdf_bytes
 from sports_edge.sportsdata import coverage
 
 
@@ -49,7 +50,7 @@ def dashboard() -> None:
         "🔌 Offline" if settings.offline_mode else "🌐 Sieć tylko na żądanie",
         "📄 STS: import ręczny"
         + (" + oficjalny link na żądanie" if settings.sts_download_enabled else ""),
-        "📊 Dane niezależne: openfootball (CC0)",
+        "📊 Wyniki: football-data.org + openfootball (CC0)",
     )
     st.subheader("Status źródeł danych")
     last = sts_imports[0] if sts_imports else None
@@ -64,15 +65,17 @@ def dashboard() -> None:
     else:
         st.write("**STS** — brak importów. Wgraj PDF w zakładce Oferta STS.")
     data = coverage(db)
+    leagues = league_freshness(db, RESEARCH_COMPETITIONS, now=c.now())
     if data:
         newest = max(r["last"] for r in data)
         st.write(
-            f"**Wyniki historyczne** — {sum(r['matches'] for r in data)} meczów, "
-            f"{len(data)} rozgrywek, ostatni wynik {newest} "
-            f"(dostępność: {', '.join(sorted({r['availability_basis'] for r in data}))})"
+            f"**Wyniki** — {sum(r['matches'] for r in data)} meczów, {len(data)} rozgrywek, "
+            f"ostatni wynik {newest}; aktualne ligi: {sum(f['fresh'] for f in leagues)}/"
+            f"{len(leagues)}; źródła: "
+            + ", ".join(sorted({p for r in data for p in r["providers"].split(",") if p}))
         )
     else:
-        st.write("**Wyniki historyczne** — brak (Modele i eksperymenty → Dane).")
+        st.write("**Wyniki** — brak (Modele i eksperymenty → Wyniki sportowe).")
     st.subheader("Status modeli i ostatniej analizy")
     models = model_overview(db)
     if models:
@@ -98,12 +101,11 @@ def dashboard() -> None:
     empty_docs = sum(1 for i in sts_imports if i["rows_total"] == 0)
     if empty_docs:
         alerts.append(f"{empty_docs} zaimportowanych plików STS nie zawierało żadnych wydarzeń.")
-    if (
-        data
-        and (c.today_local() - datetime.fromisoformat(max(r["last"] for r in data)).date()).days
-        > 21
-    ):
-        alerts.append("Dane niezależne są nieaktualne (> 21 dni) — prognozy są wstrzymane.")
+    stale = [f["name"] for f in leagues if not f["fresh"]]
+    if stale:
+        alerts.append(
+            "Nieaktualne wyniki (> 21 dni) — prognozy wstrzymane: " + ", ".join(stale) + "."
+        )
     for profile in load_profiles(c.paths().config).values():
         if not profile.cost_valid_on(c.today_local()):
             alerts.append(f"Profil podatkowy {profile.name} wygasł — EV netto zablokowane.")
@@ -190,15 +192,26 @@ def offer_page() -> None:
     if query:
         rows = [r for r in rows if query in (r["league"] + " " + r["name_raw"]).lower()]
     max_age = timedelta(minutes=c.settings().max_quote_age_minutes)
-    fresh = {
-        r["quote_set_id"]: freshness(r["valid_at"], r["start_at"], c.now(), max_age) for r in rows
-    }
-    m1, m2, m3, m4 = st.columns(4)
+    unconfirmed = sum(odds_freshness(r["valid_at"], c.now(), max_age)[0] != "fresh" for r in rows)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Wydarzenia", len({r["event_id"] for r in rows}))
     m2.metric("Rynki", len(rows))
     m3.metric("Do weryfikacji", sum(r["status"] != "ok" for r in rows))
-    m4.metric("Wycofane rynki", sum(r.get("presence") == "withdrawn" for r in rows))
-    frame = c.offers_frame(rows[:5000], wide=market != "(wszystkie)", fresh=fresh)
+    m4.metric("Kursy niepotwierdzone", unconfirmed)
+    m5.metric("Wycofane rynki", sum(r.get("presence") == "withdrawn" for r in rows))
+    if unconfirmed:
+        settings = c.settings()
+        can_fetch = not settings.offline_mode and settings.sts_download_enabled
+        st.info(
+            f"{unconfirmed} rynków ma starszą migawkę kursu (> {settings.max_quote_age_minutes} "
+            "min od daty dokumentu). Start wydarzenia w przyszłości nie potwierdza kursu — "
+            + (
+                "pobierz aktualną ofertę przyciskiem powyżej."
+                if can_fetch
+                else "pobierz nowy PDF STS (pobieranie można włączyć w Ustawieniach)."
+            )
+        )
+    frame = c.offers_frame(rows[:5000], wide=market != "(wszystkie)", now=c.now(), max_age=max_age)
     st.dataframe(frame, hide_index=True, width="stretch", height=480)
     if len(rows) > 5000:
         st.caption(f"Pokazano 5000 z {len(rows)} rynków — zawęź filtry.")
@@ -234,8 +247,8 @@ def _price_history(rows: list[dict]) -> None:
     event_id = st.selectbox("Wydarzenie", list(labels), format_func=labels.get, key="hist_event")
     markets = [r for r in rows if r["event_id"] == event_id]
     names = {
-        r["market_id"]: f"{c.MARKETS.get(r['market_key'], r['market_key'])} "
-        f"{c.PERIODS.get(r['period'], r['period'])} {r['line'] or ''}"
+        r["market_id"]: f"{c.market_label(r['market_key'], r['period'], r['line'])} "
+        f"· nr {r['offer_code'] or '—'}"
         for r in markets
     }
     market_id = st.selectbox("Rynek", list(names), format_func=names.get, key="hist_market")

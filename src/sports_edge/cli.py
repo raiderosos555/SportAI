@@ -92,6 +92,8 @@ def research(step: str) -> None:
         _print({k: v for k, v in report.items() if k not in {"selection", "holdout"}})
     elif step == "predict":
         _print(services.generate_predictions(store, paths, now=now))
+    elif step == "update-results":
+        _print(services.update_results_data(store, paths, settings, now=now, progress=print))
     elif step == "results":
         from sports_edge.paper import import_source_results
 
@@ -103,6 +105,35 @@ def research(step: str) -> None:
                 team_aliases=services.team_aliases(paths),
             )
         )
+
+
+def analyse(day: str | None, *, refresh_offer: bool, refresh_results: bool) -> None:
+    """The one-button daily analysis without the interface."""
+    from zoneinfo import ZoneInfo
+
+    from sports_edge import services
+
+    paths, settings, store = _context()
+    now = datetime.now(UTC)
+    day = day or now.astimezone(ZoneInfo("Europe/Warsaw")).date().isoformat()
+    run = services.run_daily_analysis(
+        store,
+        paths,
+        settings,
+        day,
+        now=now,
+        refresh_offer=refresh_offer,
+        refresh_results=refresh_results,
+        progress=lambda i, name, detail: print(f"[{i + 1}/8] {name}: {detail}"),
+    )
+    _print(
+        {
+            "headline": run.report.headline,
+            "diagnosis": list(run.report.diagnosis),
+            "counts": run.report.counts,
+            "analysis_id": run.analysis_id,
+        }
+    )
 
 
 def export(kind: str) -> None:
@@ -149,8 +180,13 @@ def main() -> None:
     commands.add_parser("check", help="verify configuration before starting the app")
     res = commands.add_parser("research", help="independent data, experiment, forecasts")
     res.add_argument(
-        "step", choices=["fetch-data", "import-data", "experiment", "predict", "results"]
+        "step",
+        choices=["fetch-data", "import-data", "update-results", "experiment", "predict", "results"],
     )
+    ana = commands.add_parser("analyse", help="one-button daily analysis (offer → coupon)")
+    ana.add_argument("day", nargs="?", help="YYYY-MM-DD (default: today, Warsaw)")
+    ana.add_argument("--refresh-offer", action="store_true", help="download the STS PDF (opt-in)")
+    ana.add_argument("--no-results", action="store_true", help="skip the results update")
     args = parser.parse_args()
     if args.command == "demo":
         demo()
@@ -166,6 +202,8 @@ def main() -> None:
         sys.exit(check())
     elif args.command == "research":
         research(args.step)
+    elif args.command == "analyse":
+        analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,8 @@ class Policy:
     max_selections: int = 5
     ako_enabled: bool = False
     ako_requires_joint_model: bool = True
+    # Informational ranking by win probability (never a validation gate).
+    probable_min_probability: float = 0.65
 
 
 def load_policy(path: Path) -> Policy:

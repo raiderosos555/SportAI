@@ -17,6 +17,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from sports_edge.datasources.base import FetchOutcome, ProviderStatus, ResultRecord, http_get
 from sports_edge.offers.sources import USER_AGENT, SourceBlocked
 
 BASE = "https://raw.githubusercontent.com/openfootball/football.json/master"
@@ -90,6 +91,72 @@ def fetch(
     target.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, indent=1, sort_keys=True), encoding="utf-8")
     return {"downloaded": downloaded, "cached": skipped, "missing": missing}
+
+
+class OpenfootballProvider:
+    """Results provider over the CC0 files: re-reads the season files covering a window.
+
+    Kept as the long-history source (priority below football-data.org); its current
+    season is only as fresh as the repository (last push 2026-09-22 when checked).
+    """
+
+    id = "openfootball"
+    name = "openfootball/football.json"
+    license = LICENSE
+    sports = ("football",)
+    competitions = {code: code for code in LEAGUES}
+    requires_network = True
+    paid = False
+
+    def __init__(self, *, opener=None):
+        self.opener = opener
+
+    def status(self, *, offline: bool) -> ProviderStatus:
+        if offline:
+            return ProviderStatus(False, "Tryb offline jest włączony")
+        return ProviderStatus(True, "Aktywny (CC0); repozytorium nie publikuje wyników na bieżąco")
+
+    def fetch(
+        self, competition: str, date_from: date, date_to: date, *, now: datetime
+    ) -> FetchOutcome:
+        if competition not in LEAGUES:
+            raise SourceBlocked(f"Rozgrywki {competition} poza zakresem openfootball")
+        league = LEAGUES[competition]
+        seasons = sorted({_season(date_from), _season(date_to - timedelta(days=1))})
+        records, payloads = [], []
+        for season in seasons:
+            url = f"{BASE}/{season}/{competition}.json"
+            data, _headers = http_get(url, headers={}, opener=self.opener)
+            payloads.append((url, data))
+            for match in parse(data, league=league, season=season):
+                if not date_from.isoformat() <= match["match_date"] < date_to.isoformat():
+                    continue
+                records.append(
+                    ResultRecord(
+                        provider=self.id,
+                        sport="football",
+                        competition=competition,
+                        season=season,
+                        source_event_id=None,
+                        home=match["home"],
+                        away=match["away"],
+                        start_at=match["start_at"],
+                        match_date=match["match_date"],
+                        status="finished",
+                        home_score=match["home_score"],
+                        away_score=match["away_score"],
+                        details=match["details"],
+                        published_at=None,
+                        observed_at=now,
+                        license=LICENSE,
+                    )
+                )
+        return FetchOutcome(records=records, payloads=payloads, requests=len(seasons))
+
+
+def _season(day: date) -> str:
+    year = day.year if day.month >= 7 else day.year - 1
+    return f"{year}-{str(year + 1)[2:]}"
 
 
 def parse(data: bytes, *, league: League, season: str) -> list[dict]:

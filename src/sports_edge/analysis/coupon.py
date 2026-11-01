@@ -6,6 +6,7 @@ never presented as tips. AKO is analysed only with an explicit joint-probability
 correlated legs (same event) are never multiplied together.
 """
 
+import re
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
@@ -21,6 +22,12 @@ from sports_edge.settlement import CostProfile, Outcome, settle
 from sports_edge.storage import Store
 
 NO_EDGE = "BRAK POTWIERDZONEJ PRZEWAGI — BRAK KUPONU DNIA"
+NUMBER = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
+
+
+def reason_group(text: str) -> str:
+    """Reasons that differ only by a number (odds, EV, hours) are counted together."""
+    return NUMBER.sub("…", text)
 
 
 class JointModel(Protocol):
@@ -68,8 +75,10 @@ class CouponReport:
     rejection_reasons: dict[str, int]
     ako: AkoAnalysis
     experimental: tuple[Candidate, ...] = ()
+    probable: tuple[Candidate, ...] = ()  # informational: highest model win probability
     counts: dict[str, int] = field(default_factory=dict)
     warnings: tuple[str, ...] = field(default_factory=tuple)
+    diagnosis: tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def has_coupon(self) -> bool:
@@ -103,7 +112,7 @@ def build_daily_coupon(
     solo = tuple(sorted(best_per_event.values(), key=rank_key, reverse=True))[
         : policy.max_selections
     ]
-    reasons = Counter(r for c in candidates if not c.accepted for r in c.reasons)
+    reasons = Counter(reason_group(r) for c in candidates if not c.accepted for r in c.reasons)
     experimental = tuple(
         sorted(
             (c for c in candidates if c.tier == "experimental"),
@@ -111,7 +120,13 @@ def build_daily_coupon(
             reverse=True,
         )
     )
+    probable = probable_ranking(candidates, policy)
     counts = {
+        "probable": len(probable),
+        "events": len({c.event_id for c in candidates}),
+        "markets": len({c.market_id for c in candidates}),
+        "markets_ok": len({c.market_id for c in candidates if c.data_status == "ok"}),
+        "model_markets": len({c.market_id for c in candidates if c.p_model is not None}),
         "analysed": len(candidates),
         "with_forecast": sum(c.p_model is not None for c in candidates),
         "ev_positive": sum(c.ev_net is not None and c.ev_net > 0 for c in candidates),
@@ -138,9 +153,56 @@ def build_daily_coupon(
         rejection_reasons=dict(reasons.most_common()),
         ako=ako,
         experimental=experimental,
+        probable=probable,
         counts=counts,
         warnings=tuple(warnings),
+        diagnosis=diagnose(counts),
     )
+
+
+def probable_ranking(candidates: Sequence[Candidate], policy: Policy) -> tuple[Candidate, ...]:
+    """Selections with the highest model win probability — an information view only.
+
+    Only events before their start, readable rows and markets still in the offer qualify.
+    High probability is not profit: each row carries the break-even probability after the STS
+    stake tax and the net EV, which is negative whenever the price pays less than the risk.
+    """
+    eligible = [
+        c
+        for c in candidates
+        if c.p_model is not None
+        and c.p_model >= policy.probable_min_probability
+        and c.event_status == "before_start"
+        and c.data_status == "ok"
+        and c.presence != "withdrawn"
+    ]
+    eligible.sort(
+        key=lambda c: (c.p_model, c.ev_net if c.ev_net is not None else Decimal("-9")),
+        reverse=True,
+    )
+    return tuple(eligible[:50])
+
+
+def diagnose(counts: dict[str, int], *, sports_data_fresh: bool | None = None) -> tuple[str, ...]:
+    """Separate explanations; "no confirmed edge" is never the only message when the
+    real cause is missing data, missing forecasts or a missing model."""
+    out = []
+    if not counts.get("analysed"):
+        return ("Brak oferty STS dla wybranego dnia",)
+    if sports_data_fresh is False:
+        out.append("Brak aktualnych danych sportowych — prognozy wstrzymane (próg 21 dni)")
+    if not counts.get("with_forecast"):
+        out.append("Brak prognoz modelu dla tej oferty")
+    unsupported = counts.get("markets", 0) - counts.get("model_markets", 0)
+    if unsupported > 0:
+        out.append(f"Brak modelu dla {unsupported} z {counts.get('markets', 0)} rynków")
+    if counts.get("with_forecast") and not counts.get("ev_positive"):
+        out.append("Brak dodatniego EV netto wśród selekcji z prognozą")
+    if counts.get("ev_positive") and not counts.get("validated"):
+        out.append("Brak wystarczającej walidacji — kandydaci wyłącznie eksperymentalni")
+    if not counts.get("validated"):
+        out.append("Brak potwierdzonej przewagi")
+    return tuple(out)
 
 
 def analyse_ako(
@@ -181,9 +243,18 @@ def analyse_ako(
 
 
 def save_analysis(
-    store: Store, report: CouponReport, candidates: Sequence[Candidate], policy: Policy
+    store: Store,
+    report: CouponReport,
+    candidates: Sequence[Candidate],
+    policy: Policy,
+    *,
+    pipeline: dict | None = None,
 ) -> str:
-    """Immutable snapshot of the analysis with the exact quote ids and prices it used."""
+    """Immutable snapshot of the analysis with the exact quote ids and prices it used.
+
+    ``pipeline`` keeps the stage report of the one-button flow (sources, data update, model
+    versions, data snapshots) so the analysis can be reproduced and settled later.
+    """
     items = [
         {
             "key": c.key,
@@ -201,6 +272,13 @@ def save_analysis(
             "ev_net": str(c.ev_net) if c.ev_net is not None else None,
             "ev_net_low": str(c.ev_net_low) if c.ev_net_low is not None else None,
             "freshness": c.freshness,
+            "odds_age_hours": c.odds_age_hours,
+            "document_at": c.document_at,
+            "event_status": c.event_status,
+            "break_even": c.break_even,
+            "calibration": c.calibration,
+            "market_label": c.market_label,
+            "label_raw": c.label_raw,
             "tier": c.tier,
             "model_version_id": c.model_version_id,
             "statuses": {
@@ -216,12 +294,16 @@ def save_analysis(
     ]
     summary = {
         "headline": report.headline,
+        "diagnosis": list(report.diagnosis),
         "analysed": report.analysed,
         "accepted": [c.key for c in report.solo],
         "experimental": [c.key for c in report.experimental],
+        "probable": [c.key for c in report.probable],
         "counts": report.counts,
         "rejection_reasons": report.rejection_reasons,
         "ako": {"created": report.ako.created, "reason": report.ako.reason},
+        "model_versions": sorted({c.model_version_id for c in candidates if c.model_version_id}),
+        "pipeline": pipeline or {},
     }
     key = digest(["analysis", report.day, iso(report.created_at), policy.version])
     with store.transaction():

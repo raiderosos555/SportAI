@@ -6,64 +6,34 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
+from sports_edge.datasources.football_data import ATTRIBUTION
 from sports_edge.demo import demo_document
-from sports_edge.repository import ensure_reference_data
+from sports_edge.offers.labels import MARKETS, PERIODS, SELECTIONS, market_label
+from sports_edge.repository import ensure_reference_data, event_status, odds_freshness
 from sports_edge.services import import_pdf_bytes, open_store
 from sports_edge.settings import AppPaths, AppSettings, load_settings, project_root
 from sports_edge.storage import Store
 
 WARSAW = ZoneInfo("Europe/Warsaw")
-MARKETS = {
-    "1x2": "1X2",
-    "double_chance": "Podwójna szansa",
-    "match_winner": "Zwycięzca",
-    "draw_no_bet": "Zakład bez remisu",
-    "total": "Suma poniżej/powyżej",
-    "team_total_home": "Suma gospodarzy",
-    "team_total_away": "Suma gości",
-    "btts": "Obie drużyny strzelą",
-    "home_to_score": "Gospodarze strzelą",
-    "away_to_score": "Goście strzelą",
-    "ht_or_ft": "1. połowa lub wynik",
-    "ht_ft": "Połowa / koniec",
-    "handicap_1x2": "Handicap 1X2",
-    "handicap_unsigned": "Handicap (znak niezweryfikowany)",
-    "red_card": "Czerwona kartka",
-    "correct_score": "Dokładny wynik",
-    "set_winner": "Zwycięzca seta",
-    "unknown": "Nieskatalogowany",
-}
-PERIODS = {
-    "FT": "czas regulaminowy",
-    "FT_OT": "z dogrywką",
-    "MATCH": "cały mecz",
-    "H1": "1. połowa",
-    "H2": "2. połowa",
-    "S1": "1. set",
-    "S2": "2. set",
-    "S3": "3. set",
-    "S4": "4. set",
-    "S5": "5. set",
-}
-SELECTIONS = {
-    "home": "1",
-    "draw": "X",
-    "away": "2",
-    "home_draw": "1X",
-    "draw_away": "X2",
-    "home_away": "12",
-    "under": "Poniżej",
-    "over": "Powyżej",
-    "yes": "Tak",
-    "no": "Nie",
-}
 FRESHNESS = {
-    "fresh": "🟢 aktualny",
-    "stale": "🟠 nieaktualny",
-    "expired": "🔴 wygasł",
-    "unknown": "⚪ brak czasu",
+    "fresh": "🟢 świeża migawka",
+    "unconfirmed": "🟠 kurs niepotwierdzony",
+    "unknown": "⚪ nieznany czas obserwacji",
 }
-PRESENCE = {"current": "obecny", "withdrawn": "⛔ wycofany"}
+EVENT_STATUS = {
+    "before_start": "⏳ przed rozpoczęciem",
+    "in_play": "▶ w trakcie",
+    "finished": "🏁 zakończone",
+    "postponed": "↪ przełożone",
+    "cancelled": "✖ anulowane",
+    "unknown": "❔ nieznany",
+}
+PRESENCE = {
+    "current": "potwierdzony w najnowszej ofercie",
+    "withdrawn": "⛔ wycofany",
+    "unconfirmed": "❔ niepotwierdzony",
+}
+__all__ = ["MARKETS", "PERIODS", "SELECTIONS", "market_label"]
 TIERS = {
     "validated": "✅ zwalidowany",
     "experimental": "🧪 eksperymentalny",
@@ -159,6 +129,7 @@ def load_demo_data() -> dict:
 
 def setup_page() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
+    st.sidebar.caption(f"Wyniki bieżącego sezonu: {ATTRIBUTION}.")
     if demo_mode():
         banner(
             "TRYB DEMO — dane syntetyczne z fikcyjnymi drużynami i kursami. "
@@ -173,19 +144,31 @@ def odds_text(selections: dict) -> str:
     return " · ".join(f"{SELECTIONS.get(k, k)} {selections[k]['price']}" for k in keys)
 
 
+def freshness_label(state: str, age_hours: float | None) -> str:
+    if state == "unconfirmed" and age_hours is not None:
+        return f"🟠 Kurs niepotwierdzony od {age_hours:.0f} h"
+    return FRESHNESS.get(state, state)
+
+
 def offers_frame(
-    rows: list[dict], *, wide: bool, fresh: dict[str, str] | None = None
+    rows: list[dict], *, wide: bool, now: datetime, max_age: timedelta
 ) -> pd.DataFrame:
+    """Offer rows with the market's period and line, the PDF description and three separate
+    statuses: event, price snapshot age and presence in the newest relevant offer."""
     records = []
     for row in rows:
+        state, age = odds_freshness(row["valid_at"], now, max_age)
+        event = event_status(
+            row["start_at"], now, sport=row["sport"], result_status=row.get("result_status")
+        )
         record = {
             "Start": local_time(row["start_at"]),
             "Sport": (row["sport_raw"] or row["sport"]).capitalize(),
             "Liga": row["league"],
             "Wydarzenie": " - ".join(row["participants"]) or row["name_raw"],
-            "Rynek": MARKETS.get(row["market_key"], row["market_key"]),
-            "Okres": PERIODS.get(row["period"], row["period"]),
-            "Linia": row["line"] or "",
+            "Rynek": market_label(row["market_key"], row["period"], row["line"]),
+            "Opis w PDF": row["label_raw"],
+            "Nr zakładu": row["offer_code"] or "",
         }
         if wide:
             for key, quote in row["selections"].items():
@@ -195,10 +178,14 @@ def offers_frame(
         record.update(
             {
                 "Jakość": row["quality"],
-                "Status": "✅ ok" if row["status"] == "ok" else "⚠️ weryfikacja",
-                "Aktualność": FRESHNESS.get((fresh or {}).get(row["quote_set_id"], ""), "—"),
+                "Odczyt": "✅ ok" if row["status"] == "ok" else "⚠️ weryfikacja",
+                "Status wydarzenia": EVENT_STATUS.get(event, event),
+                "Świeżość kursu": freshness_label(state, age),
+                "Dokument z": local_time(row["valid_at"]),
+                "Pobrano": local_time(row["fetched_at"])
+                if row.get("fetched_at")
+                else "plik ręczny",
                 "Rynek w ofercie": PRESENCE.get(row.get("presence", "current"), "—"),
-                "Kod": row["offer_code"] or "",
                 "Strona": row["page"],
             }
         )

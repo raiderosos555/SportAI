@@ -7,16 +7,17 @@ event starts; results and settlements are appended and never modify the coupon.
 
 import json
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from math import prod
 from zoneinfo import ZoneInfo
 
 from sports_edge import history
 from sports_edge.bookmakers import BookmakerProfile
-from sports_edge.datasources import openfootball
+from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.matching import alias_map, match_participant, participant_key
+from sports_edge.results_engine import SOURCE_LABELS, effective_results
 from sports_edge.settlement import Outcome, settle
 from sports_edge.storage import Store
 
@@ -253,6 +254,43 @@ def _bool(won: bool) -> Outcome:
     return Outcome.WIN if won else Outcome.LOSS
 
 
+FINAL_SCORE_MARKETS = {
+    "1x2",
+    "handicap_1x2",
+    "double_chance",
+    "draw_no_bet",
+    "total",
+    "team_total_home",
+    "team_total_away",
+    "btts",
+    "home_to_score",
+    "away_to_score",
+    "match_winner",
+}
+
+
+def unresolved_reason(market: dict, result: dict | None) -> str:
+    """Why a leg is not settled yet; an unresolved leg is never counted as lost."""
+    if result is None:
+        return "Brak wyniku wydarzenia — oczekuje na wynik"
+    if result["status"] in {"postponed", "cancelled", "void", "abandoned"}:
+        return f"Wydarzenie: {result['status']} — rozliczenie ręczne według regulaminu STS"
+    if not result["verified"]:
+        return "Wynik niezweryfikowany — oczekuje na potwierdzenie"
+    key, period = market["market_key"], market["period"]
+    if period in {"H1", "H2"} and result["ht_home"] is None:
+        return "Brak wyniku do przerwy — oczekuje na dodatkowe dane"
+    if key in {"ht_ft", "ht_or_ft"} and result["ht_home"] is None:
+        return "Brak wyniku do przerwy — oczekuje na dodatkowe dane"
+    if key in {"total", "team_total_home", "team_total_away"} and market["line"]:
+        line = Decimal(market["line"])
+        if line == line.to_integral_value():
+            return "Linia całkowita równa wynikowi (możliwy zwrot) — rozliczenie ręczne"
+    if key not in FINAL_SCORE_MARKETS | {"ht_ft", "ht_or_ft"}:
+        return "Wynik końcowy nie wystarcza do rozstrzygnięcia rynku — oczekuje na dodatkowe dane"
+    return "Rynek wymaga rozliczenia ręcznego (np. dogrywka lub nieobsługiwany okres)"
+
+
 def settle_coupon(
     store: Store, coupon_id: str, profiles: dict[str, BookmakerProfile], *, now: datetime
 ) -> dict:
@@ -266,7 +304,7 @@ def settle_coupon(
         WHERE l.coupon_id=?""",
         (coupon_id,),
     )
-    outcomes, details = [], []
+    outcomes, details, waiting = [], [], []
     for leg in legs:
         result = latest_result(store, leg["event_id"])
         outcome = resolve(leg, leg["selection"], result) if result else None
@@ -279,9 +317,16 @@ def settle_coupon(
                 "outcome": outcome.value if outcome else None,
             }
         )
+        if outcome is None:
+            waiting.append(unresolved_reason(leg, result))
     if any(o is None for o in outcomes):
         missing = sum(o is None for o in outcomes)
-        return {"status": "pending", "unresolved_legs": missing, "legs": details}
+        return {
+            "status": "pending",
+            "unresolved_legs": missing,
+            "reasons": waiting,
+            "legs": details,
+        }
     if all(o == Outcome.WIN for o in outcomes):
         outcome = Outcome.WIN
     elif any(o == Outcome.LOSS for o in outcomes):
@@ -402,47 +447,69 @@ def closing_line_value(store: Store, coupon_id: str) -> list[dict]:
     return out
 
 
-def import_source_results(store: Store, *, now: datetime, normalizer, team_aliases) -> dict:
-    """Copy results of STS events from the independent data store when the match is certain.
+def import_source_results(
+    store: Store,
+    *,
+    now: datetime,
+    normalizer,
+    team_aliases,
+    only_coupons: bool = True,
+) -> dict:
+    """Copy results of STS events from the independent results when the match is certain.
 
-    Certain = same sport and competition, same local match date and both teams matched
-    exactly or through a verified alias. Anything else stays for manual entry.
+    Certain = covered league, same local match date and both teams matched exactly or through
+    a verified alias, exactly one candidate and no conflict between providers. The provider
+    chosen by the source hierarchy is recorded as the result's source. Anything else stays
+    for manual entry. ``only_coupons=False`` also records results used for event statuses.
     """
     aliases = alias_map(store, team_aliases)
-    league_for = {s: code for code, lg in openfootball.LEAGUES.items() for s in lg.sts_leagues}
-    events = store.rows(
-        """SELECT e.* FROM events e WHERE e.bookmaker_id='sts' AND e.sport='football'
-        AND e.start_at IS NOT NULL AND e.start_at < ? AND e.id IN (
-          SELECT m.event_id FROM coupon_legs l JOIN selections s ON s.id=l.selection_id
-          JOIN markets m ON m.id=s.market_id)""",
-        (iso(now),),
+    league_for = {
+        (header, comp.sport): code
+        for code, comp in COMPETITIONS.items()
+        for header in comp.sts_leagues
+    }
+    sql = """SELECT e.* FROM events e WHERE e.bookmaker_id='sts'
+        AND e.start_at IS NOT NULL AND e.start_at < ?"""
+    if only_coupons:
+        sql += """ AND e.id IN (SELECT m.event_id FROM coupon_legs l
+          JOIN selections s ON s.id=l.selection_id JOIN markets m ON m.id=s.market_id)"""
+    events = store.rows(sql, (iso(now),))
+    codes = sorted(
+        {
+            league_for[(e["league"], e["sport"])]
+            for e in events
+            if (e["league"], e["sport"]) in league_for
+        }
     )
+    by_day: dict[tuple, list[dict]] = {}
+    if codes:
+        for row in effective_results(store, sport=None, until=now, competitions=codes):
+            by_day.setdefault((row["competition"], row["match_date"]), []).append(row)
     recorded, unresolved = 0, []
     for event in events:
         if latest_result(store, event["id"]) is not None:
             continue
-        code = league_for.get(event["league"])
+        code = league_for.get((event["league"], event["sport"]))
         if code is None:
+            if not only_coupons:
+                continue  # statuses: only leagues with an independent source are relevant
             unresolved.append(f"{event['name_raw']}: liga bez niezależnego źródła wyników")
             continue
+        sport = event["sport"]
         local_day = (
             datetime.fromisoformat(event["start_at"])
-            .astimezone(ZoneInfo(openfootball.LEAGUES[code].zone))
+            .astimezone(ZoneInfo(COMPETITIONS[code].zone))
             .date()
             .isoformat()
         )
-        rows = store.rows(
-            """SELECT * FROM historical_results WHERE competition=? AND match_date=?
-            AND available_at<=?""",
-            (code, local_day, iso(now)),
-        )
+        rows = by_day.get((code, local_day), [])
         known = {
-            participant_key(r[side], "football", normalizer): r[side]
+            participant_key(r[side], sport, normalizer): r[side]
             for r in rows
             for side in ("home", "away")
         }
-        home = match_participant(event["home"], "football", known, normalizer, aliases)
-        away = match_participant(event["away"], "football", known, normalizer, aliases)
+        home = match_participant(event["home"] or "", sport, known, normalizer, aliases)
+        away = match_participant(event["away"] or "", sport, known, normalizer, aliases)
         found = [r for r in rows if r["home"] == home.target and r["away"] == away.target]
         if (
             home.status not in {"exact", "alias"}
@@ -452,8 +519,14 @@ def import_source_results(store: Store, *, now: datetime, normalizer, team_alias
             unresolved.append(f"{event['name_raw']}: brak pewnego wyniku w źródle")
             continue
         match = found[0]
+        if match["conflict"]:
+            unresolved.append(
+                f"{event['name_raw']}: źródła podają różne wyniki — rozliczenie wstrzymane"
+            )
+            continue
         details = json.loads(match["details_json"] or "{}")
         ht = details.get("ht") or [None, None]
+        source = match["provider_resolved"]
         record_result(
             store,
             event_id=event["id"],
@@ -463,12 +536,79 @@ def import_source_results(store: Store, *, now: datetime, normalizer, team_alias
             away_score=match["away_score"],
             ht_home=ht[0],
             ht_away=ht[1],
-            details={"source_result_id": match["id"], "source": "openfootball (CC0)"},
-            source="openfootball",
+            details={
+                "source_result_id": match["id"],
+                "source": SOURCE_LABELS.get(source, source),
+                "providers": match["providers"],
+                "available_at": match["available_at"],
+                "available_at_basis": match["available_at_basis"],
+                "after_ot": details.get("after_ot"),
+                "periods": details.get("periods"),
+            },
+            source=source,
             verified=True,
         )
         recorded += 1
     return {"recorded": recorded, "unresolved": unresolved}
+
+
+STATUS_TO_RESULT = {"postponed": "postponed", "cancelled": "cancelled"}
+
+
+def record_status_results(
+    store: Store, status_records: list[dict], *, now: datetime, normalizer, team_aliases
+) -> dict:
+    """Postponed / cancelled fixtures reported by a provider → status of the STS event.
+
+    The event is matched by league, both teams (exact keys or reviewed aliases) and a kick-off
+    within 36 hours. Such results never settle a coupon automatically (manual rules apply).
+    """
+    aliases = alias_map(store, team_aliases)
+    sts_for = {code: comp for code, comp in COMPETITIONS.items()}
+    recorded, skipped = 0, []
+    for item in status_records:
+        status = STATUS_TO_RESULT.get(item["status"])
+        comp = sts_for.get(item["competition"])
+        if status is None or comp is None or not item.get("start_at"):
+            continue
+        leagues, sport = comp.sts_leagues, comp.sport
+        start = datetime.fromisoformat(item["start_at"])
+        candidates = store.rows(
+            f"""SELECT * FROM events WHERE bookmaker_id='sts' AND sport=?
+            AND league IN ({",".join("?" for _ in leagues)}) AND start_at BETWEEN ? AND ?""",
+            (sport, *leagues, iso(start - timedelta(hours=36)), iso(start + timedelta(hours=36))),
+        )
+        known = {
+            participant_key(item[side], sport, normalizer): item[side] for side in ("home", "away")
+        }
+        matched = [
+            e
+            for e in candidates
+            if match_participant(e["home"] or "", sport, known, normalizer, aliases).target
+            == item["home"]
+            and match_participant(e["away"] or "", sport, known, normalizer, aliases).target
+            == item["away"]
+        ]
+        if len(matched) != 1:
+            skipped.append(f"{item['home']} - {item['away']}: brak jednoznacznego meczu STS")
+            continue
+        previous = latest_result(store, matched[0]["id"])
+        if previous is not None and previous["status"] == status:
+            continue
+        record_result(
+            store,
+            event_id=matched[0]["id"],
+            status=status,
+            now=now,
+            details={
+                "source": SOURCE_LABELS.get(item["provider"], item["provider"]),
+                "source_event_id": item.get("source_event_id"),
+            },
+            source=item["provider"],
+            verified=True,
+        )
+        recorded += 1
+    return {"recorded": recorded, "skipped": skipped}
 
 
 def coupons_table(store: Store) -> list[dict]:

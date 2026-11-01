@@ -64,6 +64,30 @@ class AppSettings:
     sts_download_enabled: bool = False  # explicit opt-in for the official STS PDF links
     arbiscan_enabled: bool = False
     propline_enabled: bool = False
+    # Results providers (TASK 004): free sources only; inactive while offline or without key.
+    football_data_enabled: bool = True  # needs the user's own free FOOTBALL_DATA_API_KEY
+    openfootball_update_enabled: bool = True  # re-reads current-season CC0 files
+    api_sports_enabled: bool = True  # needs the user's own free API_SPORTS_KEY
+
+
+def local_secret(name: str, root: Path | None = None) -> str | None:
+    """Environment variable first, then the git-ignored ``.env`` of the project.
+
+    Values are never logged or shown; only their presence is reported to the user.
+    """
+    if value := os.environ.get(name):
+        return value.strip() or None
+    if root is None:
+        return None
+    try:
+        lines = (root / ".env").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == name:
+            return value.strip().strip('"').strip("'") or None
+    return None
 
 
 def load_settings(paths: AppPaths) -> AppSettings:

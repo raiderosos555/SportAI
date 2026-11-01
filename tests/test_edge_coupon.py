@@ -227,7 +227,10 @@ def test_stale_expired_and_void_markets_are_rejected(store, import_sts, policy, 
     stale = pick(
         candidates(store, policy, profiles, rules, now=NOW + timedelta(hours=4)), "Legia", "home"
     )
-    assert "Kurs nieaktualny — przekroczony maksymalny wiek oferty" in stale.reasons
+    # TASK 004: an old snapshot is "unconfirmed" (never validated), independent of the event
+    assert "Kurs niepotwierdzony od 5 h — pobierz aktualną ofertę STS" in stale.reasons
+    assert stale.tier == "experimental" and stale.event_status == "before_start"
+    assert stale.freshness == "unconfirmed" and stale.odds_age_hours == 5.0
     expired = pick(
         candidates(store, policy, profiles, rules, now=datetime(2026, 10, 31, 20, tzinfo=UTC)),
         "Legia",

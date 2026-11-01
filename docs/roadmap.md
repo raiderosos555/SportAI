@@ -56,3 +56,12 @@ z rynkiem, więc model pozostaje `experimental`, a aplikacja nie tworzy kuponu. 
 20.09.2026, dlatego prognozy dla bieżącej oferty są wstrzymane (próg 21 dni).
 Proponowany TASK 004 (aktualne wyniki, kursy do walidacji, prospektywny test Elo vs STS):
 [raport TASK 003, sekcja F](task_003_report.md).
+
+## TASK 004 — stan (01.11.2026)
+
+Aktualne wyniki 5 lig z football-data.org (181 nowych meczów, 50 potwierdzeń bez konfliktów,
+ostatni wynik 31.10), 36 rzeczywistych prognoz przedmeczowych, analiza dnia jednym przyciskiem
+(8 etapów), rozdzielone statusy kursów, czytelna Analiza AI i automatyczne rozliczenia
+z rozróżnieniem „czeka na dane”. Model nadal `experimental` — brak kursów historycznych do
+walidacji rynkowej, więc kuponu brak. Proponowany TASK 005 (prospektywny test Elo vs STS,
+API-Sports, kompletność terminarza): [raport TASK 004, sekcja H](task_004_report.md).

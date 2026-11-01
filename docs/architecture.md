@@ -173,3 +173,16 @@ usunięto w TASK 003 — zob. następna sekcja.
 | Paper Trading | `paper.py` | Wyłącznie profil STS, limit wygranej 1 000 000 zł, wyniki automatyczne tylko przy pewnym dopasowaniu (ze źródłem), maks. obsunięcie |
 | Dashboard | `app/` (Streamlit) | 7 widoków; nowa zakładka „Modele i eksperymenty” |
 | Operacje | `cli.py` | `research fetch-data / import-data / experiment / predict / results`; `import-pdf` bez wyboru bukmachera |
+
+## TASK 004 — Sports Results Data Engine i analiza jednym przyciskiem
+
+| Komponent | Implementacja | Uwagi |
+|---|---|---|
+| Kontrakt dostawców | `datasources/base.py` (`SportsResultsProvider`, `ResultRecord`, `http_get`, `RateLimiter`) | Offline i klucze respektowane; ponowienia przy 429/5xx/sieci; 401/403 kończy pobieranie |
+| Dostawcy | `datasources/football_data.py`, `datasources/openfootball.py`, `datasources/bookmaker_results.py` | football-data.org aktywne (klucz w `.env`); STS i Superbet nieaktywne z powodem |
+| Silnik wyników | `results_engine.py` | Brakujący okres (+3 dni korekt), duplikaty, potwierdzenia, korekty, konflikty; widok `effective_results` według hierarchii; surowe odpowiedzi w `data/sources/results/` |
+| Magazyn | `storage.py` (SQLite v4) | Nowe kolumny pochodzenia w `historical_results` i raport w `data_imports`; migracja z kopią |
+| Statusy | `repository.py` (`event_status`, `odds_freshness`, obecność rynku) | Wydarzenie, wiek migawki i obecność rynku rozdzielone |
+| Analiza dnia | `services.run_daily_analysis` | 8 etapów z postępem; zapis etapów w analizie |
+| Rozliczenia | `paper.py` | Wyniki z silnika tylko bez konfliktu; przełożenia jako status; „czeka na dane” dla rynków, których nie rozstrzyga wynik końcowy |
+| Interfejs | `app/` | Kupon dnia z paskiem postępu; Analiza AI w sekcjach A–E; rynki z okresem i opisem z PDF |

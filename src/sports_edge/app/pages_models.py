@@ -7,21 +7,84 @@ import streamlit as st
 
 from sports_edge.app import common as c
 from sports_edge.datasources import openfootball
+from sports_edge.datasources.football_data import ATTRIBUTION
 from sports_edge.matching import confirm_alias
 from sports_edge.models.registry import model_overview
 from sports_edge.offers.sources import SourceBlocked
+from sports_edge.results_engine import SOURCE_LABELS, SOURCE_PRIORITY, conflicts, league_freshness
 from sports_edge.services import (
+    RESULTS_COMPETITIONS,
     generate_predictions,
     import_openfootball_files,
     normalizer,
+    results_providers,
     run_research_experiment,
+    update_results_data,
 )
 from sports_edge.sportsdata import coverage, import_results_csv
+
+# Checked 2026-11-01; see docs/task_004_report.md section D for the sources of each claim.
+RESULTS_SOURCES = [
+    {
+        "Źródło": "football-data.org API v4 (Free Tier)",
+        "Legalność": "warunki publiczne; atrybucja; klucz użytkownika",
+        "Aktualność": "bieżące wyniki (lastUpdated)",
+        "Zakres": "12 rozgrywek piłkarskich (5 lig TOP, bez Ekstraklasy)",
+        "Automatyzacja": "API, 10 zapytań/min",
+        "Koszt": "0 zł",
+        "Rola": "AKTYWNE — bieżący sezon",
+    },
+    {
+        "Źródło": "openfootball (CC0)",
+        "Legalność": "domena publiczna",
+        "Aktualność": "nieregularna (repozytorium bez wyników po 20.09.2026)",
+        "Zakres": "piłka, długa historia",
+        "Automatyzacja": "pliki JSON",
+        "Koszt": "0 zł",
+        "Rola": "AKTYWNE — historia od 2012",
+    },
+    {
+        "Źródło": "API-Sports (API-Football i inne)",
+        "Legalność": "regulamin akceptowany przy rejestracji (niedostępny do odczytu automatycznego)",
+        "Aktualność": "bieżące (brak znacznika aktualizacji — czas obserwacji)",
+        "Zakres": "Ekstraklasa i inne ligi; koszykówka, hokej, siatkówka; darmowy plan: ostatnie sezony",
+        "Automatyzacja": "API, 100 zapytań/dzień na API, limit z rezerwą",
+        "Koszt": "0 zł (plan darmowy)",
+        "Rola": "WDROŻONE — Ekstraklasa; inne dyscypliny po weryfikacji na kluczu",
+    },
+    {
+        "Źródło": "STS — wyniki na stronie",
+        "Legalność": "brak API; robots.txt blokuje resultDate",
+        "Aktualność": "po rozliczeniu",
+        "Zakres": "rynki STS",
+        "Automatyzacja": "niedozwolona",
+        "Koszt": "—",
+        "Rola": "NIEAKTYWNE — wpis ręczny",
+    },
+    {
+        "Źródło": "Superbet — wyniki",
+        "Legalność": "robots.txt blokuje /wyniki",
+        "Aktualność": "—",
+        "Zakres": "—",
+        "Automatyzacja": "niedozwolona",
+        "Koszt": "—",
+        "Rola": "NIEAKTYWNE",
+    },
+    {
+        "Źródło": "Flashscore",
+        "Legalność": "regulamin zakazuje pobierania i kopiowania bazy",
+        "Aktualność": "na żywo",
+        "Zakres": "szeroki",
+        "Automatyzacja": "niedozwolona",
+        "Koszt": "licencja B2B",
+        "Rola": "WYKLUCZONE",
+    },
+]
 
 RESEARCH_AREAS = [
     {
         "Obszar": "Piłka nożna — 1X2, 5 czołowych lig (EPL, Bundesliga, LaLiga, Serie A, Ligue 1)",
-        "Dane": "openfootball CC0, 2012–2026, wynik + do przerwy + godzina",
+        "Dane": "openfootball CC0 (2012–2026) + football-data.org (bieżący sezon)",
         "Oferta STS": "co tydzień",
         "Kursy historyczne": "brak legalnych bezpłatnych",
         "Wybór": "TAK — pierwszy eksperyment",
@@ -42,7 +105,7 @@ RESEARCH_AREAS = [
     },
     {
         "Obszar": "Ekstraklasa",
-        "Dane": "brak w openfootball; football-data.org wymaga klucza",
+        "Dane": "brak w openfootball i w Free Tier football-data.org",
         "Oferta STS": "tak",
         "Kursy historyczne": "brak",
         "Wybór": "wymaga źródła",
@@ -60,13 +123,107 @@ RESEARCH_AREAS = [
 def models_page() -> None:
     c.setup_page()
     st.title("Modele i eksperymenty")
-    tabs = st.tabs(["Dane niezależne", "Modele i walidacja", "Prognozy i dopasowanie nazw"])
+    tabs = st.tabs(
+        ["Wyniki sportowe", "Dane historyczne", "Modele i walidacja", "Prognozy i nazwy"]
+    )
     with tabs[0]:
-        _data()
+        _results()
     with tabs[1]:
-        _models()
+        _data()
     with tabs[2]:
+        _models()
+    with tabs[3]:
         _forecasts()
+
+
+def _results() -> None:
+    db = c.store()
+    settings = c.settings()
+    st.subheader("Źródła wyników (hierarchia przy rozbieżnościach)")
+    st.caption(
+        " > ".join(SOURCE_LABELS[p] for p in sorted(SOURCE_PRIORITY, key=SOURCE_PRIORITY.get))
+        + " — zgodnie z zasadą STS R 14.6 (najpierw oficjalny organizator)."
+    )
+    providers = results_providers(c.paths(), settings)
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Źródło": p.name,
+                    "Status": "✅ aktywne" if s.active else "⛔ nieaktywne",
+                    "Opis": s.reason,
+                    "Licencja": p.license,
+                }
+                for p, s in ((p, p.status(offline=settings.offline_mode)) for p in providers)
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    st.subheader("Świeżość historii lig")
+    fresh = league_freshness(db, RESULTS_COMPETITIONS, now=c.now())
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Liga": f["name"],
+                    "Sport": f["sport"],
+                    "Mecze": f["matches"],
+                    "Ostatni wynik": f["last_result"],
+                    "Dni od ostatniego": f["days_since"],
+                    "Aktualna (≤ 21 dni)": "tak" if f["fresh"] else "NIE",
+                    "Źródła (mecze)": ", ".join(f"{k}: {v}" for k, v in f["providers"].items()),
+                    "Dostępność": ", ".join(f["availability_basis"]),
+                    "Konflikty": f["conflicts"],
+                }
+                for f in fresh
+            ]
+        ),
+        hide_index=True,
+        width="stretch",
+    )
+    if st.button(
+        "Uzupełnij brakujące wyniki (bezpłatne źródła)",
+        disabled=settings.offline_mode or c.demo_mode(),
+        help="Pobiera tylko okres od ostatniego wyniku (z 3-dniowym zakładem na korekty).",
+    ):
+        with st.spinner("Aktualizacja wyników…"):
+            st.session_state["results_update"] = update_results_data(
+                db, c.paths(), settings, now=c.now()
+            )
+    report = st.session_state.get("results_update")
+    if report:
+        cols = st.columns(5)
+        cols[0].metric("Nowe obserwacje", report["inserted"])
+        cols[1].metric("Potwierdzenia drugim źródłem", report["confirmations"])
+        cols[2].metric("Korekty", len(report["corrections"]))
+        cols[3].metric("Konflikty", len(report["conflicts"]))
+        cols[4].metric("Zapytania", report["requests"])
+        for line in report["errors"] + report["incomplete"][:20]:
+            st.write("• " + line)
+        if report["unmatched"]:
+            st.subheader("Nazwy drużyn do potwierdzenia")
+            for i, item in enumerate(report["unmatched"][:30]):
+                row = st.columns([4, 4, 1])
+                row[0].write(f"Źródło: **{item['source']}** ({item['competition']})")
+                row[1].write(f"Propozycja: {item['suggestion'] or '—'} ({item['score']})")
+                if item["suggestion"] and row[2].button("✓", key=f"result_alias_{i}"):
+                    confirm_alias(
+                        db,
+                        sport="football",
+                        alias=item["source"],
+                        canonical=item["suggestion"],
+                        normalizer=normalizer(c.paths()),
+                        at=c.now(),
+                    )
+                    st.success("Alias zapisany — uruchom aktualizację ponownie.")
+    found = conflicts(db, until=c.now(), competitions=RESULTS_COMPETITIONS)
+    if found:
+        st.subheader("Rozbieżne wyniki między źródłami")
+        st.dataframe(pd.DataFrame(found), hide_index=True, width="stretch")
+    st.subheader("Ranking dostawców wyników")
+    st.dataframe(pd.DataFrame(RESULTS_SOURCES), hide_index=True, width="stretch")
+    st.caption(f"{ATTRIBUTION}. Klucz API wyłącznie w zmiennej środowiskowej lub w pliku .env.")
 
 
 def _data() -> None:
@@ -78,14 +235,16 @@ def _data() -> None:
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
         st.caption(
-            "Dostępność wyniku: brak znaczników publikacji w źródle — założenie 36 h po meczu "
-            "(assumed_lag_36h). Backtest używa wyłącznie wyników z dni wcześniejszych."
+            "Dostępność wyniku: openfootball bez znaczników publikacji — założenie 36 h po meczu "
+            "(assumed_lag_36h); football-data.org — znacznik lastUpdated źródła "
+            "(source_last_updated). Backtest używa wyłącznie wyników z dni wcześniejszych."
         )
     else:
         st.info("Brak danych historycznych.")
     settings = c.settings()
     st.write(
-        f"**openfootball** — {openfootball.LICENSE}. Ostatnia aktualizacja repozytorium: 22.09.2026."
+        f"**openfootball** — {openfootball.LICENSE}. Repozytorium nie publikuje bieżących "
+        "wyników (sprawdzono 01.11.2026) — bieżący sezon uzupełnia football-data.org."
     )
     if st.button(
         "Pobierz brakujące pliki openfootball (5 lig, 2012-13 – 2026-27)",
@@ -118,6 +277,10 @@ def _data() -> None:
         competition = cols[1].text_input("Rozgrywki (kod)")
         source = st.text_input("Źródło danych")
         license_note = st.text_area("Podstawa prawna / licencja (wymagane)")
+        official = st.checkbox(
+            "Wyniki przepisane z oficjalnej strony organizatora (najwyższy priorytet przy "
+            "rozbieżnościach)"
+        )
         if st.form_submit_button("Importuj") and uploaded is not None:
             try:
                 st.json(
@@ -130,6 +293,7 @@ def _data() -> None:
                         sport=sport,
                         competition=competition,
                         now=c.now(),
+                        provider="manual_official" if official else None,
                     )
                 )
             except ValueError as error:

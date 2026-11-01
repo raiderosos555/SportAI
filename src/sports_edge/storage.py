@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -15,7 +15,21 @@ ADDED_COLUMNS = (
     ("historical_results", "available_at_basis", "TEXT NOT NULL DEFAULT 'assumed_lag_36h'"),
     ("historical_results", "start_at", "TEXT"),
     ("historical_results", "details_json", "TEXT NOT NULL DEFAULT '{}'"),
+    # v4: results providers (provenance of every observation, corrections as new rows)
+    ("historical_results", "provider", "TEXT"),
+    ("historical_results", "source_event_id", "TEXT"),
+    ("historical_results", "status", "TEXT NOT NULL DEFAULT 'finished'"),
+    ("historical_results", "home_raw", "TEXT"),
+    ("historical_results", "away_raw", "TEXT"),
+    ("historical_results", "match_confidence", "TEXT"),
+    ("historical_results", "published_at", "TEXT"),
+    ("historical_results", "observed_at", "TEXT"),
+    ("data_imports", "summary_json", "TEXT NOT NULL DEFAULT '{}'"),
 )
+MIGRATIONS = {
+    3: "STS ONLY, archive, odds metadata",
+    4: "results providers: provenance columns and update reports",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS archived_entities (
@@ -212,33 +226,40 @@ class Store:
                     BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT,'append_only'); END"""
                 )
         if self.version_before < SCHEMA_VERSION:
-            self._migrate_sts_only()
+            self._migrate()
         self.connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
-    def _migrate_sts_only(self) -> None:
-        """v3: Superbet and generic sources leave the active flow; their rows stay archived."""
+    def _migrate(self) -> None:
+        """One logged migration run from ``version_before`` to the current schema.
+
+        v3: Superbet and generic sources leave the active flow; their rows stay archived.
+        v4: only new nullable/default columns (ALTER TABLE above); existing rows are kept.
+        """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
+        steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]
         with self.transaction():
-            for kind, table, ids in (
-                ("bookmaker", "bookmakers", ARCHIVED_BOOKMAKERS),
-                ("source", "sources", ARCHIVED_SOURCES),
-            ):
-                for entity in ids:
-                    if self.get(table, entity) is not None:
-                        self.insert(
-                            "archived_entities",
-                            id=f"{kind}:{entity}",
-                            entity_type=kind,
-                            entity_id=entity,
-                            reason="TASK 003: aplikacja obsługuje wyłącznie STS",
-                            archived_at=now,
-                        )
+            if 3 in steps:
+                for kind, table, ids in (
+                    ("bookmaker", "bookmakers", ARCHIVED_BOOKMAKERS),
+                    ("source", "sources", ARCHIVED_SOURCES),
+                ):
+                    for entity in ids:
+                        if self.get(table, entity) is not None:
+                            self.insert(
+                                "archived_entities",
+                                id=f"{kind}:{entity}",
+                                entity_type=kind,
+                                entity_id=entity,
+                                reason="TASK 003: aplikacja obsługuje wyłącznie STS",
+                                archived_at=now,
+                            )
             self.insert(
                 "schema_migrations",
                 id=f"v{SCHEMA_VERSION}:{now}",
                 version=SCHEMA_VERSION,
                 applied_at=now,
-                description=f"from v{self.version_before}: STS ONLY, archive, odds metadata",
+                description=f"from v{self.version_before}: "
+                + "; ".join(f"v{v} {MIGRATIONS[v]}" for v in steps),
                 backup_path=str(self.migration_backup) if self.migration_backup else None,
             )
 

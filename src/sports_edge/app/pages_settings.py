@@ -8,12 +8,13 @@ import streamlit as st
 from sports_edge.app import common as c
 from sports_edge.backup import create_backup, list_backups
 from sports_edge.bookmakers import load_profiles, load_rules
+from sports_edge.datasources.football_data import api_key
 from sports_edge.export import export_csv, export_json
 from sports_edge.offers.sources import API_SOURCES
 from sports_edge.pdf.engine import ParseError
 from sports_edge.repository import archived_summary, counts, imports
 from sports_edge.services import import_pdf_bytes
-from sports_edge.settings import save_settings
+from sports_edge.settings import local_secret, save_settings
 
 
 def settings_page() -> None:
@@ -64,10 +65,37 @@ def _sts() -> None:
         max_value=60,
         value=settings.match_tolerance_minutes,
     )
+    st.markdown("**Źródła wyników sportowych** (bezpłatne; płatne nigdy automatycznie)")
+    football_data = st.toggle(
+        "football-data.org — bieżące wyniki 5 lig (wymaga własnego bezpłatnego klucza)",
+        value=settings.football_data_enabled,
+    )
+    st.caption(
+        "Klucz FOOTBALL_DATA_API_KEY: "
+        + ("ustawiony (zmienna środowiskowa lub .env)" if api_key(c.paths().root) else "brak")
+        + ". Aplikacja nigdy nie wyświetla ani nie zapisuje klucza w repozytorium."
+    )
+    api_sports = st.toggle(
+        "API-Sports — Ekstraklasa (piłka); koszykówka i hokej po weryfikacji schematu "
+        "(własny bezpłatny klucz, 100 zapytań/dzień na API)",
+        value=settings.api_sports_enabled,
+    )
+    st.caption(
+        "Klucz API_SPORTS_KEY: "
+        + ("ustawiony" if local_secret("API_SPORTS_KEY", c.paths().root) else "brak")
+        + " — rejestracja: dashboard.api-football.com (przeczytaj regulamin przy rejestracji)."
+    )
+    openfootball_updates = st.toggle(
+        "openfootball — ponowny odczyt plików bieżącego sezonu (CC0)",
+        value=settings.openfootball_update_enabled,
+    )
     if st.button("Zapisz ustawienia"):
         settings.offline_mode, settings.sts_download_enabled = offline, sts
         settings.retain_raw_pdf, settings.nominal_stake = retain, stake
         settings.max_quote_age_minutes, settings.match_tolerance_minutes = int(age), int(tolerance)
+        settings.football_data_enabled = football_data
+        settings.openfootball_update_enabled = openfootball_updates
+        settings.api_sports_enabled = api_sports
         save_settings(c.paths(), settings)
         st.success("Zapisano w data/settings.json")
     st.info(

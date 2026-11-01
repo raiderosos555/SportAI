@@ -30,6 +30,7 @@ from sports_edge.models.elo import (
 from sports_edge.models.registry import register_version, save_prediction
 from sports_edge.offers.text import NameNormalizer
 from sports_edge.provenance import code_state, data_snapshot
+from sports_edge.results_engine import effective_results, priority
 from sports_edge.storage import Store
 
 REQUIRED = ("date", "home", "away", "home_score", "away_score")
@@ -60,8 +61,13 @@ def import_results(
     season: str | None,
     now: datetime,
     availability_basis: str,
+    provider: str | None = None,
 ) -> dict:
-    """Store completed matches with their availability time; refuse unlicensed data."""
+    """Store completed matches with their availability time; refuse unlicensed data.
+
+    ``provider`` marks the source in the results hierarchy (None: derived from the import,
+    "manual_official": results the user copied from the official organiser).
+    """
     if not license_note.strip():
         raise ValueError("Podaj źródło i podstawę prawną użycia danych")
     sha = hashlib.sha256(file_bytes).hexdigest()
@@ -94,8 +100,22 @@ def import_results(
         for row in accepted:
             inserted += store.insert(
                 "historical_results",
+                # Rows of a named provider are observations (several sources, corrections);
+                # unnamed CSV / openfootball rows keep the original natural key.
                 id=digest(
                     ["hist", sport, competition, row["match_date"], row["home"], row["away"]]
+                    if provider is None
+                    else [
+                        "hist",
+                        provider,
+                        sport,
+                        competition,
+                        row["match_date"],
+                        row["home"],
+                        row["away"],
+                        row["home_score"],
+                        row["away_score"],
+                    ]
                 ),
                 import_id=import_id,
                 sport=sport,
@@ -110,6 +130,8 @@ def import_results(
                 available_at_basis=availability_basis,
                 start_at=iso(row["start_at"]) if row.get("start_at") else None,
                 details_json=canonical(row.get("details") or {}),
+                provider=provider,
+                observed_at=iso(now),
             )
     return {"import_id": import_id, "duplicate": False, "inserted": inserted, "errors": errors}
 
@@ -124,6 +146,7 @@ def import_results_csv(
     sport: str,
     competition: str,
     now: datetime,
+    provider: str | None = None,
 ) -> dict:
     """CSV: date, home, away, home_score, away_score[, season, available_at, start_at]."""
     text = data.decode("utf-8-sig")
@@ -170,6 +193,7 @@ def import_results_csv(
         season=seasons.pop() if len(seasons) == 1 else None,
         now=now,
         availability_basis="source_timestamp" if confirmed else "assumed_lag_36h",
+        provider=provider,
     )
     out["errors"] = errors + out["errors"]
     return out
@@ -204,35 +228,58 @@ def import_openfootball(
 def history(
     store: Store, *, sport: str, until: datetime, competitions: tuple[str, ...] | None = None
 ) -> list[HistoricalMatch]:
-    """Results whose availability time is not later than ``until`` (as-of view)."""
-    sql = "SELECT * FROM historical_results WHERE sport=? AND available_at<=?"
-    params: list = [sport, iso(until)]
-    if competitions:
-        sql += f" AND competition IN ({','.join('?' for _ in competitions)})"
-        params.extend(competitions)
+    """Results whose availability time is not later than ``until`` (as-of view).
+
+    One match per fixture even when several providers reported it: the source hierarchy and
+    the newest correction decide (``results_engine.effective_results``).
+    """
     return [
-        HistoricalMatch(
-            available_at=datetime.fromisoformat(r["available_at"]),
-            match_date=r["match_date"],
-            home=r["home"],
-            away=r["away"],
-            home_score=r["home_score"],
-            away_score=r["away_score"],
-            start_at=datetime.fromisoformat(r["start_at"]) if r["start_at"] else None,
-            competition=r["competition"],
-            result_id=r["id"],
-        )
-        for r in store.rows(sql + " ORDER BY match_date, id", tuple(params))
+        _to_match(r)
+        for r in effective_results(store, sport=sport, until=until, competitions=competitions)
     ]
 
 
-def coverage(store: Store) -> list[dict]:
-    return store.rows(
-        """SELECT sport, competition, COUNT(*) matches, MIN(match_date) first,
-        MAX(match_date) last, COUNT(DISTINCT season) seasons,
-        GROUP_CONCAT(DISTINCT available_at_basis) availability_basis
-        FROM historical_results GROUP BY sport, competition ORDER BY sport, competition"""
+def _to_match(row: dict) -> HistoricalMatch:
+    return HistoricalMatch(
+        available_at=datetime.fromisoformat(row["available_at"]),
+        match_date=row["match_date"],
+        home=row["home"],
+        away=row["away"],
+        home_score=row["home_score"],
+        away_score=row["away_score"],
+        start_at=datetime.fromisoformat(row["start_at"]) if row["start_at"] else None,
+        competition=row["competition"],
+        result_id=row["id"],
     )
+
+
+def coverage(store: Store, *, until: datetime | None = None) -> list[dict]:
+    """Per competition: matches, period, seasons, availability basis and providers."""
+    rows = effective_results(
+        store, sport="football", until=until or datetime.max.replace(tzinfo=UTC)
+    )
+    others = store.rows("SELECT DISTINCT sport FROM historical_results WHERE sport <> 'football'")
+    for other in others:
+        rows += effective_results(
+            store, sport=other["sport"], until=until or datetime.max.replace(tzinfo=UTC)
+        )
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for row in rows:
+        groups[(row["sport"], row["competition"])].append(row)
+    return [
+        {
+            "sport": sport,
+            "competition": competition,
+            "matches": len(items),
+            "first": min(r["match_date"] for r in items),
+            "last": max(r["match_date"] for r in items),
+            "seasons": len({r["season"] for r in items}),
+            "availability_basis": ",".join(sorted({r["available_at_basis"] for r in items})),
+            "providers": ",".join(sorted({r["provider_resolved"] for r in items}, key=priority)),
+            "conflicts": sum(r["conflict"] for r in items),
+        }
+        for (sport, competition), items in sorted(groups.items())
+    ]
 
 
 # ---------------------------------------------------------------- experiment
@@ -492,7 +539,9 @@ def predict_offer(
         if code in competitions
         for sts in league.sts_leagues
     }
-    matches = history(store, sport="football", until=now, competitions=competitions)
+    rows = effective_results(store, sport="football", until=now, competitions=competitions)
+    matches = [_to_match(r) for r in rows]
+    providers = sorted({r["provider_resolved"] for r in rows}, key=priority)
     scoped = _scoped(matches)
     model = Elo(
         k=params["k"],
@@ -510,11 +559,12 @@ def predict_offer(
         code: max((m.match_date for m in matches if m.competition == code), default=None)
         for code in competitions
     }
-    saved, skipped, unmatched = 0, [], []
+    saved, kept, considered, skipped, unmatched = 0, 0, 0, [], []
     for event in events:
         code = league_for.get(event.get("league", ""))
         if event.get("sport") != "football" or code is None:
             continue
+        considered += 1
         label = f"{event.get('home')} - {event.get('away')}"
         if not event.get("start_at") or datetime.fromisoformat(event["start_at"]) <= now:
             skipped.append(f"{label}: wydarzenie rozpoczęte lub bez godziny — brak prognozy")
@@ -550,6 +600,9 @@ def predict_offer(
         if min(games) < MIN_TEAM_GAMES:
             skipped.append(f"{label}: za mało meczów w historii ({min(games)})")
             continue
+        if _already_forecast(store, version_id, event["id"], snapshot):
+            kept += 1  # same model and the same data: the stored forecast stays valid
+            continue
         forecast = model.probabilities(home, away, three_way=True)
         interval = {}
         for state_key, value in forecast.items():
@@ -573,13 +626,32 @@ def predict_offer(
                 "teams": pair,
                 "competition": code,
                 "games": list(games),
-                "data": "openfootball (CC0), wyniki as-of",
+                "data": "wyniki as-of: " + ", ".join(providers),
+                "last_result": last,
             },
             kind="prospective",
             created_at=now,
         )
         saved += 1
-    return {"saved": saved, "skipped": skipped, "unmatched": unmatched}
+    return {
+        "considered": considered,
+        "saved": saved,
+        "kept": kept,
+        "skipped": skipped,
+        "unmatched": unmatched,
+        "last_result": last_result,
+    }
+
+
+def _already_forecast(store: Store, version_id: str, event_id: str, snapshot: str) -> bool:
+    for row in store.rows(
+        """SELECT inputs_json FROM predictions WHERE model_version_id=? AND event_id=?
+        AND market_key='1x2' AND period='FT' AND kind='prospective'""",
+        (version_id, event_id),
+    ):
+        if json.loads(row["inputs_json"]).get("data_snapshot") == snapshot:
+            return True
+    return False
 
 
 def _keys(matches: list[HistoricalMatch], code: str, normalizer: NameNormalizer) -> dict:

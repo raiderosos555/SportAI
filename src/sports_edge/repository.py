@@ -250,16 +250,88 @@ def _coverage(store: Store) -> list[dict]:
     return out
 
 
-def freshness(valid_at: str | None, start_at: str | None, now: datetime, max_age: timedelta) -> str:
-    """fresh / stale / expired (event started) / unknown (no document timestamp)."""
-    if start_at and now >= datetime.fromisoformat(start_at):
-        return "expired"
-    if not valid_at:
+# TASK 004: three independent statuses instead of one "stale" label.
+EVENT_STATUS = {
+    "before_start": "Przed rozpoczęciem",
+    "in_play": "W trakcie",
+    "finished": "Zakończone",
+    "postponed": "Przełożone",
+    "cancelled": "Anulowane",
+    "unknown": "Nieznany",
+}
+ODDS_FRESHNESS = {
+    "fresh": "Świeża migawka",
+    "unconfirmed": "Starsza migawka — wymaga potwierdzenia",
+    "unknown": "Nieznany czas obserwacji",
+}
+PRESENCE = {
+    "current": "Potwierdzony w najnowszej właściwej ofercie",
+    "withdrawn": "Wycofany",
+    "unconfirmed": "Niepotwierdzony",
+}
+# Typical duration used only to say "in play" before a result is known (never to settle).
+EVENT_DURATION = {
+    "football": timedelta(hours=2),
+    "basketball": timedelta(hours=2, minutes=45),
+    "ice_hockey": timedelta(hours=3),
+    "volleyball": timedelta(hours=2, minutes=30),
+    "handball": timedelta(hours=2),
+    "tennis": timedelta(hours=4),
+}
+COMPLETE_DAY_KINDS = {"today", "tomorrow"}  # these documents list every event of their day
+
+
+def event_status(
+    start_at: str | None, now: datetime, *, sport: str = "", result_status: str | None = None
+) -> str:
+    """A: before start / in play / finished / postponed / cancelled / unknown."""
+    if result_status == "completed":
+        return "finished"
+    if result_status == "postponed":
+        return "postponed"
+    if result_status in {"cancelled", "void", "abandoned"}:
+        return "cancelled"
+    if not start_at:
         return "unknown"
+    start = datetime.fromisoformat(start_at)
+    if now < start:
+        return "before_start"
+    if now < start + EVENT_DURATION.get(sport, timedelta(hours=3)):
+        return "in_play"
+    return "unknown"  # started long ago and no confirmed result
+
+
+def odds_freshness(
+    valid_at: str | None, now: datetime, max_age: timedelta
+) -> tuple[str, float | None]:
+    """B: (fresh | unconfirmed | unknown, snapshot age in hours) of the quote's own document.
+
+    A later empty document or a later start of the event never makes an old price fresh.
+    """
+    if not valid_at:
+        return "unknown", None
     age = now - datetime.fromisoformat(valid_at)
     if age < timedelta(0):
-        return "unknown"
-    return "fresh" if age <= max_age else "stale"
+        return "unknown", None
+    return ("fresh" if age <= max_age else "unconfirmed"), round(age.total_seconds() / 3600, 1)
+
+
+def freshness(valid_at: str | None, start_at: str | None, now: datetime, max_age: timedelta) -> str:
+    """Combined legacy label: expired (event started) / fresh / stale / unknown."""
+    if start_at and now >= datetime.fromisoformat(start_at):
+        return "expired"
+    status, _age = odds_freshness(valid_at, now, max_age)
+    return {"fresh": "fresh", "unconfirmed": "stale"}.get(status, "unknown")
+
+
+def latest_result_status(store: Store) -> dict[str, str]:
+    """Newest recorded result status per STS event."""
+    out: dict[str, tuple[str, str]] = {}
+    for row in store.rows("SELECT event_id, status, recorded_at, id FROM results"):
+        key = (row["recorded_at"], row["id"])
+        if row["event_id"] not in out or key > out[row["event_id"]][0]:
+            out[row["event_id"]] = (key, row["status"])
+    return {event: value[1] for event, value in out.items()}
 
 
 def offer_table(
@@ -314,6 +386,7 @@ def offer_table(
             "selection_id": o["selection_id"],
         }
     coverage = _coverage(store)
+    results = latest_result_status(store)
     result = []
     for row in latest.values():
         row = dict(row)
@@ -323,12 +396,24 @@ def offer_table(
         newer = [
             c
             for c in coverage
-            if c["offer_kind"] == row["offer_kind"] != "unknown"
-            and row["offer_date"] in c["dates"]
+            if row["offer_date"] in c["dates"]
             and (c["generated_at"] or "", c["ingested_at"])
             > (row["valid_at"] or "", row["ingested_at"])
         ]
-        row["presence"] = "withdrawn" if newer else "current"
+        same_kind = [c for c in newer if c["offer_kind"] == row["offer_kind"] != "unknown"]
+        other_complete = [
+            c
+            for c in newer
+            if c["offer_kind"] != row["offer_kind"] and c["offer_kind"] in COMPLETE_DAY_KINDS
+        ]
+        # Newer documents never list this market (otherwise they would hold the latest quote).
+        if same_kind:
+            row["presence"] = "withdrawn"
+        elif other_complete:
+            row["presence"] = "unconfirmed"
+        else:
+            row["presence"] = "current"
+        row["result_status"] = results.get(row["event_id"])
         result.append(row)
     result.sort(key=lambda r: (r["start_at"] or "", r["league"], r["event_id"], r["market_key"]))
     return result

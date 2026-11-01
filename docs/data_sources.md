@@ -88,3 +88,15 @@ Kursy innych operatorów (gdy pojawi się legalne źródło) trafiają do osobne
 `benchmark_odds` z momentem `opening` / `pre_match` / `closing` / `unknown` — wyłącznie jako
 benchmark badawczy, nigdy jako oferta STS ani cecha modelu. Ranking obszarów badawczych
 i braki: [raport TASK 003, sekcja B](task_003_report.md).
+
+## TASK 004 — źródła wyników (sprawdzono 01.11.2026)
+
+Aktywne: **football-data.org v4** (Free Tier, klucz użytkownika w `.env`, 10 zapytań/min,
+bieżący sezon 5 lig, znacznik `lastUpdated` jako górna granica dostępności) i **openfootball**
+(historia). Nieaktywne z zapisanym powodem: wyniki STS (brak API, `robots.txt` blokuje
+`resultDate`, stats.sts.pl → Sportradar `Disallow: /`) i Superbet (`robots.txt` blokuje
+`/wyniki`). Wykluczone: Flashscore (regulamin). API-Sports: adapter wdrożony (Ekstraklasa; 100 zapytań/dzień na API,
+limit z rezerwą; koszykówka i hokej nieaktywne do weryfikacji schematu; regulamin akceptuje
+użytkownik przy rejestracji). Hierarchia przy rozbieżnościach: oficjalny organizator > football-data.org >
+openfootball > CSV. Ranking i odpowiedzi na pytania o STS/Superbet:
+[raport TASK 004, sekcje B–D](task_004_report.md).

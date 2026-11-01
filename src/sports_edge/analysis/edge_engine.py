@@ -8,8 +8,14 @@ Tiers:
 * ``validated`` — every gate passed (validated model, verified market rules and tax profile,
   fresh current quote, positive lower bound of net EV);
 * ``experimental`` — a model forecast shows positive net EV, but at least one validation gate
-  failed (e.g. the model is not validated): an observation, not a recommendation;
-* ``rejected`` — data, freshness, rules or EV gates failed.
+  failed (e.g. the model is not validated, the price snapshot is old): an observation, not a
+  recommendation;
+* ``rejected`` — data, event status, rules or EV gates failed.
+
+Three statuses are kept apart (TASK 004): the event (before start, in play, finished...), the
+age of the price snapshot ("Kurs niepotwierdzony od X h") and the market's presence in the
+newest relevant offer. A price is never treated as current just because the event has not
+started yet.
 """
 
 from dataclasses import dataclass, field
@@ -19,8 +25,9 @@ from decimal import Decimal
 from sports_edge.analysis.policy import Policy
 from sports_edge.bookmakers import BookmakerProfile, MarketRules
 from sports_edge.edge import binary_ev, net_ev
+from sports_edge.offers.labels import market_label
 from sports_edge.probability import market_probabilities
-from sports_edge.repository import freshness
+from sports_edge.repository import event_status, odds_freshness
 from sports_edge.settlement import Outcome
 
 COMPLETE_SETS = {
@@ -38,6 +45,63 @@ COMPLETE_SETS = {
     "red_card": {"yes", "no"},
 }
 NOT_ANALYSED = {"unknown", "handicap_unsigned"}
+# Markets whose probabilities follow from the 1X2 forecast of the same period.
+DERIVED_FROM_1X2 = {
+    "double_chance": {
+        "home_draw": ("home", "draw"),
+        "draw_away": ("draw", "away"),
+        "home_away": ("home", "away"),
+    }
+}
+
+
+def derive_from_1x2(prediction: dict, market_key: str) -> dict:
+    """Double chance from the same 1X2 forecast; interval bounds are added (conservative)."""
+    parts = DERIVED_FROM_1X2[market_key]
+    probabilities = prediction["probabilities"]
+    interval = prediction["uncertainty"].get("interval", {})
+    derived_p = {
+        selection: sum(probabilities[k] for k in keys)
+        for selection, keys in parts.items()
+        if all(k in probabilities for k in keys)
+    }
+    derived_i = {
+        selection: [
+            max(0.0, sum(interval[k][0] for k in keys)),
+            min(1.0, sum(interval[k][1] for k in keys)),
+        ]
+        for selection, keys in parts.items()
+        if all(k in interval for k in keys)
+    }
+    return {
+        **prediction,
+        "probabilities": derived_p,
+        "uncertainty": {**prediction["uncertainty"], "interval": derived_i},
+        "derived_from": "1x2",
+    }
+
+
+def break_even_probability(odds: Decimal, stake_tax_rate: Decimal) -> float:
+    """Win probability at which net EV is zero: 1 / (odds × (1 − stake tax)).
+
+    Above 1.0 a win cannot even return the stake (STS: odds below about 1.14).
+    """
+    return 1 / (float(odds) * float(1 - stake_tax_rate))
+
+
+def calibration_note(prediction: dict | None, p: float | None) -> str:
+    """How often holdout forecasts in the same probability bin came true (1X2 outcomes)."""
+    if prediction is None or p is None:
+        return "—"
+    if prediction.get("derived_from"):
+        return "prognoza pochodna z 1X2 — bez osobnej kalibracji"
+    for row in (prediction["validation"].get("holdout") or {}).get("reliability", []):
+        if row["n"] and row["low"] <= p < row["high"]:
+            return (
+                f"holdout {row['low']:.0%}–{row['high']:.0%}: trafione {row['freq']:.0%} "
+                f"(n={row['n']})"
+            )
+    return "brak danych kalibracji w tym przedziale"
 
 
 @dataclass(frozen=True)
@@ -82,6 +146,15 @@ class Candidate:
     reasons: tuple[str, ...]
     warnings: tuple[str, ...] = ()
     explanation: dict = field(default_factory=dict)
+    event_status: str = "unknown"
+    break_even: float | None = None  # win probability needed for zero net EV (STS tax)
+    calibration: str = "—"
+    odds_age_hours: float | None = None
+    document_at: str | None = None  # time printed in the STS document of this price
+    fetched_at: str | None = None  # download time (None for a manually supplied file)
+    market_label: str = ""
+    label_raw: str = ""  # market header exactly as printed in the PDF
+    source_text: str = ""  # original PDF row
 
     @property
     def accepted(self) -> bool:
@@ -121,20 +194,37 @@ def evaluate(
     stake: Decimal,
 ) -> list[Candidate]:
     out: list[Candidate] = []
+    fair_1x2 = {(r["event_id"], r["period"]): devig(r)[0] for r in rows if r["market_key"] == "1x2"}
     for row in rows:
         if row["market_key"] in NOT_ANALYSED:
             continue
         fair, margin = devig(row)
+        if fair is None and row["market_key"] in DERIVED_FROM_1X2:
+            # STS de-margined 1X2 of the same match and period, combined like the forecast
+            base = fair_1x2.get((row["event_id"], row["period"]))
+            parts = DERIVED_FROM_1X2[row["market_key"]]
+            if base and set(row["selections"]) == set(parts):
+                fair = {sel: sum(base[k] for k in keys) for sel, keys in parts.items()}
+                margin = sum(1 / float(q["price"]) for q in row["selections"].values()) - 2
         start = datetime.fromisoformat(row["start_at"]) if row["start_at"] else None
         event_day = (
             start.date()
             if start
             else (date.fromisoformat(row["offer_date"]) if row["offer_date"] else None)
         )
-        status = freshness(row["valid_at"], row["start_at"], now, max_age)
+        status = (
+            event_status(
+                row["start_at"], now, sport=row["sport"], result_status=row.get("result_status")
+            ),
+            *odds_freshness(row["valid_at"], now, max_age),
+        )
         prediction = predictions.get(
             (row["event_id"], row["market_key"], row["period"], row["line"])
         )
+        if prediction is None and row["market_key"] in DERIVED_FROM_1X2:
+            base = predictions.get((row["event_id"], "1x2", row["period"], None))
+            if base is not None:
+                prediction = derive_from_1x2(base, row["market_key"])
         rules_status, payoff = _payoff(row, market_rules)
         for selection, quote in row["selections"].items():
             out.append(
@@ -186,16 +276,28 @@ def _candidate(
     if policy.require_verified_parser and not row["parser_verified"]:
         blocking.append("Parser niezweryfikowany na autentycznym dokumencie")
         data_status = "parser niezweryfikowany"
+    event_state, odds_state, age_hours = status
     if row.get("presence") == "withdrawn":
         blocking.append("Rynek wycofany — nie występuje w nowszej ofercie tego samego rodzaju")
-    if policy.require_fresh_quote and status != "fresh":
+    elif row.get("presence") == "unconfirmed":
+        unproven.append("Rynek niepotwierdzony w nowszej ofercie dnia — pobierz ofertę ponownie")
+    if event_state != "before_start":
         blocking.append(
             {
-                "expired": "Kurs wygasł — wydarzenie już się rozpoczęło",
-                "stale": "Kurs nieaktualny — przekroczony maksymalny wiek oferty",
-                "unknown": "Nieznany czas publikacji kursu",
-            }[status]
+                "finished": "Wydarzenie zakończone — kurs nieaktualny",
+                "postponed": "Wydarzenie przełożone — kurs nieaktualny",
+                "cancelled": "Wydarzenie anulowane — kurs nieaktualny",
+            }.get(
+                event_state,
+                "Kurs wygasł — wydarzenie już się rozpoczęło"
+                if row["start_at"]
+                else "Nieznana godzina rozpoczęcia wydarzenia",
+            )
         )
+    if policy.require_fresh_quote and odds_state == "unconfirmed":
+        unproven.append(f"Kurs niepotwierdzony od {age_hours:.0f} h — pobierz aktualną ofertę STS")
+    elif policy.require_fresh_quote and odds_state == "unknown":
+        unproven.append("Nieznany czas obserwacji kursu")
     if odds > Decimal(str(policy.max_odds)):
         blocking.append(f"Kurs {odds} powyżej limitu polityki {policy.max_odds}")
     profile_ok = event_day is not None and profile.cost_valid_on(event_day)
@@ -315,12 +417,25 @@ def _candidate(
         data_status=data_status,
         rules_status=rules_status,
         tax_status=tax_status,
-        freshness=status,
+        freshness=odds_state,
         presence=row.get("presence", "current"),
         tier=tier,
         reasons=reasons,
         warnings=tuple(warnings),
         explanation=explanation,
+        event_status=event_state,
+        break_even=(
+            break_even_probability(odds, profile.cost.stake_tax_rate)
+            if profile_ok and payoff in {None, "binary"}
+            else None
+        ),
+        calibration=calibration_note(prediction, p_model),
+        odds_age_hours=age_hours,
+        document_at=row.get("valid_at"),
+        fetched_at=row.get("fetched_at"),
+        market_label=market_label(row["market_key"], row["period"], row["line"]),
+        label_raw=row.get("label_raw", ""),
+        source_text=row.get("source_text", ""),
     )
 
 

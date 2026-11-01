@@ -66,3 +66,13 @@ Nie twierdzimy, że sam zestaw aktualnych walidatorów wyklucza każdy przeciek.
 | Nieaktualne dane w prognozie | Prognoza wstrzymana, gdy ostatni wynik drużyny jest starszy niż 21 dni lub drużyna ma < 10 meczów | `test_forecasts_only_before_start_and_with_current_data` |
 
 Wyniki: [raport TASK 003, sekcja C](task_003_report.md).
+
+## TASK 004 — wyniki z wielu źródeł
+
+| Ryzyko | Zabezpieczenie | Test |
+|---|---|---|
+| Wynik użyty przed jego publikacją | football-data.org: `available_at = lastUpdated` (górna granica dostępności, `source_last_updated`); bez znacznika — założenie +36 h; znacznik wcześniejszy niż start + 95 min jest odrzucany | `test_football_data_parser_standardises_records`, `test_incomplete_future_and_unavailable_records_are_refused` |
+| Korekta wyniku nadpisuje przeszłość | Korekta to nowy wiersz; widok as-of pokazuje wynik znany w danej chwili | `test_corrections_are_new_rows_and_history_stays_as_of` |
+| Ten sam mecz liczony dwa razy | `effective_results`: jeden mecz na fixture, hierarchia źródeł | `test_second_source_confirms_or_conflicts_and_the_hierarchy_decides` |
+| Prognoza ponownie zapisana bez nowych danych | Ta sama wersja i ten sam snapshot danych — prognoza zostaje | `test_stale_elo_history_blocks_forecasts_until_the_gap_is_filled` |
+| Prognoza całego meczu przypisana połowie | Klucz prognozy obejmuje rynek i okres | `test_match_halves_and_ht_or_ft_never_share_the_full_time_forecast` |

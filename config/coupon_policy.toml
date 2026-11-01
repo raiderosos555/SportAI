@@ -14,3 +14,5 @@ max_odds = 10.0
 max_selections = 5
 ako_enabled = false
 ako_requires_joint_model = true
+# Ranking "najwyższe prawdopodobieństwo wygranej": informacja, nie bramka walidacji.
+probable_min_probability = 0.65

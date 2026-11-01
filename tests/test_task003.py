@@ -261,4 +261,5 @@ def test_full_pipeline_on_synthetic_fixtures(app_paths, sts_fixture_pdf):
     assert closing_line_value(store, coupon)[0]["clv"] is None
     exported = export_json(store, app_paths.exports / "flow.json", now=later)
     text = exported.read_text(encoding="utf-8")
-    assert '"predictions"' in text and '"settlements"' in text and "openfootball" in text
+    assert '"predictions"' in text and '"settlements"' in text
+    assert '"source": "csv"' in text  # the result keeps its real provider (CSV fixture)

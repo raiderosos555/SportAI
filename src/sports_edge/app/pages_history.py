@@ -49,8 +49,8 @@ def history_page() -> None:
                     "Dzień": r["analysis_date"],
                     "Wynik": summary["headline"],
                     "Selekcje": summary["analysed"],
-                    "EV netto > 0": counts.get("ev_positive", "—"),
-                    "Eksperymentalne": counts.get("experimental", "—"),
+                    "EV netto > 0": counts.get("ev_positive"),
+                    "Eksperymentalne": counts.get("experimental"),
                     "Zwalidowane": len(summary["accepted"]),
                     "Polityka": json.loads(r["policy_json"])["version"],
                 }
@@ -143,10 +143,12 @@ def _results(db) -> None:
         st.info("Brak kuponów do rozliczenia.")
         return
     st.caption(
-        "Wyniki: automatycznie z niezależnego źródła tylko przy pewnym dopasowaniu (ta sama liga, "
-        "data i obie drużyny), w przeciwnym razie ręcznie. Korekta tworzy nowy rekord."
+        "Wyniki: automatycznie z niezależnych źródeł (hierarchia: organizator > football-data.org "
+        "> openfootball) tylko przy pewnym dopasowaniu i bez rozbieżności między źródłami; "
+        "rynki, których nie rozstrzyga wynik końcowy (np. rzuty rożne), czekają na dodatkowe "
+        "dane. Korekta tworzy nowy rekord, a selekcja nierozstrzygnięta nigdy nie jest przegrana."
     )
-    if st.button("Pobierz wyniki z danych niezależnych (lokalnie)"):
+    if st.button("Przenieś pewne wyniki z danych niezależnych (lokalnie)"):
         out = import_source_results(
             db, now=c.now(), normalizer=normalizer(c.paths()), team_aliases=team_aliases(c.paths())
         )
@@ -193,10 +195,16 @@ def _results(db) -> None:
         profiles = load_profiles(c.paths().config)
         for coupon in db.rows("SELECT id FROM coupons"):
             outcome = settle_coupon(db, coupon["id"], profiles, now=c.now())
+            status = {
+                "pending": "oczekuje",
+                "manual": "rozliczenie ręczne",
+                "settled": "rozliczony",
+            }
             st.write(
-                f"`{coupon['id'][:10]}…` → {outcome['status']}",
+                f"`{coupon['id'][:10]}…` → {status.get(outcome['status'], outcome['status'])}",
                 outcome.get("net_profit", ""),
                 outcome.get("reason", ""),
+                "; ".join(outcome.get("reasons", [])),
             )
 
 
