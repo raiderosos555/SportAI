@@ -295,8 +295,56 @@ def coverage(store: Store, *, until: datetime | None = None) -> list[dict]:
 
 @dataclass(frozen=True)
 class Split:
-    validation_from: str  # ISO date, inclusive
-    holdout_from: str  # ISO date, inclusive
+    """Chronological windows of one experiment (ISO dates, each ``from`` inclusive).
+
+    Protocol v1 (TASK 003–006): train < validation_from ≤ validation < holdout_from ≤ holdout;
+    the holdout also decided statuses. Protocol v2 (TASK 007) adds two windows so that the
+    final holdout never decides anything:
+
+    train < validation_from ≤ validation (hyperparameters) < calibration_from ≤ calibration
+    (calibration maps, draw margin, interval widths) < selection_from ≤ selection (model
+    choice, predictive statuses, league gates) < holdout_from ≤ final holdout (reported once).
+    """
+
+    validation_from: str
+    holdout_from: str
+    calibration_from: str | None = None
+    selection_from: str | None = None
+
+    @property
+    def protocol(self) -> str:
+        return "v2" if self.selection_from else "v1"
+
+    @property
+    def tuning_until(self) -> str:
+        """End of the hyperparameter window."""
+        return self.calibration_from or self.holdout_from
+
+    @property
+    def decision_from(self) -> str:
+        """First day of the window whose results decide statuses and the served model."""
+        return self.selection_from or self.holdout_from
+
+    def window(self, day: str) -> str:
+        if day < self.validation_from:
+            return "train"
+        if self.protocol == "v1":
+            return "validation" if day < self.holdout_from else "holdout"
+        if day < self.calibration_from:
+            return "validation"
+        if day < self.selection_from:
+            return "calibration"
+        return "selection" if day < self.holdout_from else "holdout"
+
+    def as_dict(self) -> dict:
+        out = {"validation_from": self.validation_from, "holdout_from": self.holdout_from}
+        if self.selection_from:
+            out.update(
+                calibration_from=self.calibration_from,
+                selection_from=self.selection_from,
+                protocol="v2",
+            )
+        return out
 
 
 def _scoped(matches: list[HistoricalMatch]) -> list[HistoricalMatch]:
@@ -416,8 +464,20 @@ def run_elo_experiment(
     if not matches:
         raise ValueError("Brak danych historycznych dla wybranych rozgrywek")
     train = [m for m in matches if m.match_date < split.validation_from]
-    validation = [m for m in matches if split.validation_from <= m.match_date < split.holdout_from]
+    validation = [m for m in matches if split.validation_from <= m.match_date < split.tuning_until]
     holdout = [m for m in matches if m.match_date >= split.holdout_from]
+    if split.protocol == "v2":
+        return _run_elo_v2(
+            store,
+            matches,
+            train=train,
+            validation=validation,
+            competitions=competitions,
+            split=split,
+            now=now,
+            policy=policy,
+            register=register,
+        )
     if len(train) < 1000 or len(validation) < policy.min_validation_events or not holdout:
         raise ValueError(
             f"Za mało danych: trening {len(train)}, walidacja {len(validation)}, "
@@ -534,6 +594,164 @@ def run_elo_experiment(
     return report
 
 
+def _run_elo_v2(
+    store: Store,
+    matches,
+    *,
+    train,
+    validation,
+    competitions: tuple[str, ...],
+    split: Split,
+    now: datetime,
+    policy: Policy,
+    register: bool,
+) -> dict:
+    """Protocol v2: hyperparameters on validation, draw margin and interval widths fitted on
+    data before the selection window, statuses on the selection window; the final holdout is
+    reported only."""
+    selection = [m for m in matches if split.window(m.match_date) == "selection"]
+    if len(train) < 300 or len(validation) < 300 or len(selection) < 300:
+        raise ValueError(
+            f"Za mało danych (protokół v2): trening {len(train)}, walidacja {len(validation)}, "
+            f"selekcja {len(selection)}"
+        )
+    candidates = []
+    for k in GRID["k"]:
+        for hfa in GRID["home_advantage"]:
+            items, margin = _forecasts(
+                train + validation, k=k, home_advantage=hfa, margin_until=split.validation_from
+            )
+            scored = [i for i in items if i["match"].match_date >= split.validation_from]
+            candidates.append(
+                {"k": k, "home_advantage": hfa, "draw_margin": margin, **_metrics(scored)}
+            )
+    best = min(candidates, key=lambda c: c["log_loss"])
+    items, margin = _forecasts(
+        matches,
+        k=best["k"],
+        home_advantage=best["home_advantage"],
+        margin_until=split.selection_from,
+    )
+    windows: dict[str, list] = defaultdict(list)
+    for item in items:
+        windows[split.window(item["match"].match_date)].append(item)
+    climate = _climatology([m for m in matches if m.match_date < split.selection_from])
+
+    def baseline(group):
+        known = [i for i in group if i["match"].competition in climate]
+        if not known:
+            return {"log_loss": None, "brier": None}
+        base = [climate[i["match"].competition] for i in known]
+        outcomes = [i["match"].outcome for i in known]
+        return {
+            "log_loss": round(calibration.log_loss(base, outcomes), 5),
+            "brier": round(calibration.brier(base, outcomes), 5),
+        }
+
+    def by_league(group):
+        leagues: dict[str, list] = defaultdict(list)
+        for item in group:
+            leagues[item["match"].competition].append(item)
+        return {
+            league: {k: v for k, v in _metrics(found).items() if k != "reliability"}
+            for league, found in sorted(leagues.items())
+        }
+
+    by_season: dict[str, list] = defaultdict(list)
+    for item in items:
+        if item["match"].match_date >= split.validation_from:
+            year, month = int(item["match"].match_date[:4]), int(item["match"].match_date[5:7])
+            start = year if month >= 7 else year - 1
+            by_season[f"{start}-{str(start + 1)[2:]}"].append(item)
+    decision = _metrics(windows["selection"])
+    report = {
+        "family": "elo_ordered_draw",
+        "market": "1x2 (czas regulaminowy)",
+        "protocol": "v2",
+        "competitions": list(competitions),
+        "split": split.as_dict(),
+        "n": {
+            "train": len(train),
+            **{name: len(windows[name]) for name in ("validation", "calibration", "selection")},
+            "holdout": len(windows["holdout"]),
+        },
+        "hyperparameters": {
+            "k": best["k"],
+            "home_advantage": best["home_advantage"],
+            "draw_margin": margin,
+            "draw_margin_until": split.selection_from,
+        },
+        "selection": [{k: v for k, v in c.items() if k != "reliability"} for c in candidates],
+        # interval widths of prospective forecasts come from this window (never the holdout)
+        "calibration": _metrics(windows["calibration"]),
+        "decision": decision,
+        "baseline_climatology": baseline(windows["selection"]),
+        "decision_by_league": by_league(windows["selection"]),
+        "holdout": _metrics(windows["holdout"]),
+        "holdout_baseline": baseline(windows["holdout"]),
+        "holdout_by_league": by_league(windows["holdout"]),
+        "holdout_decision_free": True,
+        "walk_forward_by_season": {
+            season: {k: v for k, v in _metrics(group).items() if k != "reliability"}
+            for season, group in sorted(by_season.items())
+        },
+        "market_benchmark": market_benchmark(store, windows["selection"]),
+        "holdout_market_benchmark": market_benchmark(store, windows["holdout"]),
+        "availability_basis": sorted(
+            {
+                r["available_at_basis"]
+                for r in store.rows(
+                    f"SELECT DISTINCT available_at_basis FROM historical_results "
+                    f"WHERE competition IN ({','.join('?' for _ in competitions)})",
+                    competitions,
+                )
+            }
+        ),
+        "leakage_checked": True,
+        "ordering_rule": "prognozy dnia D wyłącznie z wyników dni < D; podział czasowy v2",
+        "data_snapshot": data_snapshot(m.result_id for m in matches),
+        "code_state": code_state(),
+        "data_until": iso(max(m.available_at for m in matches)),
+    }
+    base = report["baseline_climatology"]["log_loss"]
+    report["improves_on_baseline"] = base is not None and decision.get("log_loss", 9) < base
+    if register:
+        version = f"elo-1x2-v2-{'-'.join(competitions)}-{now:%Y%m%d%H%M}"
+        version_id, status, reasons = register_version(
+            store,
+            family="elo_ordered_draw",
+            sport="football",
+            description="Elo z marginesem remisu, 1X2 czas regulaminowy",
+            version=version,
+            created_at=now,
+            trained_through=max(m.available_at for m in matches),
+            training_data={
+                "competitions": list(competitions),
+                "data_snapshot": report["data_snapshot"],
+                "code_state": report["code_state"],
+                "hyperparameters": report["hyperparameters"],
+                "split": report["split"],
+            },
+            validation=report,
+            policy=policy,
+        )
+        report.update(version_id=version_id, status=status, status_reasons=reasons)
+    return report
+
+
+def elo_parameters(validation: dict) -> tuple[float, list[dict], float]:
+    """(draw margin, reliability bins, ECE) behind prospective Elo forecasts and intervals.
+
+    v2 versions use the calibration window; v1 versions used the holdout (kept as stored).
+    """
+    params = validation["hyperparameters"]
+    if validation.get("protocol") == "v2":
+        source = validation["calibration"]
+        return params["draw_margin"], source.get("reliability", []), source.get("ece") or 0.0
+    source = validation["holdout"]
+    return params["draw_margin_holdout"], source.get("reliability", []), source.get("ece") or 0.0
+
+
 # ---------------------------------------------------------------- prospective forecasts
 
 
@@ -566,18 +784,15 @@ def predict_offer(
     matches = [_to_match(r) for r in rows]
     providers = sorted({r["provider_resolved"] for r in rows}, key=priority)
     scoped = _scoped(matches)
-    model = Elo(
-        k=params["k"],
-        home_advantage=params["home_advantage"],
-        draw_margin=params["draw_margin_holdout"],
-    )
+    draw_margin, reliability, ece = elo_parameters(validation)
+    model = Elo(k=params["k"], home_advantage=params["home_advantage"], draw_margin=draw_margin)
     walk_forward(scoped, model, three_way=True)
     aliases = alias_map(store, team_aliases)
     known = {
         code: known_names([r for r in rows if r["competition"] == code], "football", normalizer)
         for code in competitions
     }
-    bins = {(row["low"], row["high"]): row for row in validation["holdout"]["reliability"]}
+    bins = {(row["low"], row["high"]): row for row in reliability}
     info_cutoff = max(m.available_at for m in matches)
     snapshot = data_snapshot(m.result_id for m in matches)
     state = code_state()
@@ -634,7 +849,7 @@ def predict_offer(
         for state_key, value in forecast.items():
             row = next((r for (lo, hi), r in bins.items() if lo <= value < hi), None)
             n = row["n"] if row and row["n"] else 1
-            half = max(validation["holdout"]["ece"], 1.96 * sqrt(value * (1 - value) / n))
+            half = max(ece, 1.96 * sqrt(value * (1 - value) / n))
             interval[state_key] = [max(0.0, value - half), min(1.0, value + half)]
         save_prediction(
             store,

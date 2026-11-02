@@ -101,6 +101,17 @@ def research(step: str, scope: str = "core") -> None:
         _print(
             {k: report[k] for k in ("version_id", "predictive", "markets_served") if k in report}
         )
+    elif step == "ablation":
+        _print(services.run_ablation(store, paths, now=now, scope=scope))
+    elif step == "protocol-v2":
+        found = services.run_protocol_v2(store, paths, now=now, scope=scope, progress=print)
+        _print(
+            {
+                "elo_version_id": found["elo"]["version_id"],
+                "goals_version_id": found["goals"]["version_id"],
+                **found["summary"],
+            }
+        )
     elif step == "goals-predict":
         _print(services.generate_goals_predictions(store, paths, now=now))
     elif step == "backfill":
@@ -178,6 +189,40 @@ def backup(include_raw: bool) -> None:
     print(create_backup(AppPaths(project_root()), now=datetime.now(), include_raw=include_raw))
 
 
+def learning(action: str, *, force: bool = False) -> None:
+    """Weekly review (Windows Task Scheduler friendly), catch-up and status reports."""
+    from sports_edge import collection, retraining, services
+
+    paths, settings, store = _context()
+    now = datetime.now(UTC)
+    if action == "review":
+        if not force and not retraining.due(store, now=now):
+            _print({"review": "nie jest jeszcze należny (co 7 dni)"})
+            return
+        _print(retraining.review(store, paths, now=now, trigger="cli", force=force))
+    elif action == "catch-up":
+
+        def update():
+            return services.update_results_data(store, paths, settings, now=now)
+
+        updater = None if settings.offline_mode else update
+        _print(collection.catch_up(store, now=now, update=updater))
+    elif action == "status":
+        _print(
+            {
+                "completeness": collection.completeness(store, now=now),
+                "scopes": {
+                    scope: retraining.scope_status(store, scope, now=now)
+                    for scope in services.MODEL_SCOPES
+                },
+            }
+        )
+    elif action == "storage":
+        from sports_edge import maintenance
+
+        _print(maintenance.storage_report(store, paths))
+
+
 def check() -> int:
     from sports_edge.services import startup_check
     from sports_edge.settings import AppPaths, project_root
@@ -212,6 +257,8 @@ def main() -> None:
             "predict",
             "goals-experiment",
             "goals-predict",
+            "protocol-v2",
+            "ablation",
             "backfill",
             "results",
         ],
@@ -225,6 +272,11 @@ def main() -> None:
     ana.add_argument("day", nargs="?", help="YYYY-MM-DD (default: today, Warsaw)")
     ana.add_argument("--refresh-offer", action="store_true", help="download the STS PDF (opt-in)")
     ana.add_argument("--no-results", action="store_true", help="skip the results update")
+    lrn = commands.add_parser(
+        "learning", help="weekly model review, catch-up after a break, storage report"
+    )
+    lrn.add_argument("action", choices=["review", "catch-up", "status", "storage"])
+    lrn.add_argument("--force", action="store_true", help="train even if conditions are unmet")
     args = parser.parse_args()
     if args.command == "demo":
         demo()
@@ -242,6 +294,8 @@ def main() -> None:
         research(args.step, args.scope)
     elif args.command == "analyse":
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
+    elif args.command == "learning":
+        learning(args.action, force=args.force)
 
 
 if __name__ == "__main__":

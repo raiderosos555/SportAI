@@ -181,14 +181,15 @@ def build(candidates, rules: ProbabilityPolicy | None = None, **kwargs):
 # ---------------------------------------------------------------- policy and builder
 
 
-def test_probability_policy_file_has_three_profiles_and_its_own_version():
+def test_probability_policy_file_has_its_profiles_and_its_own_version():
+    # TASK 007 replaced the three profiles of TASK 005 by four (see test_task007)
     rules = load_probability_policy(ROOT / "config" / "probability_policy.toml")
-    assert list(rules.profiles) == ["safe", "balanced", "aggressive"]
+    assert list(rules.profiles) == ["high_hit", "standard", "higher_payout", "tasiemka"]
     assert rules.version and rules.builder["per_event"] >= 1
     assert rules.validation["min_holdout_n"] >= 300 and rules.validation["max_ece"] <= 0.03
-    assert rules.profiles["safe"]["require_predictive_validation"] is True
-    assert rules.profiles["balanced"]["require_predictive_validation"] is True
-    assert rules.profiles["aggressive"]["require_predictive_validation"] is False
+    assert rules.profiles["high_hit"]["require_predictive_validation"] is True
+    assert rules.profiles["standard"]["require_predictive_validation"] is True
+    assert rules.profiles["higher_payout"]["require_predictive_validation"] is False
 
 
 def test_safe_profile_takes_the_most_likely_single_that_still_pays():
@@ -449,8 +450,9 @@ def _version(store, family: str, version: str, when: datetime, validation: dict 
 
 def test_the_family_chosen_on_validation_serves_1x2_and_carries_its_status(store, import_sts):
     event = store.rows("SELECT * FROM events WHERE home LIKE 'Real Madrid%'")[0]
-    elo = _version(store, "elo_ordered_draw", "elo-test", NOW)
-    dc = _version(store, "dixon_coles_goals", "dc-test", NOW)
+    # TASK 007: only protocol v2 versions (decided on the selection window) carry statuses
+    elo = _version(store, "elo_ordered_draw", "elo-test", NOW, {"protocol": "v2"})
+    dc = _version(store, "dixon_coles_goals", "dc-test", NOW, {"protocol": "v2"})
     for version, home, when in ((elo, 0.5, NOW), (dc, 0.4, NOW + timedelta(minutes=5))):
         save_prediction(
             store,
@@ -477,6 +479,7 @@ def test_the_family_chosen_on_validation_serves_1x2_and_carries_its_status(store
         "dc-test-2",
         NOW + timedelta(minutes=1),
         {
+            "protocol": "v2",
             "elo_version_id": elo,
             "elo_predictive": {
                 "1x2": {"status": VALIDATED},
@@ -489,6 +492,14 @@ def test_the_family_chosen_on_validation_serves_1x2_and_carries_its_status(store
     assert served["uncertainty"]["predictive_status"] == VALIDATED
     derived = derive_from_1x2(served, "double_chance")
     assert derived["uncertainty"]["predictive_status"] == "experimental"  # its own status
+    # a protocol v1 version: its stored status was chosen on a used holdout → suspended
+    old = _version(store, "elo_ordered_draw", "elo-v1", NOW - timedelta(days=9))
+    row = {**preferred[key], "model_version_id": old, "validation": {}}
+    row["uncertainty"] = {**row["uncertainty"], "predictive_status": VALIDATED}
+    suspended = services.with_predictive_status(store, {key: row})[key]
+    assert suspended["uncertainty"]["predictive_status"] == "experimental"
+    assert suspended["uncertainty"]["stored_status"] == VALIDATED
+    assert "holdout" in suspended["uncertainty"]["status_note"].lower()
 
 
 def test_double_chance_from_1x2_has_its_own_status_and_conservative_bounds():

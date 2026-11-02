@@ -70,6 +70,10 @@ class AppSettings:
     api_sports_enabled: bool = True  # needs the user's own free API_SPORTS_KEY
     pitchapi_enabled: bool = True  # results + match statistics, user's PITCHAPI_KEY
     stats_requests_per_run: int = 60  # polite cap for match statistics per analysis
+    # Optional language layer (TASK 007 §7): a free LOCAL model (Ollama), off by default.
+    llm_enabled: bool = False
+    llm_model: str = "hf.co/speakleash/Bielik-11B-v2.3-Instruct-GGUF:Q4_K_M"
+    llm_url: str = "http://127.0.0.1:11434"  # only this computer is ever accepted
 
 
 def local_secret(name: str, root: Path | None = None) -> str | None:

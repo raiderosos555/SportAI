@@ -58,13 +58,25 @@ DERIVED_FROM_1X2 = {
 def derive_from_1x2(prediction: dict, market_key: str) -> dict:
     """Double chance from the same 1X2 forecast; interval bounds are added (conservative).
 
-    A model that calibrated the derived market separately (Dixon–Coles) ships its calibrated
-    values and status inside the 1X2 row; those are used as they are.
+    Dixon–Coles ships its double chance inside the 1X2 row: since TASK 007 it is derived
+    from the final 1X2 (P(1X) = 1 − P(2)); older rows calibrated every side separately, so
+    their drift from 1 − P(excluded outcome) is measured and too large a drift blocks them.
     """
     shipped = (prediction["uncertainty"].get("derived") or {}).get(market_key)
     if shipped:
+        base = prediction["probabilities"]
         return {
             **prediction,
+            # forecasts before TASK 007 calibrated every side separately: measure how far
+            # they drift from 1 − P(excluded outcome) of the same 1X2 forecast
+            "coherence_gap": max(
+                (
+                    abs(p - (1 - base[EXCLUDED[sel]]))
+                    for sel, p in shipped["calibrated"].items()
+                    if EXCLUDED.get(sel) in base
+                ),
+                default=0.0,
+            ),
             "probabilities": shipped["calibrated"],
             "uncertainty": {
                 **prediction["uncertainty"],
@@ -107,6 +119,36 @@ def derive_from_1x2(prediction: dict, market_key: str) -> dict:
     }
 
 
+EXCLUDED = {"home_draw": "away", "draw_away": "home", "home_away": "draw"}
+SUM_TOLERANCE = 1e-3  # rounding only: exclusive outcomes sum to one, double chance to two
+DERIVED_SUM = {"double_chance": 2.0}
+
+
+def market_problem(prediction: dict, market_key: str) -> str | None:
+    """Why the probabilities of one market cannot be trusted (None = consistent)."""
+    probs = prediction["probabilities"]
+    if any(not isinstance(v, int | float) or not 0.0 <= v <= 1.0 for v in probs.values()):
+        return "prawdopodobieństwo poza zakresem 0–1"
+    gap = prediction.get("coherence_gap") or 0.0
+    if gap > SUM_TOLERANCE:
+        return f"podwójna szansa niezgodna z 1X2 tego samego modelu (różnica {gap:.1%})"
+    expected = DERIVED_SUM.get(market_key, 1.0)
+    complete = COMPLETE_SETS.get(market_key) or set(DERIVED_FROM_1X2.get(market_key, {}))
+    if complete and set(probs) == complete:
+        total = sum(probs.values())
+        if abs(total - expected) > SUM_TOLERANCE:
+            return f"suma prawdopodobieństw {total:.3f} zamiast {expected:.0f}"
+    return None
+
+
+def consistent_interval(p: float | None, low: float | None, high: float | None) -> bool:
+    """0 ≤ P_low ≤ P ≤ P_high ≤ 1 (a small tolerance only for floating-point noise)."""
+    if p is None or low is None or high is None:
+        return False
+    eps = 1e-9
+    return -eps <= low <= p + eps and p - eps <= high <= 1 + eps
+
+
 def break_even_probability(odds: Decimal, stake_tax_rate: Decimal) -> float:
     """Win probability at which net EV is zero: 1 / (odds × (1 − stake tax)).
 
@@ -116,27 +158,32 @@ def break_even_probability(odds: Decimal, stake_tax_rate: Decimal) -> float:
 
 
 def calibration_note(prediction: dict | None, p: float | None) -> str:
-    """How often holdout forecasts in the same probability bin came true (1X2 outcomes)."""
+    """How often out-of-sample forecasts in the same probability bin came true: the
+    selection window of protocol v2, the holdout of older versions."""
     if prediction is None or p is None:
         return "—"
+    validation = prediction["validation"]
+    v2 = validation.get("protocol") == "v2"
+    where = "okno selekcji" if v2 else "holdout"
     family = prediction["uncertainty"].get("family")
-    ranges = ((prediction["validation"].get("families") or {}).get(family) or {}).get("ranges")
+    ranges = ((validation.get("families") or {}).get(family) or {}).get("ranges")
     if ranges:
         for row in ranges:
             low, high = (float(x.strip("%")) / 100 for x in row["range"].split("–"))
             if row["n"] and low <= p < high + (1e-9 if high == 1.0 else 0):
                 lo, hi = row["ci95"]
                 return (
-                    f"holdout {row['range']}: trafione {row['freq']:.0%} "
+                    f"{where} {row['range']}: trafione {row['freq']:.0%} "
                     f"(95%: {lo:.0%}–{hi:.0%}, n={row['n']})"
                 )
-        return "brak prognoz holdoutu w tym przedziale"
+        return f"brak prognoz ({where}) w tym przedziale"
     if prediction.get("derived_from"):
         return "prognoza pochodna z 1X2 — bez osobnej kalibracji"
-    for row in (prediction["validation"].get("holdout") or {}).get("reliability", []):
+    sample = (validation.get("decision") if v2 else validation.get("holdout")) or {}
+    for row in sample.get("reliability", []):
         if row["n"] and row["low"] <= p < row["high"]:
             return (
-                f"holdout {row['low']:.0%}–{row['high']:.0%}: trafione {row['freq']:.0%} "
+                f"{where} {row['low']:.0%}–{row['high']:.0%}: trafione {row['freq']:.0%} "
                 f"(n={row['n']})"
             )
     return "brak danych kalibracji w tym przedziale"
@@ -189,6 +236,8 @@ class Candidate:
     break_even: float | None = None  # win probability needed for zero net EV (STS tax)
     calibration: str = "—"
     odds_age_hours: float | None = None
+    probability_ok: bool = True  # False: inconsistent bounds — never ranked, never in a coupon
+    status_note: str = ""  # why a stored status is suspended (TASK 007 protocol v2)
     document_at: str | None = None  # time printed in the STS document of this price
     fetched_at: str | None = None  # download time (None for a manually supplied file)
     market_label: str = ""
@@ -352,6 +401,7 @@ def _candidate(
     if rules_status != "zweryfikowane":
         unproven.append("Zasady rozliczenia rynku STS niezweryfikowane")
     p_model = p_low = p_high = None
+    probability_ok = True
     model_name = model_version_id = None
     model_status = "brak prognozy"
     ev_gross = ev_net_value = ev_net_low = None
@@ -363,20 +413,34 @@ def _candidate(
         model_version_id = prediction["model_version_id"]
         model_status = prediction["version_status"]
         p_model = prediction["probabilities"].get(selection)
+        problem = market_problem(prediction, row["market_key"])
+        if problem:
+            blocking.append(f"Niespójne prawdopodobieństwa rynku: {problem} — poza rankingiem")
+            probability_ok = False
         interval = prediction["uncertainty"].get("interval", {}).get(selection)
-        if interval:
+        if interval and probability_ok:
             p_low, p_high = interval
+            if not consistent_interval(p_model, p_low, p_high):
+                # e.g. bounds computed before a normalisation (forecasts before TASK 007)
+                blocking.append(
+                    "Niespójny przedział prawdopodobieństwa (P_low ≤ P ≤ P_high nie zachodzi)"
+                    " — selekcja wyłączona z rankingu"
+                )
+                probability_ok = False
+                p_low = p_high = None
         validation = prediction["validation"]
-        holdout = validation.get("holdout") or {}
+        v2 = validation.get("protocol") == "v2"
+        sample = (validation.get("decision") if v2 else validation.get("holdout")) or {}
         validation_text = (
-            f"holdout n={holdout.get('n')}, log loss={holdout.get('log_loss')}, "
-            f"ECE={holdout.get('ece')}, rynek: {validation.get('beats_market')}"
+            f"{'okno selekcji' if v2 else 'holdout'} n={sample.get('n')}, "
+            f"log loss={sample.get('log_loss')}, ECE={sample.get('ece')}, "
+            f"rynek: {validation.get('beats_market')}"
         )
         if policy.require_validated_model and model_status != "validated":
             unproven.append("Model bez zatwierdzonej walidacji — dodatnie EV nie jest przewagą")
         if p_model is None:
             blocking.append("Prognoza nie obejmuje tej selekcji")
-        if p_low is None:
+        if p_low is None and probability_ok:
             unproven.append("Brak oszacowania niepewności prognozy")
     if p_model is not None:
         ev_gross = binary_ev(p_model, float(odds))
@@ -475,6 +539,8 @@ def _candidate(
             else "brak prognozy"
         ),
         odds_age_hours=age_hours,
+        probability_ok=probability_ok,
+        status_note=(prediction["uncertainty"].get("status_note", "") if prediction else ""),
         document_at=row.get("valid_at"),
         fetched_at=row.get("fetched_at"),
         market_label=market_label(row["market_key"], row["period"], row["line"]),

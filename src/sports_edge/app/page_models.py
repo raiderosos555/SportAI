@@ -7,8 +7,10 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge import learning
 from sports_edge.app import common as c
 from sports_edge.app import ui
+from sports_edge.app.page_learning import learning_panel
 from sports_edge.app.pages_models import _data, _forecasts, _models, _results
 from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.models.registry import model_overview
@@ -36,7 +38,12 @@ def models_page() -> None:
         "Modele i statystyki", "Jakie modele działają, dla kogo i jak bardzo można im ufać"
     )
     # a view switch instead of tabs: only the chosen view is computed (tabs run all bodies)
-    views = {"Podstawowy": _basic, "Pokrycie oferty": _coverage, "Zaawansowany": _advanced}
+    views = {
+        "Podstawowy": _basic,
+        "Uczenie AI": learning_panel,
+        "Pokrycie oferty": _coverage,
+        "Zaawansowany": _advanced,
+    }
     view = st.segmented_control("Widok", list(views), default="Podstawowy", key="models_view")
     views[view or "Podstawowy"]()
 
@@ -59,12 +66,19 @@ def _basic() -> None:
         leagues = ", ".join(COMPETITIONS[code].name for code in scope if code in COMPETITIONS)
         one_x_two = preference.get(("1x2", scope[0]), ELO_FAMILY)
         ui.section(SCOPE_LABELS[name].capitalize(), leagues)
+        suspended = report.get("protocol") != "v2"
+        if suspended:
+            ui.explanation(
+                "Statusy zawieszone (protokół v1)",
+                [learning.HOLDOUT_NOTE, "Nowe wersje (protokół v2) czekają w panelu Uczenie AI."],
+                tone="warn",
+            )
         cards = []
         for family, label in FAMILIES.items():
             info, model = _family_info(report, family, one_x_two)
             if info is None:
                 continue
-            validated = info.get("status") == "validated_predictive"
+            validated = info.get("status") == "validated_predictive" and not suspended
             ranges = _ranges(report, family, model)
             text = [
                 "Model: " + ("Elo (siła drużyn)" if model == "elo" else "Dixon–Coles (gole)"),

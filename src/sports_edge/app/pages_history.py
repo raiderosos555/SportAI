@@ -1,6 +1,7 @@
 """Historia i wyniki: analyses, virtual coupons, results, settlement, ROI, drawdown, CLV."""
 
 import json
+from datetime import datetime
 from decimal import Decimal
 
 import pandas as pd
@@ -10,6 +11,7 @@ from sports_edge import insights as ins
 from sports_edge.app import common as c
 from sports_edge.app import ui
 from sports_edge.bookmakers import load_profiles
+from sports_edge.forecast_quality import coupon_review
 from sports_edge.paper import (
     MODES,
     closing_line_value,
@@ -319,11 +321,23 @@ def _overview(db) -> None:
             if coupon["outcome"]
             else "czeka na wyniki"
         )
+        review = ""
+        if coupon["outcome"] in {"win", "loss"}:  # ANALIZA WYNIKU KUPONU (TASK 007)
+            judged = {
+                **coupon,
+                "proposal": {
+                    **payload,
+                    "legs": [{**leg, "outcome": outcomes.get(leg["odds_id"])} for leg in legs],
+                },
+            }
+            review = ui.bullets(coupon_review(judged)[:4])
         cards.append(
             ui.card(
                 f"<b>{ui.esc(payload.get('label', coupon['profile']))}</b> · "
                 f"{ui.esc(c.local_time(coupon['first_start_at'], '%d.%m.%Y'))}<br>"
                 + ui.pill(label, tone)
+                + ui.pill(*kind_label(coupon, c.now()))
+                + review
                 + ui.key_values(
                     [
                         ("Zdarzenia", str(len(legs))),
@@ -336,6 +350,19 @@ def _overview(db) -> None:
             )
         )
     ui.card_grid(cards, wide=False)
+
+
+def kind_label(coupon: dict, now) -> tuple[str, str]:
+    """Which kind of saved coupon this is (TASK 007): settled, real, current or historical."""
+    if coupon["outcome"]:
+        return "Rozliczony", "neutral"
+    if coupon["mode"] == "real_manual":
+        return "Rzeczywisty (wpis ręczny)", "info"
+    if datetime.fromisoformat(coupon["first_start_at"]) > now:
+        if coupon["mode"] == "paper_manual":
+            return "Zapisany wirtualny (Mój kupon)", "info"
+        return "Bieżący kandydat", "info"
+    return "Historyczny — czeka na wyniki", "warn"
 
 
 def _pct(value, digits: int = 0) -> str:

@@ -6,8 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge.app import cart, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
 from sports_edge.performance import builder_coupons
 from sports_edge.repository import imports, offer_days
 from sports_edge.services import (
@@ -19,7 +19,7 @@ from sports_edge.services import (
     saved_proposals,
 )
 
-PROFILE_ORDER = ("safe", "balanced", "aggressive")
+PROFILE_ORDER = ("high_hit", "standard", "higher_payout", "tasiemka")
 OUTCOME = {"win": ("Trafiony", "ok"), "loss": ("Nietrafiony", "bad")}
 
 
@@ -54,6 +54,12 @@ def dashboard_page() -> None:
     forecast = {x.event_id for x in candidates if x.p_model is not None}
     label = "Dziś" if day == today else c.day_label(day)
 
+    cart.flash()
+    ui.section(
+        f"{label} w ofercie STS",
+        c.day_label(day)
+        + ("" if day == today else " — na dziś brak oferty, pokazano kolejny dzień"),
+    )
     ui.metric_cards(
         [
             (f"Wydarzenia STS — {label}", str(len(events)), f"{offer['markets']} rynków w ofercie"),
@@ -83,10 +89,21 @@ def dashboard_page() -> None:
     if not offer["fresh"]:
         ui.pills([(_offer_hint(offer), "warn")])
 
-    ui.section("Najlepsze prognozy", "przyszłe mecze z najwyższą ostrożną szansą typu")
-    picks = _best_picks(days, today, now, max_odds)
+    picks = _best_picks(days, today, now, max_odds)[:6]
+    starts = sorted((p["candidate"].start_at or "")[:10] for p in picks)
+    span = (
+        c.day_label(starts[0])
+        + (f" – {c.day_label(starts[-1])}" if starts[-1] != starts[0] else "")
+        if starts
+        else "kolejne dni oferty"
+    )
+    ui.section("Najlepsze prognozy", f"mecze {span} · najwyższa ostrożna szansa typu")
     if picks:
-        ui.card_grid([_pick_card(p, now) for p in picks[:5]])
+        columns = st.columns(3)
+        for i, pick in enumerate(picks):
+            with columns[i % 3]:
+                st.markdown(_pick_card(pick, now), unsafe_allow_html=True)
+                cart.add_button(pick["candidate"], day=pick["day"], key=f"dash_add_{i}")
     else:
         ui.empty_state(
             "Brak wystarczająco wiarygodnych typów",
@@ -142,6 +159,7 @@ def _best_picks(days: list[str], today: str, now, max_odds: float) -> list[dict]
             pick = ins.best_pick(rows, now=now, max_odds=max_odds)
             if pick:
                 pick["rows"] = rows
+                pick["day"] = day
                 out.append(pick)
         if len(out) >= 5:
             break

@@ -137,6 +137,12 @@ PAGES = {
     "historia": "from sports_edge.app.pages_history import history_page; history_page()",
     "modele": "from sports_edge.app.page_models import models_page; models_page()",
     "zrodla": "from sports_edge.app.page_sources import sources_page; sources_page()",
+    "moj_kupon": "from sports_edge.app.page_my_coupon import my_coupon_page; my_coupon_page()",
+    "generator": "from sports_edge.app.page_generator import generator_page; generator_page()",
+    "tasiemka": "from sports_edge.app.page_generator import tasiemka_page; tasiemka_page()",
+    "budzet": "from sports_edge.app.page_simulators import budget_page; budget_page()",
+    "historyczny": "from sports_edge.app.page_simulators import historical_page; historical_page()",
+    "uczenie": "from sports_edge.app.page_learning import learning_page; learning_page()",
 }
 
 

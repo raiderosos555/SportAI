@@ -6,8 +6,8 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge.app import cart, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
 from sports_edge.repository import offer_days
 from sports_edge.services import (
     RANGES,
@@ -20,11 +20,17 @@ from sports_edge.services import (
     saved_proposals,
 )
 
-PROFILE_ORDER = ("safe", "balanced", "aggressive")
+PROFILE_ORDER = ("high_hit", "standard", "higher_payout", "tasiemka")
 PROFILE_TEXT = {
-    "safe": "Priorytet: możliwie najwyższa szansa trafienia, mało selekcji, dopuszczalne SOLO.",
-    "balanced": "Kompromis między szansą trafienia a wypłatą, niewielka liczba selekcji.",
-    "aggressive": "Wyższy kurs i niższa szansa trafienia — wyraźnie zwiększone ryzyko.",
+    "high_hit": "Kurs 1,25–1,60: najwyższa szansa trafienia, preferowany SOLO.",
+    "standard": "Kurs 1,80–2,20: główny profil — szansa i wypłata w równowadze.",
+    "higher_payout": "Kurs 2,50–4,00: wyższa wypłata za wyraźnie niższą szansę.",
+    "tasiemka": "Kurs 8–12: najmniejsza uzasadniona liczba zdarzeń; zwykle brak, gdy dane "
+    "nie pozwalają.",
+    # profiles of coupons saved before TASK 007
+    "safe": "Profil sprzed TASK 007 (Bezpieczny).",
+    "balanced": "Profil sprzed TASK 007 (Zrównoważony).",
+    "aggressive": "Profil sprzed TASK 007 (Agresywny).",
 }
 PHASES = (
     "Pobieranie danych",
@@ -216,6 +222,7 @@ def _day(db, settings, rules, day, run, online) -> None:
         explanation = ins.explain_no_coupon(candidates, builder, offer, now=now, max_odds=max_odds)
         _no_coupon(explanation, day, run is not None, online)
         return
+    by_odds = {x.odds_id: x for x in candidates}
     columns = st.container(key=f"cards-{day}").columns(len(rules.profiles))
     for col, name in zip(columns, rules.profiles, strict=True):
         with col:
@@ -230,6 +237,18 @@ def _day(db, settings, rules, day, run, online) -> None:
                     for a in alternatives.get(name, ())
                 ],
             )
+            payload = proposals.get(name)
+            legs = [by_odds.get(leg["odds_id"]) for leg in (payload or {}).get("legs", [])]
+            if payload and all(legs):
+                st.button(
+                    cart.ADD_LABEL,
+                    key=f"to_cart_{day}_{name}",
+                    icon=":material/add_shopping_cart:",
+                    on_click=cart.add_many,
+                    args=([(x, day) for x in legs],),
+                    help="Przenosi typy tej propozycji do Mojego kuponu (do oceny lub zmian)",
+                    width="stretch",
+                )
 
 
 def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool) -> None:
@@ -265,11 +284,16 @@ def _card(name, profile, payload, refusal, coupon_id, alternatives) -> None:
             f'<p class="se-desc">{ui.esc(PROFILE_TEXT.get(name, ""))}</p>',
             unsafe_allow_html=True,
         )
+        span = (
+            f"kurs {ins.num(profile['min_total_odds'])}–{ins.num(profile['max_total_odds'])}"
+            if profile.get("max_total_odds")
+            else f"kurs ≥ {ins.num(profile['min_total_odds'])}"
+        )
+        floor = profile.get("min_coupon_probability")
         st.caption(
-            f"do {profile['max_legs']} selekcji · każda ≥ "
-            f"{ins.pct(profile['min_leg_probability'], 0)} ostrożnie · kurs ≥ "
-            f"{ins.num(profile['min_total_odds'])} · zysk ≥ "
-            f"{ins.pct(profile['min_net_profit_share'], 0)} stawki"
+            f"{span} · do {profile['max_legs']} selekcji · każda ≥ "
+            f"{ins.pct(profile['min_leg_probability'], 0)} ostrożnie"
+            + (f" · kupon ≥ {ins.pct(floor, 0)} ostrożnie" if floor else "")
         )
         if payload is None:
             st.markdown(ui.pill("Brak propozycji", "neutral"), unsafe_allow_html=True)
@@ -386,8 +410,12 @@ def _pool(days: list[str], rules) -> None:
     rows = []
     for day in days:
         _report, candidates = c.day_candidates(day)
-        rows += ins.candidate_groups(candidates, now=now, max_odds=max_odds)
+        rows += [
+            {**group, "offer_day": day}
+            for group in ins.candidate_groups(candidates, now=now, max_odds=max_odds)
+        ]
     rows = [r for r in rows if r["candidate"].event_status == "before_start" or r["group"] == "C"]
+    cart.flash()
     if not rows:
         ui.empty_state("Brak typów z prognozą", "Dla wybranych dni modele nie mają prognoz.")
         return
@@ -437,7 +465,7 @@ def _pool(days: list[str], rules) -> None:
             if not subset:
                 st.caption("Brak typów w tej grupie przy wybranych filtrach.")
                 continue
-            st.dataframe(
+            table = st.dataframe(
                 pd.DataFrame(
                     [
                         {
@@ -468,6 +496,19 @@ def _pool(days: list[str], rules) -> None:
                     "Ostrożnie": st.column_config.NumberColumn(format="%.1f%%"),
                     "Kurs": st.column_config.NumberColumn(format="%.2f"),
                 },
+                on_select="rerun",
+                selection_mode="multi-row",
+                key=f"pool_table_{key}",
+            )
+            picked = [subset[i] for i in table.selection.rows if i < len(subset)]
+            st.button(
+                f"{cart.ADD_LABEL} ({len(picked)})",
+                key=f"pool_add_{key}",
+                icon=":material/add_shopping_cart:",
+                disabled=not picked,
+                on_click=cart.add_many,
+                args=([(r["candidate"], r["offer_day"]) for r in picked],),
+                help="Zaznacz wiersze tabeli, aby dodać typy do Mojego kuponu",
             )
             if len(subset) > 200:
                 st.caption(f"Pokazano 200 z {len(subset)} — zawęź filtry.")

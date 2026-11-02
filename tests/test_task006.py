@@ -328,15 +328,16 @@ def test_each_scope_serves_its_own_versions_and_wide_experiments_stay_unserved(s
 
 
 def test_the_validated_model_serves_1x2_when_only_one_passed(store):
-    def goals(name, scope, elo_ok, dc_ok, served):
+    def goals(name, scope, elo_ok, dc_ok, served, protocol="v2", when=NOW):
         status = {True: "validated_predictive", False: "experimental"}
         _version(
             store,
             "dixon_coles_goals",
             name,
-            NOW,
+            when,
             scope,
             {
+                "protocol": protocol,
                 "elo_predictive": {"1x2": {"status": status[elo_ok]}},
                 "predictive": {"1x2": {"status": status[dc_ok]}},
                 "markets_served": served,
@@ -349,6 +350,17 @@ def test_the_validated_model_serves_1x2_when_only_one_passed(store):
     assert preference[("1x2", "es.1")] == "elo_ordered_draw"  # both passed: lower log loss
     assert preference[("1x2", "en.2")] == "dixon_coles_goals"  # only DC passed
     assert preference["1x2"] == "elo_ordered_draw"
+    # TASK 007: statuses of a protocol v1 report (chosen on a used holdout) never decide
+    goals(
+        "ext-v1",
+        services.EXTENDED_COMPETITIONS,
+        False,
+        True,
+        ["total"],
+        "v1",
+        NOW + timedelta(days=1),
+    )
+    assert services.prediction_preference(store)[("1x2", "en.2")] == "elo_ordered_draw"
 
 
 class _History:

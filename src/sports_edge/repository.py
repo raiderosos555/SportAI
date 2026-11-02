@@ -234,16 +234,17 @@ def archived_summary(store: Store) -> list[dict]:
     )
 
 
-def _coverage(store: Store) -> list[dict]:
+def _coverage(store: Store, as_of: str | None = None) -> list[dict]:
     """STS imports with offer kind, document time and the offer dates they cover.
 
-    Empty documents (no rows at all) never prove that a market was withdrawn.
+    Empty documents (no rows at all) never prove that a market was withdrawn. ``as_of``:
+    only documents the application had received by then (historical simulation).
     """
     out = []
     for row in store.rows(
         "SELECT id, offer_kind, generated_at, ingested_at, summary_json FROM imports "
-        "WHERE bookmaker_id=? AND rows_total > 0",
-        (BOOKMAKER,),
+        "WHERE bookmaker_id=? AND rows_total > 0 AND (? IS NULL OR ingested_at<=?)",
+        (BOOKMAKER, as_of, as_of),
     ):
         dates = set(json.loads(row["summary_json"]).get("offer_dates", []))
         out.append({**row, "dates": dates})
@@ -324,10 +325,13 @@ def freshness(valid_at: str | None, start_at: str | None, now: datetime, max_age
     return {"fresh": "fresh", "unconfirmed": "stale"}.get(status, "unknown")
 
 
-def latest_result_status(store: Store) -> dict[str, str]:
-    """Newest recorded result status per STS event."""
+def latest_result_status(store: Store, as_of: str | None = None) -> dict[str, str]:
+    """Newest recorded result status per STS event (recorded by ``as_of`` when given)."""
     out: dict[str, tuple[str, str]] = {}
-    for row in store.rows("SELECT event_id, status, recorded_at, id FROM results"):
+    for row in store.rows(
+        "SELECT event_id, status, recorded_at, id FROM results WHERE (? IS NULL OR recorded_at<=?)",
+        (as_of, as_of),
+    ):
         key = (row["recorded_at"], row["id"])
         if row["event_id"] not in out or key > out[row["event_id"]][0]:
             out[row["event_id"]] = (key, row["status"])
@@ -340,17 +344,24 @@ def offer_table(
     day: str | None = None,
     include_review: bool = True,
     data_kinds: tuple[str, ...] = ("prospective", "archive"),
+    as_of: datetime | None = None,
 ) -> list[dict]:
     """Latest STS quote per market (document time, then ingestion), selections pivoted.
 
     ``presence`` is 'withdrawn' when a newer document of the same offer kind covering the
     event's date no longer lists the market; such prices must not be analysed as current.
+    ``as_of`` (historical simulator, TASK 007): only prices, documents and results the
+    application had received by then — no later price can leak into a past decision.
     """
     where = [f"i.data_kind IN ({','.join('?' for _ in data_kinds)})", "e.bookmaker_id=?"]
     params: list = [*data_kinds, BOOKMAKER]
     if day:
         where.append("e.offer_date=?")
         params.append(day)
+    known = as_of.isoformat() if as_of is not None else None
+    if known is not None:
+        where.append("q.ingested_at<=?")
+        params.append(known)
     sql = f"""
       SELECT e.id event_id, e.bookmaker_id, e.sport, e.sport_raw, e.league, e.country, e.home,
              e.away, e.participants_json, e.name_raw, e.start_at, e.offer_date,
@@ -385,8 +396,8 @@ def offer_table(
             "odds_id": o["odds_id"],
             "selection_id": o["selection_id"],
         }
-    coverage = _coverage(store)
-    results = latest_result_status(store)
+    coverage = _coverage(store, known)
+    results = latest_result_status(store, known)
     result = []
     for row in latest.values():
         row = dict(row)

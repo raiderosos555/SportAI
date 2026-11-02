@@ -1,10 +1,11 @@
 """Ustawienia: STS download, import, data sources, tax profile and rules, local data."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pandas as pd
 import streamlit as st
 
+from sports_edge import llm
 from sports_edge.app import common as c
 from sports_edge.backup import create_backup, list_backups
 from sports_edge.bookmakers import load_profiles, load_rules
@@ -89,7 +90,33 @@ def _sts() -> None:
         "openfootball — ponowny odczyt plików bieżącego sezonu (CC0)",
         value=settings.openfootball_update_enabled,
     )
+    st.markdown(
+        "**Lokalny model AI do objaśnień kuponu** — bezpłatny, działa na tym komputerze "
+        "(Ollama), domyślnie wyłączony"
+    )
+    llm_on = st.toggle(
+        "Objaśnienia „Rozwiń odpowiedź” przez lokalny model (każde pytanie tylko po kliknięciu)",
+        value=settings.llm_enabled,
+    )
+    known = [code for code, _label in llm.ALTERNATIVES]
+    model = st.selectbox(
+        "Model",
+        known + ([settings.llm_model] if settings.llm_model not in known else []),
+        index=(known + [settings.llm_model]).index(settings.llm_model),
+        format_func=lambda code: dict(llm.ALTERNATIVES).get(code, code),
+    )
+    st.caption(
+        "Jednorazowo: zainstaluj Ollamę z ollama.com (Windows), potem w terminalu "
+        f"`ollama pull {model}`. Bielik to polski model SpeakLeash (licencja Apache 2.0 + "
+        "warunki bielik.ai/terms). Dane kuponu nie opuszczają komputera — aplikacja łączy się "
+        "wyłącznie z 127.0.0.1. Bez modelu działa wbudowany objaśniacz szablonowy."
+    )
+    if st.button("Sprawdź lokalny model", icon=":material/memory:"):
+        probe = replace(settings, llm_enabled=True, llm_model=model)
+        usable, why = llm.available(probe)
+        (st.success if usable else st.info)("Lokalny model gotowy." if usable else why)
     if st.button("Zapisz ustawienia"):
+        settings.llm_enabled, settings.llm_model = llm_on, model
         settings.offline_mode, settings.sts_download_enabled = offline, sts
         settings.retain_raw_pdf, settings.nominal_stake = retain, stake
         settings.max_quote_age_minutes, settings.match_tolerance_minutes = int(age), int(tolerance)

@@ -175,6 +175,7 @@ def probable_ranking(candidates: Sequence[Candidate], policy: Policy) -> tuple[C
         c
         for c in candidates
         if c.p_model is not None
+        and c.probability_ok
         and c.p_model >= policy.probable_min_probability
         and c.event_status == "before_start"
         and c.data_status == "ok"

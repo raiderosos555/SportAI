@@ -192,10 +192,28 @@ def day_candidates(day: str):
     return cached_day(db, data_version(db), day, minute(), data_kinds())
 
 
-def offer_day_choice(days: list[str], label: str = "Dzień", key: str | None = None) -> str:
+def upcoming_days(days: list[str]) -> list[str]:
+    """Offer days that still have at least one event before its start."""
+    found = {
+        r["offer_date"]
+        for r in store().rows(
+            "SELECT DISTINCT offer_date FROM events WHERE bookmaker_id='sts' AND start_at>?",
+            (now().isoformat(),),
+        )
+    }
+    return [d for d in days if d in found]
+
+
+def offer_day_choice(
+    days: list[str], label: str = "Dzień", key: str | None = None, *, upcoming: bool = False
+) -> str:
+    """Day selector; ``upcoming``: start on the first day with matches still to play."""
     today = str(today_local())
     future = [d for d in days if d >= today]
     default = today if today in days else (future[0] if future else days[-1])
+    if upcoming:
+        ahead = upcoming_days(days)
+        default = ahead[0] if ahead else default
     return st.selectbox(label, days, index=days.index(default), key=key, format_func=day_label)
 
 

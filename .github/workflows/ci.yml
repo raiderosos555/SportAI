@@ -17,5 +17,15 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff check .
       - run: python -m ruff format --check .
-      - run: python -m pytest
+      - run: python -m pytest --junitxml=artifacts/qa/junit.xml
       - run: sports-edge demo
+      # TASK 007 §28: UI paths on SYNTHETIC data + library versions; never a database or keys
+      - if: always() && matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        run: python -m sports_edge.qa artifacts/qa
+      - if: always() && matrix.os == 'ubuntu-latest' && matrix.python == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qa-report
+          path: artifacts/qa
+          if-no-files-found: warn
+          retention-days: 14

@@ -1,11 +1,13 @@
-"""Intelligent Coupon Builder (TASK 005): probability-first STS coupons.
+"""Intelligent Coupon Builder (TASK 005, profiles of TASK 007): probability-first STS coupons.
 
-For every profile (safe / balanced / aggressive) the builder searches all combinations of
-the best eligible selections and keeps the one with the highest CONSERVATIVE probability of
-winning the whole coupon that satisfies the profile: number of legs, minimum leg
-probability, minimum total odds and net profit on a win after the STS stake coefficient and
-payout tax. Fewer legs win ties; a coupon that does not return more than the stake is never
-proposed.
+For every profile the builder searches combinations of the best eligible selections and
+keeps the one with the highest CONSERVATIVE probability of winning the whole coupon that
+satisfies the profile: total odds range, number of legs, minimum leg probability, minimum
+coupon probability and net profit on a win after the STS stake coefficient and payout tax.
+Fewer legs win ties (a profile may prefer SOLO within a small tolerance); a coupon that does
+not return more than the stake is never proposed. Small searches are exhaustive; long
+accumulators (TASIEMKA) use dynamic programming over log-odds (one leg per match). A profile
+that the data cannot satisfy produces no coupon — thresholds are never lowered.
 
 Joint probability: legs always come from different matches and the product of marginals is
 used under the explicit assumption that different matches are independent. Two markets of
@@ -20,16 +22,16 @@ from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
 from itertools import combinations
-from math import prod
+from math import comb, log, prod
 
 from sports_edge.analysis.edge_engine import Candidate
 from sports_edge.settlement import CostProfile, Outcome, settle
 
 VALIDATED = "validated_predictive"
 JOINT_BASIS = (
-    "iloczyn prawdopodobieństw różnych meczów (założenie niezależności; na holdoucie pary "
-    "meczów jednego dnia trafiały razem tak często, jak wynika z ich osobnych trafności — "
-    "stosunek ≈ 1,00)"
+    "PRZYBLIŻENIE: iloczyn prawdopodobieństw różnych meczów przy założeniu niezależności. "
+    "Test par meczów jednego dnia (bootstrap blokowy po dniach) nie wykazał zależności, ale "
+    "tego nie dowodzi — rzeczywista szansa kuponu AKO może być inna"
 )
 
 
@@ -62,6 +64,7 @@ class BuilderReport:
     pool: tuple[Candidate, ...]
     excluded: dict[str, int] = field(default_factory=dict)
     # why a profile has no coupon: no_candidates | not_validated | low_probability | payout
+    # (odds outside the profile range or too little net profit) | coupon_probability
     refusal_codes: dict[str, str] = field(default_factory=dict)
     alternatives: dict[str, tuple[Proposal, ...]] = field(default_factory=dict)
 
@@ -70,6 +73,8 @@ def eligibility(candidate: Candidate, max_odds: float) -> str | None:
     """Why a selection cannot enter any coupon (None = eligible)."""
     if candidate.p_model is None:
         return "brak prognozy modelu"
+    if not candidate.probability_ok:
+        return "niespójne prawdopodobieństwo (przedział nie obejmuje wartości)"
     if candidate.p_low is None:
         return "brak konserwatywnego oszacowania"
     if candidate.event_status != "before_start":
@@ -116,8 +121,12 @@ def build_coupons(
     ]
     pool = tuple(sorted(alternatives, key=_strength, reverse=True)[: int(builder["candidates"])])
     proposals, refusals, codes, alternatives = {}, {}, {}, {}
+    wide = tuple(
+        sorted(alternatives, key=_strength, reverse=True)[: int(builder.get("long_candidates", 0))]
+    )
     for name, profile in policy.profiles.items():
-        likely = [c for c in pool if c.p_low >= float(profile["min_leg_probability"])]
+        source = wide if int(profile["max_legs"]) > 4 and wide else pool
+        likely = [c for c in source if c.p_low >= float(profile["min_leg_probability"])]
         legs = [
             c
             for c in likely
@@ -126,10 +135,25 @@ def build_coupons(
         ranked = _optimise(legs, profile, cost=cost, on_date=on_date, stake=stake)
         if not ranked:
             proposals[name] = None
-            refusals[name] = _refusal(legs, profile)
+            floor = profile.get("min_coupon_probability")
+            in_range = (
+                floor is not None
+                and legs
+                and _optimise(
+                    legs,
+                    {**profile, "min_coupon_probability": 0},
+                    cost=cost,
+                    on_date=on_date,
+                    stake=stake,
+                    keep=1,
+                )
+            )
+            refusals[name] = _refusal(legs, profile, floor_failed=bool(in_range))
             codes[name] = (
                 "no_candidates"
                 if not pool
+                else "coupon_probability"
+                if in_range
                 else "payout"
                 if legs
                 else "not_validated"
@@ -150,23 +174,27 @@ def _strength(candidate: Candidate) -> tuple[float, float]:
     return candidate.p_low, candidate.p_model
 
 
+EXHAUSTIVE_LIMIT = 200_000  # combinations; beyond this the search is dynamic programming
+LOG_STEP = 0.004  # resolution of the log-odds grid of the dynamic programming search
+
+
 def _optimise(legs, profile, *, cost, on_date, stake, keep: int = 3):
     """Best combinations (most likely first): the proposal and up to two alternatives that
     share no match with a better one."""
-    found = []
-    for n in range(1, int(profile["max_legs"]) + 1):
-        for combo in combinations(legs, n):
-            if len({c.event_id for c in combo}) != n:
-                continue  # never two markets of one match
-            total = _total_odds(combo)
-            if total < Decimal(str(profile["min_total_odds"])):
-                continue
-            net = _net_on_win(stake, total, cost, on_date)
-            if net is None or net < stake * Decimal(str(profile["min_net_profit_share"])):
-                continue
-            score = (prod(c.p_low for c in combo), -n, prod(c.p_model for c in combo))
-            found.append((score, combo, total, net))
+    max_legs = int(profile["max_legs"])
+    if sum(comb(len(legs), n) for n in range(1, max_legs + 1)) > EXHAUSTIVE_LIMIT:
+        found = _dynamic(legs, profile, cost=cost, on_date=on_date, stake=stake, keep=keep)
+    else:
+        found = []
+        for n in range(1, max_legs + 1):
+            for combo in combinations(legs, n):
+                if len({c.event_id for c in combo}) != n:
+                    continue  # never two markets of one match
+                item = _accept(combo, profile, cost=cost, on_date=on_date, stake=stake)
+                if item is not None:
+                    found.append(item)
     found.sort(key=lambda item: item[0], reverse=True)
+    found = _prefer_solo(found, profile)
     chosen, used = [], set()
     for item in found:
         events = {c.event_id for c in item[1]}
@@ -177,6 +205,83 @@ def _optimise(legs, profile, *, cost, on_date, stake, keep: int = 3):
         if len(chosen) == keep:
             break
     return chosen
+
+
+def _accept(combo, profile, *, cost, on_date, stake):
+    """(score, combo, total, net) when the combination meets every rule of the profile."""
+    total = _total_odds(combo)
+    if total < Decimal(str(profile["min_total_odds"])):
+        return None
+    high = profile.get("max_total_odds")
+    if high is not None and total > Decimal(str(high)):
+        return None
+    net = _net_on_win(stake, total, cost, on_date)
+    if net is None or net < stake * Decimal(str(profile["min_net_profit_share"])):
+        return None
+    p_low = prod(c.p_low for c in combo)
+    if p_low < float(profile.get("min_coupon_probability") or 0):
+        return None
+    return (p_low, -len(combo), prod(c.p_model for c in combo)), tuple(combo), total, net
+
+
+def _prefer_solo(found, profile):
+    """A profile that prefers SOLO puts the best single selection first when it is within
+    ``solo_tolerance`` of the most likely combination (TASK 007: WYSOKA TRAFNOŚĆ)."""
+    if not profile.get("prefer_solo") or not found:
+        return found
+    tolerance = float(profile.get("solo_tolerance", 0))
+    solo = next((item for item in found if len(item[1]) == 1), None)
+    if solo is None or solo is found[0] or solo[0][0] < found[0][0][0] - tolerance:
+        return found
+    return [solo, *(item for item in found if item is not solo)]
+
+
+def _dynamic(legs, profile, *, cost, on_date, stake, keep):
+    """Long accumulators: maximise the sum of log conservative probabilities subject to the
+    log-odds range, one leg per match (multiple-choice knapsack on a log-odds grid). Each
+    rerun excludes the matches of the coupons already found, so alternatives differ."""
+    low = log(float(profile["min_total_odds"]))
+    high = log(float(profile.get("max_total_odds") or 1000.0))
+    max_legs = int(profile["max_legs"])
+    by_event: dict[str, list] = {}
+    for c in legs:
+        by_event.setdefault(c.event_id, []).append(c)
+    out, banned = [], set()
+    for _ in range(keep):
+        top = int(high / LOG_STEP) + max_legs  # rounding slack of the grid
+        states = {(0, 0): (0.0, ())}
+        for event, options in by_event.items():
+            if event in banned:
+                continue
+            new = dict(states)
+            for (n, bucket), (score, chain) in states.items():
+                if n == max_legs:
+                    continue
+                for c in options:
+                    nb = bucket + round(log(float(c.odds)) / LOG_STEP)
+                    if nb > top:
+                        continue
+                    value = score + log(c.p_low)
+                    key = (n + 1, nb)
+                    if key not in new or value > new[key][0]:
+                        new[key] = (value, (*chain, c))
+            states = new
+        ranked = sorted(
+            (
+                item
+                for (n, bucket), (score, chain) in states.items()
+                if n and bucket * LOG_STEP >= low - max_legs * LOG_STEP
+                for item in [_accept(chain, profile, cost=cost, on_date=on_date, stake=stake)]
+                if item is not None
+            ),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+        if not ranked:
+            break
+        out.append(ranked[0])
+        banned |= {c.event_id for c in ranked[0][1]}
+    return out
 
 
 def _total_odds(combo) -> Decimal:
@@ -210,7 +315,7 @@ def _proposal(name, profile, found, *, cost, on_date, stake) -> Proposal:
         )
     warnings = []
     if len(combo) > 1:
-        warnings.append("Łączne prawdopodobieństwo zakłada niezależność różnych meczów")
+        warnings.append("Łączna szansa AKO jest przybliżeniem: zakłada niezależność różnych meczów")
     if level != VALIDATED:
         warnings.append(
             "Co najmniej jedna selekcja z modelu bez walidacji predykcyjnej — symulacja"
@@ -234,15 +339,25 @@ def _proposal(name, profile, found, *, cost, on_date, stake) -> Proposal:
     )
 
 
-def _refusal(legs, profile) -> str:
+def _refusal(legs, profile, *, floor_failed: bool = False) -> str:
     if not legs:
         need = "zwalidowanych predykcyjnie " if profile["require_predictive_validation"] else ""
         return (
             f"Brak {need}selekcji z ostrożną szansą ≥ {float(profile['min_leg_probability']):.0%}"
             " i świeżym kursem"
         )
+    if floor_failed:
+        return (
+            f"Kombinacje w przedziale kursu istnieją, ale ostrożna szansa kuponu jest niższa niż "
+            f"{float(profile['min_coupon_probability']):.0%} — dane nie uzasadniają takiego kuponu"
+        )
+    high = profile.get("max_total_odds")
+    span = (
+        f"w przedziale {profile['min_total_odds']}–{high}"
+        if high is not None
+        else f"≥ {profile['min_total_odds']}"
+    )
     return (
-        f"Żadna kombinacja do {profile['max_legs']} selekcji nie daje kursu ≥ "
-        f"{profile['min_total_odds']} i zysku netto ≥ {float(profile['min_net_profit_share']):.0%}"
-        " stawki"
+        f"Żadna kombinacja do {profile['max_legs']} selekcji nie daje kursu {span} i zysku "
+        f"netto ≥ {float(profile['min_net_profit_share']):.0%} stawki"
     )

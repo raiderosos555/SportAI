@@ -1,48 +1,74 @@
-# Probability-first coupon policy (TASK 005). Separate from coupon_policy.toml (EV policy),
-# which keeps its meaning for analyses of TASK 001–004. Thresholds below are STARTING values:
-# they are reviewed on validation data only — never tuned on the final holdout.
+# Probability-first coupon policy (TASK 005; four profiles of TASK 007). Separate from
+# coupon_policy.toml (EV policy), which keeps its meaning for analyses of TASK 001–004.
+# Thresholds below are STARTING values: they are reviewed on validation data only — never
+# tuned on the final holdout — and the builder never lowers them to produce a coupon.
 [policy]
-version = "2026-11-01.p2"
+version = "2026-11-02.p3"
+# p3 (TASK 007): four profiles defined by the range of total odds; a minimum conservative
+# probability of the whole coupon ("don't build a coupon the data cannot justify").
 # p2: up to `per_event` selections of one match enter the search pool (p1: only the best one,
 # which hid better combinations); one match still gives at most one leg of a coupon.
 
-# A market family is "zwalidowany predykcyjnie" when, on the untouched holdout:
+# A market family is "zwalidowany predykcyjnie" when, on the SELECTION window of protocol v2
+# (TASK 007: the final holdout is reported only and never decides):
 [validation]
-min_holdout_n = 300          # predictions of this market family out of sample
+min_holdout_n = 300          # forecasts of this market family out of sample (selection window)
 max_ece = 0.03               # calibrated expected calibration error
 require_beats_baseline = true  # log loss below the climatology / base-rate benchmark
-max_season_ece = 0.06        # no holdout season much worse than the whole
+max_season_ece = 0.06        # no season much worse than the whole
 forbid_overconfident_bins = true  # no 10-point range (n >= 30) whose Wilson 95% upper bound < mean forecast
 
-# Coupon profiles: the builder maximises the (conservative) probability of the whole coupon
-# subject to these constraints. "min_leg_probability" applies to the conservative estimate.
-[profiles.safe]
-label = "Bezpieczny"
-max_legs = 2
-min_leg_probability = 0.75
+# Coupon profiles: the builder maximises the CONSERVATIVE probability of the whole coupon
+# subject to these rules. "min_leg_probability" applies to the conservative estimate of every
+# leg, "min_coupon_probability" to the product (an approximation: matches are assumed
+# independent). Thresholds are not lower than those of the profiles they replace (p2:
+# safe 0.75, balanced 0.65, aggressive 0.55).
+[profiles.high_hit]
+label = "WYSOKA TRAFNOŚĆ"
 min_total_odds = 1.25
+max_total_odds = 1.60
+max_legs = 2
+prefer_solo = true
+solo_tolerance = 0.02          # SOLO first when at most 2 points less likely than the best AKO
+min_leg_probability = 0.75
+min_coupon_probability = 0.65
 min_net_profit_share = 0.08    # net profit on a win >= 8% of the stake (after the 0.88 coefficient)
 require_predictive_validation = true
 
-[profiles.balanced]
-label = "Zrównoważony"
+[profiles.standard]
+label = "STANDARDOWY"
+min_total_odds = 1.80
+max_total_odds = 2.20
 max_legs = 3
 min_leg_probability = 0.65
-min_total_odds = 1.60
+min_coupon_probability = 0.42
 min_net_profit_share = 0.35
 require_predictive_validation = true
 
-[profiles.aggressive]
-label = "Agresywny"
+[profiles.higher_payout]
+label = "WYŻSZA WYPŁATA"
+min_total_odds = 2.50
+max_total_odds = 4.00
 max_legs = 4
 min_leg_probability = 0.55
-min_total_odds = 2.50
+min_coupon_probability = 0.22
 min_net_profit_share = 1.00
-require_predictive_validation = false   # allowed only as an experimental simulation
+require_predictive_validation = false   # experimental legs only as a labelled simulation
+
+[profiles.tasiemka]
+label = "TASIEMKA"
+min_total_odds = 8.00
+max_total_odds = 12.00
+max_legs = 8                   # the fewest legs win ties; no coupon when the data do not allow it
+min_leg_probability = 0.60
+min_coupon_probability = 0.07
+min_net_profit_share = 5.00
+require_predictive_validation = true
 
 [builder]
 stake = "10.00"
-candidates = 25                # best selections considered by the exhaustive search
+candidates = 25                # best selections considered by the search of short coupons
+long_candidates = 40           # pool of profiles with more than 4 legs (dynamic programming)
 per_event = 3                  # alternatives of one match in the pool (one leg per match)
 same_event_combinations = false  # different markets of one match are never multiplied
 max_odds_per_leg = 4.0

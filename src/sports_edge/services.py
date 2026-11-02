@@ -9,11 +9,13 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
+from sports_edge import learning
 from sports_edge.analysis.coupon import CouponReport, build_daily_coupon, diagnose, save_analysis
 from sports_edge.analysis.coupon_builder import BuilderReport, Proposal, build_coupons
 from sports_edge.analysis.edge_engine import Candidate, evaluate
 from sports_edge.analysis.policy import Policy, load_policy
 from sports_edge.bookmakers import load_profiles, load_rules
+from sports_edge.collection import record_job, settle_predictions
 from sports_edge.datasources import openfootball
 from sports_edge.datasources.api_sports import ENV_KEY as API_SPORTS_ENV
 from sports_edge.datasources.api_sports import (
@@ -26,6 +28,7 @@ from sports_edge.datasources.competitions import COMPETITIONS, for_sts_league
 from sports_edge.datasources.football_data import FootballDataOrgProvider, api_key
 from sports_edge.datasources.pitchapi import ENV_KEY as PITCH_ENV
 from sports_edge.datasources.pitchapi import PitchApiProvider
+from sports_edge.ingestion.types import canonical as canonical_json
 from sports_edge.ingestion.types import digest
 from sports_edge.matching import (
     TeamIdentities,
@@ -99,6 +102,23 @@ MODEL_SCOPES = {"core": CORE_COMPETITIONS, "extended": EXTENDED_COMPETITIONS}
 SCOPE_LABELS = {"core": "5 czołowych lig", "extended": "7 lig dodanych w TASK 006"}
 RESEARCH_COMPETITIONS = CORE_COMPETITIONS + EXTENDED_COMPETITIONS
 RESEARCH_SPLIT = Split(validation_from="2022-07-01", holdout_from="2024-07-01")
+# TASK 007 protocol v2: the final holdout (from 2024-07-01) never decides anything. The
+# added leagues have results only from 2021/22 (Poland and Turkey from 2022/23), so their
+# hyperparameter and calibration windows are half seasons.
+PROTOCOLS = {
+    "core": Split(
+        validation_from="2021-07-01",
+        calibration_from="2022-07-01",
+        selection_from="2023-07-01",
+        holdout_from="2024-07-01",
+    ),
+    "extended": Split(
+        validation_from="2022-07-01",
+        calibration_from="2023-01-01",
+        selection_from="2023-07-01",
+        holdout_from="2024-07-01",
+    ),
+}
 # What the registered Elo model forecasts (double chance follows from the same 1X2).
 MODEL_MARKETS = {("1x2", "FT"), ("double_chance", "FT")}
 RESULTS_COMPETITIONS = tuple(COMPETITIONS)  # every league with a results source
@@ -108,6 +128,7 @@ def open_store(paths: AppPaths) -> Store:
     """Production database; a schema migration first copies the file to backups/."""
     store = Store(paths.database, backup_dir=paths.backups)
     ensure_reference_data(store)
+    ensure_model_roles(store)
     return store
 
 
@@ -192,11 +213,14 @@ def analyse_day(
     *,
     now: datetime,
     data_kinds: tuple[str, ...] = ("prospective", "archive"),
+    as_of: datetime | None = None,
 ) -> tuple[CouponReport, list[Candidate]]:
+    """Every selection of an offer day with its forecast and status at ``now``; ``as_of``
+    restricts the offer to what was known then (historical simulator)."""
     profiles = load_profiles(paths.config)
     rules = policy(paths)
     candidates = evaluate(
-        offer_table(store, day=day, data_kinds=data_kinds),
+        offer_table(store, day=day, data_kinds=data_kinds, as_of=as_of),
         predictions=with_predictive_status(
             store,
             latest_predictions(
@@ -288,7 +312,29 @@ def version_competitions(row: dict) -> tuple[str, ...]:
     return tuple(found or ())
 
 
+def scope_name(scope: tuple[str, ...]) -> str | None:
+    return next((n for n, found in MODEL_SCOPES.items() if tuple(found) == tuple(scope)), None)
+
+
 def scope_version(
+    store: Store, scope: tuple[str, ...], family: str = ELO_FAMILY, sport: str = "football"
+) -> dict | None:
+    """Served version (champion) of a family in a scope.
+
+    TASK 007: the champion is recorded in the model history (activation / rollback by the
+    user); a new version waits as a challenger. Without a recorded champion the newest
+    version of the scope is served, as before.
+    """
+    name = scope_name(scope)
+    champion = learning.champion_id(store, name, family) if name else None
+    if champion is not None:
+        for row in model_overview(store):
+            if row["version_id"] == champion and row["status"] != "retired":
+                return row
+    return newest_scope_version(store, scope, family, sport)
+
+
+def newest_scope_version(
     store: Store, scope: tuple[str, ...], family: str = ELO_FAMILY, sport: str = "football"
 ) -> dict | None:
     """Newest version of a family trained on (a subset of) the scope's competitions.
@@ -313,6 +359,36 @@ def active_versions(store: Store) -> dict[str, dict[str, dict | None]]:
         }
         for name, scope in MODEL_SCOPES.items()
     }
+
+
+def ensure_model_roles(store: Store, *, now: datetime | None = None) -> int:
+    """Seed the model history once (TASK 007): which versions were served before and which
+    versions had their holdout used for decisions. Idempotent; never changes a result."""
+    now = now or datetime.now(UTC)
+    served = {}
+    for name, scope in MODEL_SCOPES.items():
+        for family in (ELO_FAMILY, GOALS_FAMILY):
+            row = newest_scope_version(store, scope, family)
+            if row is not None:
+                served[(name, family)] = row
+    v1 = [
+        row["version_id"]
+        for row in model_overview(store)
+        if json.loads(row["validation_json"]).get("protocol") != "v2"
+    ]
+    return learning.ensure_roles(store, now=now, served=served, holdout_used=v1)
+
+
+def challenger_versions(store: Store) -> dict[str, dict[str, dict]]:
+    """Challengers waiting for a decision (shadow mode), per scope and model."""
+    rows = {row["version_id"]: row for row in model_overview(store)}
+    out: dict[str, dict[str, dict]] = {}
+    for name in MODEL_SCOPES:
+        for key, family in (("elo", ELO_FAMILY), ("goals", GOALS_FAMILY)):
+            waiting = learning.challengers(store, name, family)
+            if waiting and waiting[-1] in rows:
+                out.setdefault(name, {})[key] = rows[waiting[-1]]
+    return out
 
 
 def active_version_ids(store: Store) -> set[str]:
@@ -346,7 +422,7 @@ def generate_predictions(
 ) -> dict:
     """Pre-match Elo forecasts for upcoming STS events with the served version of each scope."""
     events = _upcoming(store, now) if events is None else events
-    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}}
+    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}, "shadow": {}}
     for name, pair in active_versions(store).items():
         if pair["elo"] is None:
             continue
@@ -363,6 +439,19 @@ def generate_predictions(
         out["saved"] += found["saved"]
         out["kept"] += found["kept"]
         out["skipped"] += found["skipped"]
+    # shadow mode: challengers forecast the same events; archived, never served
+    for name, pair in challenger_versions(store).items():
+        if "elo" in pair:
+            found = predict_offer(
+                store,
+                version_id=pair["elo"]["version_id"],
+                events=events,
+                normalizer=normalizer(paths),
+                now=now,
+                team_aliases=team_aliases(paths),
+                identities=team_identities(paths),
+            )
+            out["shadow"][name] = {k: found[k] for k in ("saved", "kept")}
     if not out["scopes"]:
         raise ValueError("Brak zarejestrowanego modelu — uruchom eksperyment")
     return out
@@ -579,6 +668,28 @@ def update_results_data(
         identities=team_identities(paths),
     )
     report["settlements"] = settle_coupons(store, paths, now=now)
+    # TASK 007: every prospective forecast is settled, not only the legs of coupons
+    report["prediction_settlements"] = settle_predictions(store, now=now)
+    errors = [str(e) for e in report.get("errors") or []]
+    record_job(
+        store,
+        "results_update",
+        trigger="analysis",
+        started=now,
+        finished=now,
+        status="partial" if errors else "ok",
+        reason="; ".join(errors[:3])[:500],
+        payload={"settlements": report["settlements"]},
+    )
+    record_job(
+        store,
+        "prediction_settlement",
+        trigger="results_update",
+        started=now,
+        finished=now,
+        status="ok",
+        payload=report["prediction_settlements"],
+    )
     return report
 
 
@@ -1007,23 +1118,29 @@ def run_analysis(
             snapshots += 1
     stage(shared, 4, "ok", f"migawki cech przedmeczowych: {snapshots}", snapshots=snapshots)
 
-    # 6. Models (one Elo and one Dixon–Coles version per scope; trained only when missing) --
+    # 6. Models (one Elo and one Dixon–Coles version per scope; trained only when missing,
+    # under protocol v2: the first version of a scope is served, later ones are challengers)
     trained, errors = False, []
     for name, scope in MODEL_SCOPES.items():
         if not scope_has_data(store, scope):
             continue  # no history for this scope yet: nothing to train
-        if scope_version(store, scope) is None:
+        had_elo = scope_version(store, scope) is not None
+        if not had_elo or scope_version(store, scope, GOALS_FAMILY) is None:
             try:
-                run_research_experiment(store, paths, now=now, competitions=scope)
-                trained = True
+                run_protocol_v2(store, paths, now=now, scope=name)
+                trained = trained or not had_elo
             except ValueError as error:
-                errors.append(f"{SCOPE_LABELS[name]}: {error}")
-                continue
-        if scope_version(store, scope, GOALS_FAMILY) is None:
-            try:
-                run_goals_experiment(store, paths, now=now, competitions=scope)
-            except ValueError as error:
-                errors.append(f"{SCOPE_LABELS[name]} (gole): {error}")
+                # Too little history for the four windows of protocol v2: a v1 model keeps the
+                # application working and its statuses stay suspended (experimental).
+                errors.append(f"{SCOPE_LABELS[name]}: protokół v2 niewykonalny ({error})")
+                try:
+                    if scope_version(store, scope) is None:
+                        run_research_experiment(store, paths, now=now, competitions=scope)
+                    if scope_version(store, scope, GOALS_FAMILY) is None:
+                        run_goals_experiment(store, paths, now=now, competitions=scope)
+                    trained = trained or not had_elo
+                except ValueError as second:
+                    errors.append(f"{SCOPE_LABELS[name]}: {second}")
     served = active_versions(store)
     forecasts = goals = None
     if any(pair["elo"] for pair in served.values()):
@@ -1346,6 +1463,84 @@ def save_coupon_proposals(
     return ids
 
 
+def my_coupon_payload(rows: list[Candidate], summary: dict, *, policy_version: str) -> dict:
+    """What is stored with a coupon built by the user (MÓJ KUPON), JSON-safe."""
+    return {
+        "profile": "my_coupon",
+        "label": "MÓJ KUPON",
+        "source": "user",
+        "policy_version": policy_version,
+        "level": "validated_predictive" if summary["validated"] else "experimental",
+        "probability": {
+            "calibrated": summary["probability"],
+            "conservative": summary["probability_low"],
+            "basis": summary["probability_note"],
+        },
+        "total_odds": str(summary["total_odds"]),
+        "stake": str(summary["stake"]),
+        "payout": str(summary.get("payout")),
+        "net_profit": str(summary.get("net_profit")),
+        "legs": [
+            {
+                "event": leg.event,
+                "league": leg.league,
+                "start_at": leg.start_at,
+                "market": leg.market_label,
+                "market_key": leg.market_key,
+                "line": leg.line,
+                "selection": leg.selection,
+                "offer_code": leg.offer_code,
+                "odds": str(leg.odds),
+                "odds_id": leg.odds_id,
+                "p_model": leg.p_model,
+                "p_conservative": leg.p_low,
+                "p_market": leg.p_market,
+                "predictive_status": leg.predictive_status,
+                "calibration": leg.calibration,
+                "model": leg.model,
+                "model_version_id": leg.model_version_id,
+                "document_at": leg.document_at,
+                "odds_age_hours": leg.odds_age_hours,
+                "freshness": leg.freshness,
+            }
+            for leg in rows
+        ],
+    }
+
+
+def save_my_coupon(
+    store: Store,
+    paths: AppPaths,
+    cart: list[dict],
+    rows: list[Candidate | None],
+    *,
+    stake: Decimal,
+    now: datetime,
+    real: bool = False,
+) -> str:
+    """Save MÓJ KUPON as a virtual coupon (or a manually recorded real one). Refused while a
+    blocking problem remains (stale price, started event, contradiction, one match twice)."""
+    from sports_edge import my_coupon as mine
+
+    sts = load_profiles(paths.config)["sts"]
+    summary = mine.summary(cart, rows, stake=stake, cost=sts.cost, on_date=now.date())
+    blocking = [i.message for i in summary["issues"] if i.severity == "block"]
+    if blocking:
+        raise ValueError("Kupon nie może być zapisany: " + "; ".join(blocking))
+    present = [row for row in rows if row is not None]
+    payload = my_coupon_payload(present, summary, policy_version=probability_policy(paths).version)
+    return create_coupon(
+        store,
+        odds_ids=[row.odds_id for row in present],
+        stake=stake,
+        mode="real_manual" if real else "paper_manual",
+        profile=sts,
+        now=now,
+        note="Mój kupon" + (" — postawiony w STS (wpis ręczny)" if real else ""),
+        proposal=payload,
+    )
+
+
 def _refresh_offer(
     store: Store, paths: AppPaths, settings: AppSettings, day: str, *, now: datetime
 ) -> str:
@@ -1572,7 +1767,8 @@ def elo_walk_forward_forecasts(
         matches,
         k=params["k"],
         home_advantage=params["home_advantage"],
-        margin_until=RESEARCH_SPLIT.holdout_from,
+        # v2: the draw margin of the version (fitted before its selection window)
+        margin_until=params.get("draw_margin_until", RESEARCH_SPLIT.holdout_from),
     )
     return {item["match"].result_id: item["forecast"] for item in items}
 
@@ -1647,8 +1843,6 @@ def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict
     measured it for one Elo version, so only that version's forecasts receive it; a league
     that fails its own gate stays experimental."""
     benchmarks = elo_benchmarks(store)
-    if not benchmarks:
-        return predictions
 
     def status(report: dict, family: str, competition: str | None) -> str:
         value = ((report.get("elo_predictive") or {}).get(family) or {}).get(
@@ -1658,6 +1852,9 @@ def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict
         return "experimental" if gate and not gate["ok"] else value
 
     for row in predictions.values():
+        if (row.get("validation") or {}).get("protocol") != "v2":
+            _suspend_status(row)  # TASK 007 §4.2: statuses chosen on a used holdout
+            continue
         report = benchmarks.get(row["model_version_id"])
         if report is None or row["market_key"] != "1x2":
             continue
@@ -1675,11 +1872,35 @@ def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict
     return predictions
 
 
+def _suspend_status(row: dict) -> None:
+    """Read-time status of a protocol v1 forecast: experimental, with the reason shown.
+
+    The stored forecast and the stored version status stay untouched (append-only); only
+    the status used for decisions is suspended, explicitly and visibly."""
+    uncertainty = row["uncertainty"]
+    derived = {
+        key: {**value, "predictive_status": "experimental"}
+        for key, value in (uncertainty.get("derived") or {}).items()
+    }
+    row["uncertainty"] = {
+        **uncertainty,
+        "family": uncertainty.get("family")
+        or (row["market_key"] if row["market_key"] in ("1x2", "double_chance") else None),
+        "predictive_status": "experimental",
+        "derived": derived,
+        "derived_status": {"double_chance": "experimental"},
+        "status_note": learning.HOLDOUT_NOTE,
+        "stored_status": uncertainty.get("predictive_status"),
+    }
+    row["version_status"] = "experimental"
+
+
 def prediction_preference(store: Store) -> dict:
     """Model serving 1X2 (and the double chance derived from it), per scope and league.
 
     The model that passed the predictive validation wins; when both or neither passed, the
-    lower VALIDATION log loss decides (stored in the version). The holdout never decides.
+    lower log loss of the deciding window decides (validation in v1, selection in v2). The
+    holdout never decides: statuses of v1 versions (chosen on a used holdout) do not count.
     """
     out: dict = {}
     for name, scope in MODEL_SCOPES.items():
@@ -1687,12 +1908,17 @@ def prediction_preference(store: Store) -> dict:
         if goals is None:
             continue
         report = json.loads(goals["validation_json"])
-        elo_ok = ((report.get("elo_predictive") or {}).get("1x2") or {}).get(
-            "status"
-        ) == "validated_predictive"
-        dc_ok = ((report.get("predictive") or {}).get("1x2") or {}).get(
-            "status"
-        ) == "validated_predictive"
+        v2 = report.get("protocol") == "v2"
+        elo_ok = (
+            v2
+            and ((report.get("elo_predictive") or {}).get("1x2") or {}).get("status")
+            == "validated_predictive"
+        )
+        dc_ok = (
+            v2
+            and ((report.get("predictive") or {}).get("1x2") or {}).get("status")
+            == "validated_predictive"
+        )
         by_loss = GOALS_FAMILY if "1x2" in report.get("markets_served", []) else ELO_FAMILY
         family = by_loss if elo_ok == dc_ok else ELO_FAMILY if elo_ok else GOALS_FAMILY
         out.update({("1x2", code): family for code in scope})
@@ -1701,11 +1927,154 @@ def prediction_preference(store: Store) -> dict:
     return out
 
 
+def run_protocol_v2(
+    store: Store, paths: AppPaths, *, now: datetime, scope: str, progress=None
+) -> dict:
+    """TASK 007 §4.2: Elo and Dixon–Coles of one scope under protocol v2, registered as
+    challengers (shadow mode). The champion is changed only by the user."""
+    competitions = MODEL_SCOPES[scope]
+    split = PROTOCOLS[scope]
+    ensure_model_roles(store, now=now)
+    if progress:
+        progress(f"Elo ({SCOPE_LABELS[scope]}): okna v2")
+    elo = run_elo_experiment(
+        store,
+        competitions=competitions,
+        split=split,
+        now=now,
+        policy=policy(paths),
+        identities=team_identities(paths),
+    )
+    elo_row = next(r for r in model_overview(store) if r["version_id"] == elo["version_id"])
+    if progress:
+        progress(f"Dixon–Coles ({SCOPE_LABELS[scope]}): okna v2")
+    goals = run_probability_experiment(
+        store,
+        competitions=competitions,
+        split=split,
+        now=now,
+        policy=policy(paths),
+        probability_policy=probability_policy(paths),
+        elo_forecasts=elo_walk_forward_forecasts(
+            store,
+            now=now,
+            identities=team_identities(paths),
+            competitions=competitions,
+            version=elo_row,
+        ),
+        identities=team_identities(paths),
+        elo_version_id=elo["version_id"],
+    )
+    summary = {
+        "protocol": "v2",
+        "split": split.as_dict(),
+        "elo_decision": elo.get("decision"),
+        "goals_decision": goals.get("decision"),
+        "statuses": {k: v["status"] for k, v in goals["predictive"].items()},
+        "elo_statuses": {k: v["status"] for k, v in goals["elo_predictive"].items()},
+        "markets_served": goals["markets_served"],
+    }
+    for family, report in ((ELO_FAMILY, elo), (GOALS_FAMILY, goals)):
+        first = learning.champion_id(store, scope, family) is None
+        learning.record(
+            store,
+            kind="challenger_ready",
+            actor="system",
+            reason="Protokół v2: wybór i statusy na oknie selekcji, holdout tylko raportowany",
+            now=now,
+            version_id=report["version_id"],
+            scope=scope,
+            family=family,
+            payload=summary,
+        )
+        if first:  # nothing to compare with: the first model of a scope is served
+            learning.record(
+                store,
+                kind="activated",
+                actor="system",
+                reason="Pierwsza wersja modelu w tym zakresie — brak modelu do porównania",
+                now=now,
+                version_id=report["version_id"],
+                scope=scope,
+                family=family,
+            )
+    return {"elo": elo, "goals": goals, "summary": summary}
+
+
+def newest_v2_version(store: Store, scope: str, family: str) -> dict | None:
+    for row in model_overview(store):
+        if row["family"] != family or row["status"] == "retired":
+            continue
+        report = json.loads(row["validation_json"])
+        if report.get("protocol") == "v2" and set(version_competitions(row)) <= set(
+            MODEL_SCOPES[scope]
+        ):
+            return row
+    return None
+
+
+def run_ablation(store: Store, paths: AppPaths, *, now: datetime, scope: str) -> dict:
+    """Feature ablation A–D of one scope on the protocol v2 windows (stored as an
+    experiment; every result is kept, also a worse one)."""
+    from sports_edge import ablation
+    from sports_edge.probability_lab import dc_walk_forward, served_view
+
+    elo_row = newest_v2_version(store, scope, ELO_FAMILY)
+    goals_row = newest_v2_version(store, scope, GOALS_FAMILY)
+    if elo_row is None or goals_row is None:
+        raise ValueError("Brak wersji protokołu v2 w tym zakresie — najpierw protokół v2")
+    split = PROTOCOLS[scope]
+    competitions = MODEL_SCOPES[scope]
+    rows = effective_results(
+        store,
+        sport="football",
+        until=now,
+        competitions=competitions,
+        identities=team_identities(paths),
+    )
+    goals_report = json.loads(goals_row["validation_json"])
+    raw = dc_walk_forward(
+        rows, half_life=goals_report["half_life_days"], from_date=split.validation_from
+    )
+    calibrators = goals_report["calibrators"]
+    goals = {k: served_view(v, calibrators)[("1x2", None)] for k, v in raw.items()}
+    elo = elo_walk_forward_forecasts(
+        store,
+        now=now,
+        identities=team_identities(paths),
+        competitions=competitions,
+        version=elo_row,
+    )
+    report = ablation.run(rows, split=split, elo=elo, goals=goals)
+    report.update(
+        scope=scope, elo_version_id=elo_row["version_id"], goals_version_id=goals_row["version_id"]
+    )
+    store.insert(
+        "experiments",
+        id=digest(["ablation", scope, elo_row["version_id"], goals_row["version_id"]]),
+        hypothesis="Ablacja 1X2: Elo (A), Dixon–Coles (B), DC + cechy (C), prosty model ML (D)",
+        registered_at=now.isoformat(),
+        kind="backtest",
+        config_json=canonical_json(report),
+        status="concluded",
+    )
+    return report
+
+
+def ablation_reports(store: Store) -> list[dict]:
+    out = []
+    for row in store.rows(
+        "SELECT * FROM experiments WHERE hypothesis LIKE 'Ablacja 1X2%' ORDER BY registered_at"
+    ):
+        out.append({**json.loads(row["config_json"]), "registered_at": row["registered_at"]})
+    return out
+
+
 def generate_goals_predictions(
     store: Store, paths: AppPaths, *, now: datetime, events: list[dict] | None = None
 ) -> dict:
     events = _upcoming(store, now) if events is None else events
-    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}}
+    out: dict = {"saved": 0, "kept": 0, "skipped": [], "scopes": {}, "shadow": {}}
     for name, pair in active_versions(store).items():
         if pair["goals"] is None:
             continue
@@ -1722,6 +2091,18 @@ def generate_goals_predictions(
         out["saved"] += found["saved"]
         out["kept"] += found["kept"]
         out["skipped"] += found["skipped"]
+    for name, pair in challenger_versions(store).items():
+        if "goals" in pair:  # shadow mode: archived, never served
+            found = predict_offer_goals(
+                store,
+                version_id=pair["goals"]["version_id"],
+                events=events,
+                normalizer=normalizer(paths),
+                now=now,
+                team_aliases=team_aliases(paths),
+                identities=team_identities(paths),
+            )
+            out["shadow"][name] = {k: found[k] for k in ("saved", "kept")}
     if not out["scopes"]:
         raise ValueError("Brak zarejestrowanego modelu bramkowego — uruchom eksperyment")
     return out

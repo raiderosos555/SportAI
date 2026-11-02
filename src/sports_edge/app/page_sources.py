@@ -57,6 +57,7 @@ def sources_page() -> None:
         "Ustawienia": _sts,
         "Podatki i reguły": _profile,
         "Dane lokalne": _local_data,
+        "Zbieranie danych i monitoring": _monitoring,
         "Diagnostyka": _diagnostics,
     }
     view = st.segmented_control("Widok", list(views), default="Źródła danych", key="sources_view")
@@ -66,6 +67,83 @@ def sources_page() -> None:
 def _diagnostics() -> None:
     data_diagnostics()
     _sources()
+
+
+def _monitoring() -> None:
+    """Data collection engine, job runs, storage, integrity, backup with a restore test."""
+    import pandas as pd
+
+    from sports_edge import collection, maintenance
+    from sports_edge.backup import create_backup
+    from sports_edge.services import update_results_data
+
+    db, now = c.store(), c.now()
+    ui.section("Raport monitoringu", "źródła, zadania, rozliczenia, modele i baza")
+    st.dataframe(
+        pd.DataFrame(maintenance.monitoring(db, c.paths(), c.settings(), now=now)),
+        hide_index=True,
+        width="stretch",
+    )
+    report = collection.completeness(db, now=now)
+    ui.metric_cards(
+        [
+            ("Prognozy zapisane", str(report["predictions"]), "wszystkie prospektywne"),
+            ("Rozliczone", str(sum(report["settlements"].values())), "z wersjonowaniem korekt"),
+            ("Oczekujące", str(report["pending"]), "mecz rozpoczęty, brak wyniku"),
+            ("Bez wyniku > 48 h", str(report["missing_results_count"]), "nierozstrzygnięte"),
+        ]
+    )
+    if report["settlements"]:
+        st.caption(
+            "Statusy rozliczeń: "
+            + ", ".join(
+                f"{collection.STATUS_LABELS.get(k, k)}: {v}"
+                for k, v in report["settlements"].items()
+            )
+        )
+    online = not c.settings().offline_mode
+    if st.button(
+        "Uzupełnij po przerwie",
+        icon=":material/sync:",
+        help="Rozlicza zaległe "
+        "prognozy; w trybie online także aktualizuje wyniki (maks. 14 dni przerwy)",
+    ):
+        found = collection.catch_up(
+            db,
+            now=c.now(),
+            update=(lambda: update_results_data(db, c.paths(), c.settings(), now=c.now()))
+            if online
+            else None,
+        )
+        st.json(found, expanded=False)
+    ui.section("Baza danych", "rozmiar, przyrost, integralność i kopia zapasowa")
+    disk = maintenance.storage_report(db, c.paths(), now=now)
+    ui.metric_cards(
+        [
+            ("Rozmiar bazy", f"{disk['bytes'] / 1e6:.1f} MB", f"schemat {disk['schema']}"),
+            (
+                "Przyrost / miesiąc",
+                f"~{disk['projected_bytes_per_month'] / 1e6:.1f} MB",
+                "szacunek z 7 dni",
+            ),
+            ("Pliki surowe", f"{disk['raw_bytes'] / 1e6:.1f} MB", "data/sources, data/raw"),
+            ("Kopie zapasowe", f"{disk['backups_bytes'] / 1e6:.1f} MB", "folder backups/"),
+            (
+                "Integralność",
+                "OK" if disk["integrity"]["ok"] else "BŁĄD",
+                f"klucze obce: {disk['integrity']['foreign_key_errors']} błędów",
+            ),
+        ]
+    )
+    ui.explanation("Plan archiwizacji (nic nie jest usuwane automatycznie)", disk["archive_plan"])
+    if st.button("Utwórz kopię zapasową i sprawdź odtworzenie", icon=":material/backup:"):
+        folder = create_backup(c.paths(), now=c.now())
+        test = maintenance.restore_test(folder / "sports_edge.db", db)
+        (st.success if test["ok"] else st.error)(
+            f"Kopia {folder.name}: test odtworzenia {'udany' if test['ok'] else 'nieudany'} "
+            f"(integralność {test['integrity']}, tabel {test['tables']})"
+            + (": " + "; ".join(test["problems"]) if test["problems"] else "")
+        )
 
 
 def _panel() -> None:

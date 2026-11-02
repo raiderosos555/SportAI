@@ -5,8 +5,9 @@ from collections import defaultdict
 import pandas as pd
 import streamlit as st
 
+from sports_edge.app import cart, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
+from sports_edge.app.page_my_coupon import event_panel
 from sports_edge.app.pages_offers import offer_content
 from sports_edge.repository import offer_days
 
@@ -43,7 +44,7 @@ def _schedule() -> None:
     )
     league = cols[2].selectbox("Liga", ["wszystkie", *leagues], key="schedule_league")
     table = []
-    for rows in events.values():
+    for eid, rows in events.items():
         head = rows[0]
         if sport != "wszystkie" and head.sport != sport:
             continue
@@ -60,6 +61,7 @@ def _schedule() -> None:
                 "Rynki": len({r.market_id for r in rows}),
                 "Kurs STS": "potwierdzony" if head.freshness == "fresh" else "niepotwierdzony",
                 "_start": head.start_at or "",
+                "_id": eid,
             }
         )
     if not table:
@@ -77,10 +79,23 @@ def _schedule() -> None:
             ),
         ]
     )
-    frame = pd.DataFrame(sorted(table, key=lambda r: r["_start"])).drop(columns="_start")
-    st.dataframe(
-        frame, hide_index=True, width="stretch", height=min(38 * (len(frame) + 1) + 4, 560)
+    ordered = sorted(table, key=lambda r: r["_start"])
+    frame = pd.DataFrame(ordered).drop(columns=["_start", "_id"])
+    cart.flash()
+    picked = st.dataframe(
+        frame,
+        hide_index=True,
+        width="stretch",
+        height=min(38 * (len(frame) + 1) + 4, 560),
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"schedule_table_{day}",
     )
+    st.caption("Kliknij wiersz, aby zobaczyć rynki i dodać typ do Mojego kuponu.")
+    if picked.selection.rows:
+        chosen = ordered[picked.selection.rows[0]]["_id"]
+        ui.section("Rynki wydarzenia", events[chosen][0].event)
+        event_panel(events[chosen], day)
 
 
 def _finished() -> None:

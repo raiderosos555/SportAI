@@ -3,13 +3,17 @@
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge.app import cart, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
 from sports_edge.app.page_coupon import coupon_page
 from sports_edge.app.page_dashboard import dashboard_page
 from sports_edge.app.page_events import events_page
+from sports_edge.app.page_generator import generator_page, tasiemka_page
+from sports_edge.app.page_learning import learning_page
 from sports_edge.app.page_match import match_page
 from sports_edge.app.page_models import models_page
+from sports_edge.app.page_my_coupon import my_coupon_page
+from sports_edge.app.page_simulators import budget_page, historical_page
 from sports_edge.app.page_sources import sources_page
 from sports_edge.app.pages_history import history_page
 from sports_edge.repository import imports
@@ -33,11 +37,32 @@ pages = {
     "kupon": st.Page(
         coupon_page, title="Kupon dnia", icon=":material/receipt_long:", url_path="kupon"
     ),
+    "moj_kupon": st.Page(
+        my_coupon_page,
+        title="Mój kupon",
+        icon=":material/shopping_cart:",
+        url_path="moj-kupon",
+    ),
+    "generator": st.Page(
+        generator_page, title="Kupon na kurs", icon=":material/tune:", url_path="kupon-na-kurs"
+    ),
+    "tasiemka": st.Page(
+        tasiemka_page, title="Tasiemka", icon=":material/format_list_numbered:", url_path="tasiemka"
+    ),
     "analiza": st.Page(
         match_page, title="Analiza meczów", icon=":material/query_stats:", url_path="analiza"
     ),
     "wydarzenia": st.Page(
         events_page, title="Wydarzenia i wyniki", icon=":material/event:", url_path="wydarzenia"
+    ),
+    "budzet": st.Page(
+        budget_page, title="Symulator budżetu", icon=":material/savings:", url_path="symulator"
+    ),
+    "historyczny": st.Page(
+        historical_page,
+        title="Symulator historyczny",
+        icon=":material/manage_history:",
+        url_path="symulator-historyczny",
     ),
     "historia": st.Page(
         history_page, title="Historia i skuteczność", icon=":material/history:", url_path="historia"
@@ -45,11 +70,21 @@ pages = {
     "modele": st.Page(
         models_page, title="Modele i statystyki", icon=":material/monitoring:", url_path="modele"
     ),
+    "uczenie": st.Page(
+        learning_page, title="Uczenie AI", icon=":material/model_training:", url_path="uczenie"
+    ),
     "zrodla": st.Page(
         sources_page, title="Źródła i ustawienia", icon=":material/tune:", url_path="zrodla"
     ),
 }
 st.session_state["pages"] = pages
+SECTIONS = {
+    "Kupony": ("dashboard", "kupon", "moj_kupon", "generator", "tasiemka"),
+    "Analiza": ("analiza", "wydarzenia"),
+    "Symulacje": ("budzet", "historyczny"),
+    "Wyniki i modele": ("historia", "modele", "uczenie"),
+    "Ustawienia": ("zrodla",),
+}
 
 
 def sidebar() -> None:
@@ -74,6 +109,7 @@ def sidebar() -> None:
                 ("Wyniki lig", f"aktualne {sum(f['fresh'] for f in freshness)}/{len(freshness)}"),
                 ("Modele", f"{sum(1 for p in served.values() if p['elo'] or p['goals'])} zakresy"),
                 ("Ostatnia analiza", c.local_time(last_run, "%d.%m %H:%M") if last_run else "—"),
+                ("Mój kupon", cart.summary_line()),
                 ("Tryb", "offline" if settings.offline_mode else "online (na żądanie)"),
             ]
         )
@@ -92,4 +128,6 @@ try:
     sidebar()
 except Exception as error:  # noqa: BLE001 — a broken status must never hide the pages
     st.sidebar.warning(f"Status danych niedostępny: {error}")
-st.navigation(list(pages.values())).run()
+st.navigation(
+    {section: [pages[key] for key in keys if key in pages] for section, keys in SECTIONS.items()}
+).run()

@@ -33,15 +33,20 @@ def beats_market(benchmark: dict | None, policy) -> tuple[bool, str]:
 
 
 def validation_status(validation: dict, policy) -> tuple[str, list[str]]:
-    """'validated' requires holdout size and calibration, a market benchmark and as-of data."""
+    """'validated' requires out-of-sample size and calibration, a market benchmark and as-of
+    data. Protocol v2 (TASK 007) judges the selection window; its final holdout never
+    decides. Protocol v1 versions judged their holdout and keep that stored status."""
     reasons = []
-    holdout = validation.get("holdout") or {}
-    n = holdout.get("n", 0)
+    if validation.get("protocol") == "v2":
+        sample, where, of = validation.get("decision") or {}, "w oknie selekcji", "okna selekcji"
+    else:
+        sample, where, of = validation.get("holdout") or {}, "w holdoucie", "holdoutu"
+    n = sample.get("n", 0)
     if n < policy.min_validation_events:
-        reasons.append(f"Za mało prognoz w holdoucie: {n} < {policy.min_validation_events}")
-    ece = holdout.get("ece")
+        reasons.append(f"Za mało prognoz {where}: {n} < {policy.min_validation_events}")
+    ece = sample.get("ece")
     if ece is None or ece > policy.max_calibration_ece:
-        reasons.append(f"Kalibracja holdoutu ECE={ece} powyżej progu {policy.max_calibration_ece}")
+        reasons.append(f"Kalibracja {of} ECE={ece} powyżej progu {policy.max_calibration_ece}")
     if policy.require_beats_market_benchmark:
         ok, why = beats_market(validation.get("market_benchmark"), policy)
         if not ok:

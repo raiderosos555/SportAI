@@ -12,8 +12,8 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge.app import cart, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
 from sports_edge.repository import offer_days
 from sports_edge.results_engine import SOURCE_LABELS
 from sports_edge.services import (
@@ -52,6 +52,7 @@ def match_page() -> None:
     only_model = top[1].toggle("Tylko z prognozą", value=True, key="match_only_model")
     show_done = top[2].toggle("Pokaż rozpoczęte", value=False, key="match_done")
     _report, candidates = c.day_candidates(day)
+    cart.flash()
     events = defaultdict(list)
     for x in candidates:
         events[x.event_id].append(x)
@@ -111,7 +112,7 @@ def match_page() -> None:
     ui.section("Ocena modelu", "przed meczem" if not started else "prognoza sprzed rozpoczęcia")
     _outlook(rows, context, head, review)
     ui.section("Najbardziej prawdopodobny obsługiwany typ")
-    _pick(rows, now, max_odds, started)
+    _pick(rows, now, max_odds, started, day)
     ui.section("Dlaczego model tak ocenia ten mecz?")
     _why(rows, context, teams, review.get("forecast") if started else None)
     tabs = st.tabs(
@@ -131,7 +132,7 @@ def match_page() -> None:
     with tabs[2]:
         _lineups(db, context, choice, now, started)
     with tabs[3]:
-        _markets(rows)
+        _markets(rows, day, started)
     with tabs[4]:
         _models(rows, context)
     with tabs[5]:
@@ -293,7 +294,7 @@ def _model_text(model: str) -> str:
     return MODEL_TEXT.get(key, model or "brak")
 
 
-def _pick(rows, now, max_odds, started) -> None:
+def _pick(rows, now, max_odds, started, day) -> None:
     pick = ins.best_pick(rows, now=now, max_odds=max_odds) if not started else None
     if pick is None:
         ui.empty_state(
@@ -326,6 +327,7 @@ def _pick(rows, now, max_odds, started) -> None:
         ),
         unsafe_allow_html=True,
     )
+    cart.add_button(x, day=day, key=f"match_add_{x.selection_id}")
 
 
 def _why(rows, context, teams, original=None) -> None:
@@ -525,8 +527,9 @@ def _lineups(db, context, event_id, now, started) -> None:
     )
 
 
-def _markets(rows) -> None:
-    st.dataframe(
+def _markets(rows, day, started) -> None:
+    ordered = sorted(rows, key=lambda x: (x.market_label, x.selection))
+    table = st.dataframe(
         pd.DataFrame(
             [
                 {
@@ -541,7 +544,7 @@ def _markets(rows) -> None:
                     else None,
                     "Kurs STS": "potwierdzony" if x.freshness == "fresh" else "niepotwierdzony",
                 }
-                for x in sorted(rows, key=lambda x: (x.market_label, x.selection))
+                for x in ordered
             ]
         ),
         hide_index=True,
@@ -553,7 +556,21 @@ def _markets(rows) -> None:
             "Rynek bez marży": st.column_config.NumberColumn(format="%.1f%%"),
             "Kurs": st.column_config.NumberColumn(format="%.2f"),
         },
+        on_select="rerun",
+        selection_mode="multi-row",
+        key=f"match_markets_{rows[0].event_id}",
     )
+    picked = [ordered[i] for i in table.selection.rows if i < len(ordered)]
+    if not started:
+        st.button(
+            f"{cart.ADD_LABEL} ({len(picked)})",
+            key=f"match_add_rows_{rows[0].event_id}",
+            icon=":material/add_shopping_cart:",
+            disabled=not picked,
+            on_click=cart.add_many,
+            args=([(x, day) for x in picked],),
+            help="Zaznacz wiersze tabeli, aby dodać typy do Mojego kuponu",
+        )
     st.caption("Brak wartości oznacza brak danych (model nie liczy tego rynku), a nie zero.")
 
 
@@ -572,7 +589,7 @@ def _models(rows, context) -> None:
                     "Walidacja predykcyjna": STATUS_TEXT.get(
                         x.predictive_status, x.predictive_status
                     ),
-                    "Kalibracja (holdout)": x.calibration,
+                    "Kalibracja (okno oceny)": x.calibration,
                 }
                 for x in modelled
             ]

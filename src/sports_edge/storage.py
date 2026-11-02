@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -35,6 +35,7 @@ MIGRATIONS = {
     3: "STS ONLY, archive, odds metadata",
     4: "results providers: provenance columns and update reports",
     5: "sports statistics store, feature snapshots, coupon proposals",
+    6: "TASK 007: model history, prediction settlements, job runs, simulations, LLM usage",
 }
 
 SCHEMA = """
@@ -194,6 +195,41 @@ CREATE TABLE IF NOT EXISTS feature_snapshots (
  feature_set TEXT NOT NULL, features_json TEXT NOT NULL, inputs_json TEXT NOT NULL,
  created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS model_events (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL,
+ model_version_id TEXT REFERENCES model_versions(id), scope TEXT, family TEXT,
+ kind TEXT NOT NULL, actor TEXT NOT NULL CHECK(actor IN ('system','user','migration')),
+ reason TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS prediction_settlements (
+ id TEXT PRIMARY KEY, prediction_id TEXT NOT NULL REFERENCES predictions(id),
+ revision INTEGER NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('settled','unresolved','cancelled','postponed','void',
+   'uncertain','source_conflict','missing_stat')),
+ outcome_json TEXT NOT NULL, result_ref TEXT, source TEXT, settled_at TEXT NOT NULL,
+ supersedes_id TEXT REFERENCES prediction_settlements(id), reason TEXT NOT NULL DEFAULT '',
+ UNIQUE(prediction_id, revision)
+);
+CREATE TABLE IF NOT EXISTS job_runs (
+ id TEXT PRIMARY KEY, job TEXT NOT NULL, trigger TEXT NOT NULL, started_at TEXT NOT NULL,
+ finished_at TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('ok','skipped','failed','partial')),
+ reason TEXT NOT NULL DEFAULT '', payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS simulation_runs (
+ id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('budget','historical')),
+ created_at TEXT NOT NULL, policy_version TEXT, config_json TEXT NOT NULL,
+ result_json TEXT NOT NULL, status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS llm_usage (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+ purpose TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+ cache_read_tokens INTEGER NOT NULL DEFAULT 0, cost_usd TEXT NOT NULL, status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS model_event_role ON model_events(scope, family, kind, created_at);
+CREATE INDEX IF NOT EXISTS prediction_settlement ON prediction_settlements(prediction_id);
+CREATE INDEX IF NOT EXISTS job_run ON job_runs(job, started_at);
+CREATE INDEX IF NOT EXISTS prediction_event ON predictions(event_id, market_key);
 CREATE INDEX IF NOT EXISTS stat_entity ON stat_observations(kind, entity_key, available_at);
 CREATE INDEX IF NOT EXISTS feature_event ON feature_snapshots(event_id, decision_time);
 CREATE INDEX IF NOT EXISTS event_day ON events(bookmaker_id, offer_date);
@@ -257,6 +293,9 @@ class Store:
         v3: Superbet and generic sources leave the active flow; their rows stay archived.
         v4: only new nullable/default columns (ALTER TABLE above); existing rows are kept.
         v5: new append-only tables (statistics, feature snapshots) and nullable coupon columns.
+        v6: new append-only tables only (model history, prediction settlements, job runs,
+        simulation runs, LLM usage); no existing row is touched. Model roles of the versions
+        that already exist are recorded by the application (``learning.ensure_roles``).
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

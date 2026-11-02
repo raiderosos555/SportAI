@@ -81,9 +81,17 @@ def pick_label(
 ) -> str:
     """A selection in plain words: "Powyżej 1,5 gola", "Atalanta lub remis (1X)"."""
     home, away = teams(event)
-    goals = num(line, 1) if line not in (None, "") else ""
+    try:  # goal lines are numbers; a handicap line such as "0:1" is not
+        goals = num(line, 1) if line not in (None, "") else ""
+    except ValueError:
+        goals = ""
     if market_key == "1x2":
         return {"home": f"Wygrana: {home}", "draw": "Remis", "away": f"Wygrana: {away}"}.get(
+            selection, selection
+        )
+    if market_key in {"match_winner", "draw_no_bet"}:
+        suffix = " (bez remisu)" if market_key == "draw_no_bet" else ""
+        return {"home": f"Wygrana: {home}{suffix}", "away": f"Wygrana: {away}{suffix}"}.get(
             selection, selection
         )
     if market_key == "double_chance":
@@ -102,6 +110,9 @@ def pick_label(
     if market_key in {"home_to_score", "away_to_score"}:
         team = home if market_key == "home_to_score" else away
         return f"{team} strzeli gola" if selection == "yes" else f"{team} nie strzeli gola"
+    if market_key == "handicap_1x2" and line:
+        side = {"home": home, "draw": "remis", "away": away}.get(selection, selection)
+        return f"Handicap {line}: {side}"
     return f"{market} → {selection_label(selection)}" if market else selection_label(selection)
 
 
@@ -160,8 +171,8 @@ def candidate_groups(candidates: list[Candidate], *, now: datetime, max_odds: fl
     """
     out = []
     for c in candidates:
-        if c.p_model is None:
-            continue
+        if c.p_model is None or not c.probability_ok:
+            continue  # no or inconsistent probability: never ranked
         why = eligibility(c, max_odds)
         fresh_why = eligibility(replace(c, freshness="fresh"), max_odds) if why == STALE else why
         notes = []
@@ -270,8 +281,8 @@ def explain_no_coupon(
     elif codes.get("payout"):
         case = "D"
         headline = (
-            "Dostępne typy mają wysokie prawdopodobieństwo, ale nie pozwalają uzyskać wymaganej "
-            "wypłaty netto po współczynniku 0,88."
+            "Dostępne typy mają wysokie prawdopodobieństwo, ale nie składają się na kurs łączny "
+            "z przedziału profilu albo nie dają wymaganej wypłaty netto po współczynniku 0,88."
         )
         action = "Kursy tych typów są zbyt niskie; poczekaj na inne mecze lub inny profil."
         count = len([g for g in groups if g["group"] == "A"])
@@ -325,7 +336,8 @@ def best_pick(candidates: list[Candidate], *, now: datetime, max_odds: float) ->
     usable = [
         c
         for c in candidates
-        if c.p_low is not None
+        if c.probability_ok
+        and c.p_low is not None
         and c.p_low >= MIN_PICK
         and c.break_even is not None
         and c.break_even < 1

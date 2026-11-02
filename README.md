@@ -11,7 +11,14 @@ Funkcje:
 - modele Elo (1X2, podwójna szansa) i Dixon–Coles (sumy goli, BTTS) z kalibracją, walidacją
   predykcyjną i bramką jakości każdej ligi — **12 lig piłkarskich** (5 czołowych +
   Championship, Eredivisie, Liga Portugal, Pro League, 2. Bundesliga, Süper Lig, Ekstraklasa);
-- kreator kuponów w trzech profilach dla dziś / jutro / 3 / 7 dni, z wyjaśnieniem braku kuponu;
+- kreator kuponów w czterech profilach (Wysoka trafność, Standardowy, Wyższa wypłata,
+  Tasiemka) i generator „kupon na kurs”, dla dziś / jutro / 3 / 7 dni;
+- **Mój kupon**: własny kupon z oferty STS z walidacją i oceną modelami („OCEŃ MÓJ KUPON AI”),
+  alternatywami i pytaniami; opcjonalnie objaśnienia lokalnego, bezpłatnego modelu AI
+  (Ollama + polski Bielik 11B, domyślnie wyłączone, dane nie opuszczają komputera);
+- symulator budżetu (Monte Carlo) i symulator historyczny (dane as-of);
+- protokół walidacji v2 (holdout nie decyduje), rozliczanie każdej prognozy, panel
+  **Uczenie AI** (champion–challenger, tryb cienia, aktywacja tylko przez użytkownika);
 - analiza meczu prostym językiem: tryb przedmeczowy i pomeczowy;
 - paper trading, automatyczne rozliczenia i panel skuteczności.
 
@@ -23,7 +30,7 @@ Kod jest w **prywatnym** repozytorium GitHub
 [raiderosos555/SportAI](https://github.com/raiderosos555/SportAI). Aplikacja i jej dane
 działają lokalnie: baza, oferty PDF, eksporty, kopie zapasowe i `.env` nie trafiają do
 repozytorium (`.gitignore`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 006](docs/task_006_report.md).
+Stan i ograniczenia: [raport TASK 007](docs/task_007_report.md).
 
 ## Uruchomienie na Windows
 
@@ -40,12 +47,16 @@ Start nie pobiera niczego z sieci; tryb offline jest domyślnie włączony.
 | Krok w aplikacji | Gdzie |
 |---|---|
 | Przegląd dnia: liczby, najlepsze prognozy, kupony, status danych | **Dashboard** |
-| Kupony 3 profili (dziś / jutro / 3 / 7 dni), powody braku kuponu, typy do rozważenia A/B/C | **Kupon dnia** → „ANALIZUJ MECZE I GENERUJ KUPONY” |
+| Kupony 4 profili (dziś / jutro / 3 / 7 dni), powody braku kuponu, typy do rozważenia A/B/C | **Kupon dnia** → „ANALIZUJ MECZE I GENERUJ KUPONY” |
+| Własny kupon z oferty, ocena AI, najsłabsze ogniwo, alternatywy, pytania | **Mój kupon** |
+| Kupon jak najbliżej wybranego kursu; długi kupon 8–12 | **Kupon na kurs**, **Tasiemka** |
+| Ryzyko serii kuponów (Monte Carlo); odtworzenie przeszłego dnia as-of | **Symulator budżetu**, **Symulator historyczny** |
+| Champion i challenger, aktywacja nowego modelu, przegląd, jakość prognoz, ablacja | **Uczenie AI** |
 | Ocena modelu, najbardziej prawdopodobny typ, uzasadnienie, forma, statystyki, składy, tryb po meczu | **Analiza meczów** |
 | Terminarz, zakończone mecze z wynikami, pełna oferta STS i historia kursów, import PDF | **Wydarzenia i wyniki** |
 | Kupony, trafność, ROI, wykres w czasie, rozliczenia, CLV, analizy | **Historia i skuteczność** |
 | Modele prostym językiem, pokrycie oferty, metryki, bramki lig, wersje, eksperymenty | **Modele i statystyki** |
-| Źródła danych, oficjalne pliki STS, ustawienia, podatki i reguły, kopie, diagnostyka | **Źródła i ustawienia** |
+| Źródła danych, oficjalne pliki STS, ustawienia (także lokalny model AI), monitoring, kopie, diagnostyka | **Źródła i ustawienia** |
 | Dane DEMO (fikcyjne, oddzielna baza) | przełącznik w pasku bocznym |
 
 Aktualne wyniki (bezpłatnie): zarejestruj własny klucz na
@@ -68,6 +79,17 @@ PitchAPI (zalecane): darmowy klucz z pitchapi.dev jako `PITCHAPI_KEY=…` w `.en
 
 Profile kuponów i progi walidacji: `config/probability_policy.toml` (wersjonowane).
 
+Lokalny model AI do objaśnień kuponu (opcjonalnie, bezpłatnie): zainstaluj Ollamę z
+[ollama.com](https://ollama.com/download/windows), pobierz model jednym poleceniem i włącz go w
+Źródła i ustawienia → Ustawienia (przycisk „Sprawdź lokalny model”):
+
+```powershell
+ollama pull hf.co/speakleash/Bielik-11B-v2.3-Instruct-GGUF:Q4_K_M
+```
+
+Bielik to polski model SpeakLeash (≈ 6,7 GB; licencja Apache 2.0 + warunki bielik.ai/terms).
+Aplikacja łączy się wyłącznie z Ollamą na tym komputerze (127.0.0.1).
+
 CLI (te same funkcje bez interfejsu):
 
 ```powershell
@@ -84,6 +106,11 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge research goals-predict      # prognozy rynków bramkowych (wszystkie zakresy)
 .\.venv\Scripts\sports-edge research backfill           # historia lig z planu HISTORY_PLAN (bezpłatne źródła)
 .\.venv\Scripts\sports-edge research results            # wyniki z danych niezależnych (pewne dopasowanie)
+.\.venv\Scripts\sports-edge research protocol-v2 --scope core   # nowe modele (challengery) w protokole v2
+.\.venv\Scripts\sports-edge research ablation --scope core      # ablacja A Elo / B DC / C DC+cechy / D ML
+.\.venv\Scripts\sports-edge learning review             # przegląd tygodniowy (np. z Harmonogramu zadań)
+.\.venv\Scripts\sports-edge learning catch-up           # uzupełnienie po przerwie (rozliczenia, wyniki)
+.\.venv\Scripts\sports-edge learning status             # kompletność danych i statusy modeli
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
 .\.venv\Scripts\sports-edge demo
@@ -101,6 +128,8 @@ CLI (te same funkcje bez interfejsu):
 | `data/sources/results/` | surowe odpowiedzi dostawców wyników (pochodzenie każdej aktualizacji) |
 | `.env` | lokalne klucze API (`FOOTBALL_DATA_API_KEY`, `PITCHAPI_KEY`, …) — nigdy w repozytorium |
 | `data/exports/` | eksporty JSON/CSV |
+| `data/drafts/` | szkic Mojego kuponu (sam koszyk, bez kluczy) |
+| `artifacts/qa/` | raport QA interfejsu z `python -m sports_edge.qa` (dane syntetyczne) |
 | `backups/YYYY-MM-DD_HH-MM-SS/` | kopie zapasowe: config, baza (snapshot SQLite), ustawienia, manifest SHA-256 |
 | `config/` | profil STS i podatki, `sts_rules.toml` (zweryfikowane reguły), polityka kuponu, aliasy; `config/archive/` — wycofany Superbet |
 
@@ -112,9 +141,11 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-223 testy (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005 + 27 z TASK 006: m.in. test
-integracyjny od PDF STS do raportu skuteczności, statusy pobierania STS, przypadki braku kuponu,
-analiza pomeczowa i scenariusze interfejsu). Testy parserów używają oznaczonych fixture
+266 testów (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005 + 27 z TASK 006 + 43 z TASK 007:
+m.in. spójność przedziałów, holdout bez wpływu na decyzje, Mój kupon, generator i tasiemka,
+symulatory, rozliczenia prognoz, uczenie oraz 20 ścieżek interfejsu). Artefakt QA w GitHub
+Actions („qa-report”) zawiera raport ścieżek UI, wersje bibliotek i syntetyczny PDF — nigdy
+bazy ani kluczy. Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
 (katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
 uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.
@@ -134,8 +165,15 @@ src/sports_edge/
                   API-Sports, openfootball, STS/Superbet (nieaktywne)
   app/            interfejs Streamlit: main (nawigacja, pasek boczny), ui (design system),
                   page_dashboard, page_coupon, page_match, page_events, pages_history,
-                  page_models, page_sources, diagnostics (analiza EV), common (cache, formaty)
-  storage.py      SQLite tylko-dopisywanie, migracje do v5 z kopią;  repository.py  importy i widoki
+                  page_models, page_sources, diagnostics (analiza EV), common (cache, formaty),
+                  page_my_coupon + cart (Mój kupon), page_generator, page_simulators,
+                  page_learning (Uczenie AI)
+  storage.py      SQLite tylko-dopisywanie, migracje do v6 z kopią;  repository.py  importy i widoki
+  my_coupon.py, advisor.py, explainer.py, llm.py   Mój kupon, ocena AI, pytania, lokalny model (Ollama)
+  analysis/generator.py  kupon na kurs;  simulation.py  symulator budżetu i historyczny
+  learning.py, retraining.py, ablation.py   historia modeli, przegląd, champion–challenger, ablacja
+  collection.py   rozliczanie prognoz, zadania, kompletność;  forecast_quality.py  jakość prognoz
+  maintenance.py  rozmiar, przyrost, integralność, test odtworzenia;  qa.py  ścieżki UI i artefakt
   history.py      historia kursów STS, zmiany, momenty przed meczem, CLV, braki
   results_engine.py  aktualizacja wyników: brakujący okres, duplikaty, korekty, konflikty, hierarchia
   matching.py     dopasowanie STS ↔ dane niezależne, zgodność rynków;  paper.py  kupony, ROI, CLV
@@ -154,6 +192,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 007](docs/task_007_report.md) | P0 (przedziały, protokół v2, zależność par), Mój kupon, profile, symulatory, zbieranie danych, uczenie, TASK 008 |
 | [Raport TASK 006](docs/task_006_report.md) | Redesign, Kupon dnia, analiza meczu, pokrycie 12 lig, zakresy modeli, TASK 007 |
 | [Raport TASK 005](docs/task_005_report.md) | Źródła statystyk, Sports Intelligence, modele i kalibracja, kreator kuponów, TASK 006 |
 | [Raport TASK 004](docs/task_004_report.md) | Diagnoza, źródła wyników, aktualizacja, prognozy, analiza dnia, TASK 005 |
