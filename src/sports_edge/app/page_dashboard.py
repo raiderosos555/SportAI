@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
-from sports_edge.app import cart, ui
+from sports_edge.app import cart, prematch_ui, ui
 from sports_edge.app import common as c
 from sports_edge.performance import builder_coupons
 from sports_edge.repository import imports, offer_days
@@ -122,6 +122,7 @@ def dashboard_page() -> None:
             + ("" if offer["fresh"] else "Najpierw potrzebna jest aktualna oferta STS."),
         )
     c.page_link("kupon", "Przejdź do Kuponu dnia")
+    prematch_ui.control_panel()
 
     left, right = st.columns([3, 2], gap="large")
     with left:

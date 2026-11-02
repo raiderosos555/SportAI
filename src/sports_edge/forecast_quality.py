@@ -11,7 +11,7 @@ import random
 from collections import defaultdict
 from datetime import datetime
 
-from sports_edge import collection
+from sports_edge import collection, learning
 from sports_edge.models.calibration import wilson_interval
 from sports_edge.storage import Store
 
@@ -23,9 +23,12 @@ BINS = [i / 10 for i in range(11)]
 def items(store: Store) -> list[dict]:
     """One row per settled selection: served probability p, outcome y and its context."""
     out = []
+    served = learning.served_check(store)
     for row in collection.settled_forecasts(store):
         if row["status"] != "settled":
             continue
+        if not served(row["model_version_id"], row["predicted_at"]):
+            continue  # a shadow forecast of a challenger: archived, never served
         competition = row["inputs"].get("competition")
         family = row["uncertainty"].get("family") or row["market_key"]
         groups = [
@@ -53,6 +56,8 @@ def items(store: Store) -> list[dict]:
                 out.append(
                     {
                         "event": row["prediction_id"],
+                        "match": row["event_id"],  # independent unit: one match
+                        "group": market_group(market),
                         "p": float(p),
                         "y": int(y),
                         "market": market,
@@ -85,10 +90,58 @@ def _ece(rows: list[dict]) -> float | None:
     return round(err, 4)
 
 
+GROUPS = ("1X2", "Podwójna szansa", "Over/Under", "BTTS", "Gole drużyny")
+ACCURACY = {
+    "1X2": "trafność wskazanego wyniku (najwyższa z 3 szans)",
+    "Podwójna szansa": "trafność najwyżej ocenionej z 3 opcji",
+    "Over/Under": "trafność strony ≥ 50%",
+    "BTTS": "trafność strony ≥ 50%",
+    "Gole drużyny": "trafność strony ≥ 50%",
+}
+
+
+def market_group(market: str) -> str:
+    if market == "1x2":
+        return "1X2"
+    if market == "double_chance":
+        return "Podwójna szansa"
+    if market == "total":
+        return "Over/Under"
+    if market == "btts":
+        return "BTTS"
+    return "Gole drużyny"
+
+
+def by_market(rows: list[dict]) -> dict[str, dict]:
+    """Metrics of each market group separately (never one mixed "accuracy"), plus draws.
+
+    The number of independent matches is reported next to the number of forecasts: several
+    markets of one match are not independent evidence."""
+    out = {}
+    for group in GROUPS:
+        part = [r for r in rows if r["group"] == group]
+        if part:
+            out[group] = {**metrics(part), "accuracy_basis": ACCURACY[group]}
+    draws = [r for r in rows if r["group"] == "1X2" and r["selection"] == "draw"]
+    if draws:
+        hits = sum(r["y"] for r in draws)
+        low, high = wilson_interval(hits, len(draws))
+        out["Remisy"] = {
+            **metrics(draws),
+            "predicted": round(sum(r["p"] for r in draws) / len(draws), 4),
+            "observed": round(hits / len(draws), 4),
+            "observed_ci95": [round(low, 4), round(high, 4)],
+            "accuracy_basis": "średnia prognozowana szansa remisu wobec częstości remisów",
+        }
+    return out
+
+
 def metrics(rows: list[dict], *, seed: int = 7, resamples: int = 300) -> dict:
-    """Pooled metrics of selections; the log loss interval resamples whole forecasts."""
+    """Metrics of selections of ONE kind of market; the log loss interval resamples whole
+    matches (all forecasts of a match together). "accuracy": the forecast's favourite side
+    per prediction — meaningful within one market group only."""
     if not rows:
-        return {"n": 0, "events": 0}
+        return {"n": 0, "events": 0, "matches": 0}
     eps = 1e-6
 
     def loss(part):
@@ -97,18 +150,22 @@ def metrics(rows: list[dict], *, seed: int = 7, resamples: int = 300) -> dict:
         ) / len(part)
 
     by_event: dict[str, list[dict]] = defaultdict(list)
+    by_match: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
         by_event[r["event"]].append(r)
+        by_match[r.get("match") or r["event"]].append(r)
     groups = list(by_event.values())
+    matches = list(by_match.values())
     rng = random.Random(seed)
     draws = sorted(
-        loss([r for g in rng.choices(groups, k=len(groups)) for r in g]) for _ in range(resamples)
+        loss([r for g in rng.choices(matches, k=len(matches)) for r in g]) for _ in range(resamples)
     )
     favourites = [max(g, key=lambda r: r["p"]) for g in groups if len(g) > 1]
     hits = sum(r["y"] for r in favourites)
     return {
         "n": len(rows),
         "events": len(groups),
+        "matches": len(matches),
         "log_loss": round(loss(rows), 4),
         "log_loss_ci95": [
             round(draws[int(0.025 * resamples)], 4),
@@ -120,8 +177,45 @@ def metrics(rows: list[dict], *, seed: int = 7, resamples: int = 300) -> dict:
         "accuracy_ci95": [round(v, 4) for v in wilson_interval(hits, len(favourites))]
         if favourites
         else None,
-        "small_sample": len(groups) < SMALL,
+        "small_sample": len(matches) < SMALL,
     }
+
+
+def coupon_split(coupons: list[dict]) -> list[dict]:
+    """Coupons by kind (SOLO / AKO) and by profile: hit rate with a Wilson interval, the
+    average predicted probability and ROI — a whole coupon, never single selections."""
+    groups: dict[str, list[dict]] = defaultdict(list)
+    for coupon in coupons:
+        groups[f"rodzaj: {'SOLO' if coupon['kind'] == 'solo' else 'AKO'}"].append(coupon)
+        label = (coupon.get("proposal") or {}).get("label") or coupon.get("profile")
+        groups[f"profil: {label}"].append(coupon)
+    out = []
+    for name, part in sorted(groups.items()):
+        decided = [c for c in part if c["outcome"] in {"win", "loss"}]
+        wins = sum(c["outcome"] == "win" for c in decided)
+        stake = sum(float(c["stake"]) for c in decided)
+        profit = sum(float(c["net_profit"] or 0) for c in decided)
+        predicted = [
+            ((c.get("proposal") or {}).get("probability") or {}).get("calibrated") for c in decided
+        ]
+        predicted = [p for p in predicted if p is not None]
+        ci = wilson_interval(wins, len(decided)) if decided else None
+        out.append(
+            {
+                "grupa": name,
+                "kupony": len(part),
+                "rozliczone": len(decided),
+                "wygrane": wins,
+                "trafność": round(wins / len(decided), 4) if decided else None,
+                "trafność_ci95": [round(v, 4) for v in ci] if ci else None,
+                "prognoza_średnio": round(sum(predicted) / len(predicted), 4)
+                if predicted
+                else None,
+                "roi": round(profit / stake, 4) if stake else None,
+                "mała_próba": len(decided) < SMALL,
+            }
+        )
+    return out
 
 
 def calibration(rows: list[dict]) -> list[dict]:

@@ -90,6 +90,37 @@ def champion_id(store: Store, scope: str, family: str) -> str | None:
     return found[-1]["model_version_id"] if found else None
 
 
+def served_check(store: Store):
+    """``served(version_id, at)``: was the version the champion of its scope at that time?
+
+    From the role events (activation / rollback); a store without them serves every
+    version, as before TASK 007. Quality reports use it to leave out shadow forecasts of
+    challengers, which were archived but never served."""
+    timeline: dict[tuple, list[tuple[datetime, str]]] = {}
+    for e in events(store):
+        if e["kind"] in ROLE_KINDS:
+            timeline.setdefault((e["scope"], e["family"]), []).append(
+                (datetime.fromisoformat(e["created_at"]), e["model_version_id"])
+            )
+    if not timeline:
+        return lambda version_id, at: True
+    spans: dict[str, list[tuple[datetime, datetime | None]]] = {}
+    for items in timeline.values():
+        items.sort(key=lambda item: item[0])
+        for i, (start, version_id) in enumerate(items):
+            end = items[i + 1][0] if i + 1 < len(items) else None
+            spans.setdefault(version_id, []).append((start, end))
+
+    def served(version_id: str, at: str | datetime) -> bool:
+        moment = datetime.fromisoformat(at) if isinstance(at, str) else at
+        return any(
+            start <= moment and (end is None or moment < end)
+            for start, end in spans.get(version_id, ())
+        )
+
+    return served
+
+
 def has_roles(store: Store) -> bool:
     return bool(
         store.scalar("SELECT COUNT(*) FROM model_events WHERE kind IN ('activated','rolled_back')")

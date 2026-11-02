@@ -115,6 +115,7 @@ CSS = Template(
 .se-leg { border-top: 1px solid var(--se-border); padding: .55rem 0 .15rem; }
 .se-leg .ev { font-weight: 700; overflow-wrap: anywhere; }
 .se-leg small { display: block; color: var(--se-muted); font-size: .76rem; }
+.se-leg small.note { color: var(--se-info); }
 .se-leg .row { display: flex; justify-content: space-between; gap: .6rem; margin: .2rem 0;
   font-weight: 650; }
 .se-leg .row b { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -335,7 +336,9 @@ def legs_html(legs: Sequence[dict]) -> str:
             f'<div class="ev">{i}. {esc(leg["event"])}</div>'
             f"<small>{esc(leg['when'])}</small>"
             f'<div class="row"><span>{esc(leg["pick"])}</span><b>@ {esc(leg["odds"])}</b></div>'
-            f"<small>{esc(leg['detail'])}</small></div>"
+            f"<small>{esc(leg['detail'])}</small>"
+            + (f'<small class="note">{esc(leg["note"])}</small>' if leg.get("note") else "")
+            + "</div>"
         )
     return "".join(out)
 

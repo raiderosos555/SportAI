@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
-from sports_edge.app import cart, ui
+from sports_edge.app import cart, prematch_ui, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
 from sports_edge.services import (
@@ -278,6 +278,7 @@ def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool)
 
 
 def _card(name, profile, payload, refusal, coupon_id, alternatives) -> None:
+    db = c.store()
     with st.container(border=True):
         st.markdown(
             f'<div class="se-title">{ui.esc(profile["label"])}</div>'
@@ -348,6 +349,10 @@ def _card(name, profile, payload, refusal, coupon_id, alternatives) -> None:
                             "zwalidowany"
                             if leg["predictive_status"] == "validated_predictive"
                             else "eksperymentalny"
+                        ),
+                        "note": prematch_ui.leg_status(
+                            db,
+                            leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"]),
                         ),
                     }
                     for leg in payload["legs"]

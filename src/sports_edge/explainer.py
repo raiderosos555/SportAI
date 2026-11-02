@@ -44,6 +44,15 @@ EXAMPLES = (
     "Dlaczego ten kupon nie kwalifikuje się do profilu standardowego?",
     "Czy ten kupon ma większą szansę niż propozycja automatyczna?",
 )
+LINEUP_EXAMPLES = (
+    "Czy opublikowano oficjalne składy?",
+    "Czy wykryto nowe absencje?",
+    "Czy podstawowy bramkarz wystąpi?",
+    "Co zmieniło się od ostatniej analizy?",
+    "Który mecz mojego kuponu wymaga uwagi?",
+    "Czy obecna prognoza uwzględnia składy?",
+    "Jakich danych brakuje?",
+)
 
 
 def _plain(text: str) -> str:
@@ -91,6 +100,9 @@ def answer(
     legs = report["legs"]
     if not legs:
         return _out("Kupon jest pusty — dodaj selekcje, aby o nie zapytać.")
+    lineup = _lineups(q, report)
+    if lineup is not None:
+        return lineup
     if any(word in q for word in ("ryzykown", "najslabsz", "najgorsz", "slabe ogniwo")):
         return _weakest(report)
     if any(word in q for word in ("usun", "bez ", "wyrzuc", "skresl")):
@@ -106,6 +118,90 @@ def answer(
         "Nie rozpoznałem pytania. Spróbuj na przykład: " + " • ".join(EXAMPLES),
         recognised=False,
     )
+
+
+LINEUP_WORDS = (
+    "sklad",
+    "absenc",
+    "kontuz",
+    "zawiesz",
+    "bramkar",
+    "zmienil",
+    "zmian",
+    "brakuje",
+    "brak danych",
+    "uwagi",
+)
+
+
+def _lineups(q: str, report: dict) -> dict | None:
+    """Questions about lineups and absences — answered only from stored observations."""
+    if not any(word in q for word in LINEUP_WORDS):
+        return None
+    if "uwzgledni" in q or ("prognoz" in q and "sklad" in q):
+        return _out(
+            "Nie. Modele Elo i Dixon–Coles liczą szanse z wyników meczów; składy i absencje są "
+            "pokazywane jako informacja i ostrzeżenia, ale nie zmieniają procentów (brak "
+            "zwalidowanego modelu ich wpływu)."
+        )
+    legs = [(r["event"], r.get("lineups") or {}) for r in report["legs"]]
+    if not any(info.get("observed") for _event, info in legs):
+        return _out(
+            "Brak zapisanych obserwacji składów dla meczów kuponu — uruchom kontrolę składów "
+            "(Automatyzacja AI lub przycisk sprawdzenia kuponu) albo poczekaj na harmonogram "
+            "przedmeczowy."
+        )
+    if "absenc" in q or "kontuz" in q or "zawiesz" in q:
+        lines = [
+            f"{e}: "
+            + (
+                ", ".join(i["absences"])
+                if i.get("absences")
+                else i.get("absence_source", "brak danych")
+            )
+            for e, i in legs
+        ]
+        return _out("Absencje: " + "; ".join(lines) + ".", lines)
+    if "bramkar" in q:
+        lines = []
+        for e, i in legs:
+            keepers = i.get("goalkeepers") or {}
+            shown = ", ".join(v for v in keepers.values() if v) or "brak składu"
+            lines.append(f"{e}: {shown} ({i.get('lineup_status', 'brak danych')})")
+        return _out(
+            "Bramkarze w ostatnio zapisanych składach: " + "; ".join(lines) + ". Skład "
+            "przewidywany nie jest potwierdzeniem występu.",
+            lines,
+        )
+    if "zmienil" in q or "zmian" in q:
+        lines = [
+            f"{e}: " + ("; ".join(i["changes"]) if i.get("changes") else "bez zmian")
+            for e, i in legs
+        ]
+        return _out("Od poprzedniej kontroli: " + "; ".join(lines) + ".", lines)
+    if "uwagi" in q or "wymaga" in q:
+        flagged = [e for e, i in legs if i.get("changes") or not i.get("lineup_confirmed")]
+        if not flagged:
+            return _out("Żaden mecz nie ma nowych zmian, a składy są potwierdzone.")
+        return _out(
+            "Uwagi wymagają: " + ", ".join(flagged) + " (zmiany w składzie albo brak "
+            "potwierdzonego składu).",
+            flagged,
+        )
+    if "brakuje" in q or "brak danych" in q:
+        lines = []
+        for e, i in legs:
+            missing = []
+            if not i.get("lineup_confirmed"):
+                missing.append("potwierdzonego składu")
+            if not i.get("absences"):
+                missing.append("zweryfikowanych absencji")
+            if i.get("needs_refresh"):
+                missing.append("świeżej kontroli")
+            lines.append(f"{e}: brak " + ", ".join(missing) if missing else f"{e}: komplet")
+        return _out("Braki danych: " + "; ".join(lines) + ".", lines)
+    lines = [f"{e}: {i.get('lineup_status', 'brak danych')}" for e, i in legs]
+    return _out("Stan składów: " + "; ".join(lines) + ".", lines)
 
 
 def _out(text: str, facts: list[str] | None = None, *, recognised: bool = True) -> dict:

@@ -24,7 +24,49 @@ def supported(c: Candidate | None) -> bool:
     return c is not None and c.p_model is not None and c.probability_ok and c.p_low is not None
 
 
-def leg_report(leg: dict, c: Candidate | None, *, now: datetime) -> dict:
+# A pre-match check older than this is reported as "needs a fresh check".
+LINEUP_FRESH_HOURS = 6
+
+
+def lineup_facts(store, event_id: str | None, *, now: datetime) -> dict:
+    """Stored pre-match information of one match (no network): what is known, what changed,
+    what is missing — and that the forecast did not use it."""
+    if store is None or not event_id:
+        return {}
+    from sports_edge import prematch
+
+    info = prematch.summary(store, event_id)
+    check = info["last_check"]
+    verified = [a for a in info["absences"] if a["match_status"] == "verified"]
+    stale = (
+        check is None
+        or (now - datetime.fromisoformat(check["executed_at"])).total_seconds()
+        > LINEUP_FRESH_HOURS * 3600
+    )
+    keepers = {
+        side: (prematch.goalkeeper(row) or {}).get("name")
+        for side, row in info["sides"].items()
+        if row
+    }
+    return {
+        "observed": bool(check or keepers or info["absences"]),
+        "lineup_status": info["lineup_label"],
+        "lineup_confirmed": info["lineup_status"] in ("confirmed", "official"),
+        "last_check": check["executed_at"] if check else None,
+        "changes": [c["detail"] for c in info["changes"]],
+        "absences": [
+            f"{a['player_name']} ({prematch.ABSENCE_REASON.get(a['reason'], a['reason'])}, "
+            f"źródło: {a['source']})"
+            for a in verified
+        ],
+        "absence_source": "zweryfikowane wpisy" if verified else "brak zweryfikowanego źródła",
+        "goalkeepers": keepers,
+        "needs_refresh": stale,
+        "model_uses_lineups": False,
+    }
+
+
+def leg_report(leg: dict, c: Candidate | None, *, now: datetime, store=None) -> dict:
     """Plain evaluation of one selection of the coupon."""
     base = {
         "event": leg["event"],
@@ -32,6 +74,7 @@ def leg_report(leg: dict, c: Candidate | None, *, now: datetime) -> dict:
         "market": leg.get("market", ""),
         "selection_id": leg["selection_id"],
         "odds": c.odds if c is not None else Decimal(leg["added_odds"]),
+        "lineups": lineup_facts(store, leg.get("event_id"), now=now),
     }
     if c is None:
         return {
@@ -118,9 +161,12 @@ def evaluate(
     cost: CostProfile,
     on_date,
     now: datetime,
+    store=None,
 ) -> dict:
     summary = mine.summary(cart, rows, stake=stake, cost=cost, on_date=on_date)
-    reports = [leg_report(leg, row, now=now) for leg, row in zip(cart, rows, strict=True)]
+    reports = [
+        leg_report(leg, row, now=now, store=store) for leg, row in zip(cart, rows, strict=True)
+    ]
     weak = weakest(reports)
     uncertainties = []
     if summary["probability_note"]:

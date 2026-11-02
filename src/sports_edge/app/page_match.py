@@ -12,14 +12,12 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
-from sports_edge.app import cart, ui
+from sports_edge.app import advanced_ui, cart, prematch_ui, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
-from sports_edge.results_engine import SOURCE_LABELS
 from sports_edge.services import (
     event_context,
     event_features,
-    event_lineups,
     match_review,
     probability_policy,
 )
@@ -114,7 +112,7 @@ def match_page() -> None:
     ui.section("Najbardziej prawdopodobny obsługiwany typ")
     _pick(rows, now, max_odds, started, day)
     ui.section("Dlaczego model tak ocenia ten mecz?")
-    _why(rows, context, teams, review.get("forecast") if started else None)
+    advanced_ui.why(db, rows, context, teams, review.get("forecast") if started else None)
     tabs = st.tabs(
         [
             "Forma",
@@ -330,60 +328,6 @@ def _pick(rows, now, max_odds, started, day) -> None:
     cart.add_button(x, day=day, key=f"match_add_{x.selection_id}")
 
 
-def _why(rows, context, teams, original=None) -> None:
-    prediction = original or context.get("prediction") or {}
-    inputs = prediction.get("inputs") or {}
-    used = []
-    games = inputs.get("games") or []
-    counted = (
-        f" ({ins.plural(games[0], 'mecz', 'mecze', 'meczów')} i "
-        f"{ins.plural(games[1], 'mecz', 'mecze', 'meczów')})"
-        if len(games) == 2
-        else ""
-    )
-    one_x_two = str(prediction.get("family") or "")
-    if one_x_two.startswith("elo"):
-        used.append(
-            "Wynik 1X2 i podwójna szansa: siła obu drużyn (Elo) obliczona z wyników ich meczów"
-            + counted
-            + ", z przewagą własnego boiska."
-        )
-    if any(r.model and "dixon" in r.model for r in rows if r.p_model is not None):
-        used.append(
-            "Model goli (Dixon–Coles): średnie gole zdobyte i stracone obu drużyn z ostatnich "
-            "2 lat, starsze mecze ważą mniej"
-            + ("" if one_x_two.startswith("elo") else counted)
-            + " — z nich szanse liczby goli i BTTS"
-            + ("." if one_x_two.startswith("elo") else ", a w tej lidze także 1X2.")
-        )
-    if used:
-        used.append(
-            "Prawdopodobieństwa skalibrowane na meczach z sezonów 2022–2024 (sprawdzone na "
-            "późniejszych meczach)."
-        )
-    fresh = context.get("freshness") or {}
-    if fresh:
-        used.append(
-            f"Wyniki ligi do {fresh.get('last_result')} (źródła: "
-            + ", ".join(SOURCE_LABELS.get(p, p) for p in fresh.get("providers", {}))
-            + ")."
-        )
-    extra = []
-    for side, label in (("home", "Gospodarze"), ("away", "Goście")):
-        for point in ins.form_points(teams.get(side)):
-            extra.append(f"{label}: {point}")
-    extra.append("Składy, kontuzje i statystyki meczowe nie wpływają na prognozę.")
-    left, right = st.columns(2, gap="medium")
-    with left:
-        ui.explanation(
-            "Dane wykorzystane przez model",
-            used or ["Brak modelu dla tego wydarzenia."],
-            tone="accent",
-        )
-    with right:
-        ui.explanation("Dodatkowe informacje o meczu (poza modelem)", extra)
-
-
 # ---------------------------------------------------------------- tabs
 
 
@@ -488,6 +432,10 @@ def _stats(teams, head) -> None:
 
 
 def _lineups(db, context, event_id, now, started) -> None:
+    start_at = (context.get("event") or {}).get("start_at")
+    if prematch_ui.lineups_panel(db, event_id, start_at=start_at, now=now, started=started):
+        return
+    # observations stored before the pre-match engine (TASK 007) are still shown
     teams = context.get("teams") or {}
     names = [teams[s]["canonical"] for s in ("home", "away")] if teams else []
     stored = None
@@ -495,14 +443,6 @@ def _lineups(db, context, event_id, now, started) -> None:
         stored = latest_lineups(
             db, home=names[0], away=names[1], day=context["event"]["start_at"][:10]
         )
-    if not started and st.button(
-        "Sprawdź składy (PitchAPI, 2 zapytania)", key=f"lineups_{event_id}"
-    ):
-        out = event_lineups(db, c.paths(), c.settings(), event_id=event_id, now=now)
-        if out["status"] == "ok":
-            stored = {"lineups": out["lineups"], "observed_at": out["observed_at"]}
-        else:
-            st.info(out["status"])
     if stored:
         observed = datetime.fromisoformat(stored["observed_at"])
         start = datetime.fromisoformat(context["event"]["start_at"])
@@ -521,10 +461,6 @@ def _lineups(db, context, event_id, now, started) -> None:
         )
     else:
         st.caption("Składy są publikowane zwykle około godziny przed meczem.")
-    st.caption(
-        "Kontuzje i zawieszenia: brak bezpłatnego, zweryfikowanego źródła. Modele nie uwzględniają "
-        "składów ani absencji."
-    )
 
 
 def _markets(rows, day, started) -> None:

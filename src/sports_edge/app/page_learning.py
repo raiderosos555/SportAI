@@ -12,17 +12,21 @@ import streamlit as st
 from sports_edge import forecast_quality as fq
 from sports_edge import insights as ins
 from sports_edge import learning, retraining
+from sports_edge.app import advanced_ui, ui
 from sports_edge.app import common as c
-from sports_edge.app import ui
-from sports_edge.collection import completeness, last_success
+from sports_edge.collection import completeness
 from sports_edge.performance import builder_coupons, coupon_performance
 from sports_edge.services import (
     ELO_FAMILY,
     GOALS_FAMILY,
     MODEL_SCOPES,
+    ROLE_LABELS,
     SCOPE_LABELS,
     ablation_reports,
     challenger_versions,
+    model_versions_of,
+    switch_models,
+    train_now,
 )
 
 STATUS_TONE = {
@@ -63,6 +67,7 @@ def learning_panel() -> None:
     _review(db, now)
     _quality(db, now)
     _coupons(db)
+    advanced_ui.engine_panel()
     _ablation()
     ui.section("Historia uczenia", "każda decyzja jest zapisana i nie może być zmieniona")
     rows = retraining.history(db)
@@ -111,15 +116,7 @@ def _scope(db, scope: str, now) -> None:
             disabled=not sure,
             icon=":material/rocket_launch:",
         ):
-            learning.activate(
-                db,
-                scope=scope,
-                versions=versions,
-                now=c.now(),
-                reason="Decyzja użytkownika w panelu Uczenie AI",
-            )
-            st.cache_data.clear()
-            st.rerun()
+            _switch(scope, versions, "Decyzja użytkownika w panelu Uczenie AI (aktywacja)")
         if cols[1].button(
             "POZOSTAW POPRZEDNI MODEL",
             key=f"learn_keep_{scope}",
@@ -134,55 +131,145 @@ def _scope(db, scope: str, now) -> None:
                 reason="Decyzja użytkownika w panelu Uczenie AI",
             )
             st.rerun()
-    older = learning.previous_champions(db, scope, ELO_FAMILY)
-    if older:
-        with st.expander("Przywróć starszą wersję"):
-            choice = st.selectbox(
-                "Wersja Elo", older, key=f"learn_old_{scope}", format_func=lambda v: v[:12]
+    _versions(db, scope)
+    _train(scope)
+
+
+def _switch(scope: str, versions: dict[str, str], reason: str) -> None:
+    with st.spinner("Zmiana modelu i prognozy nadchodzących meczów…"):
+        switch_models(
+            c.store(), c.paths(), scope=scope, versions=versions, now=c.now(), reason=reason
+        )
+    st.cache_data.clear()
+    st.rerun()
+
+
+def _versions(db, scope: str) -> None:
+    """Every version of the scope; any of them can be served again (also a rejected one)."""
+    rows = model_versions_of(db, scope)
+    with st.expander("Wszystkie wersje modeli i przywracanie"):
+        if not rows:
+            st.caption("Brak wersji w tym zakresie.")
+            return
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Model": "Elo" if r["family"] == ELO_FAMILY else "Dixon–Coles",
+                        "Wersja": r["version"],
+                        "Utworzona": c.local_time(r["created_at"], "%d.%m.%Y %H:%M"),
+                        "Protokół": r["protocol"],
+                        "Rola": ROLE_LABELS[r["role"]],
+                        "Log loss (okno selekcji)": r["log_loss"],
+                        "Zwalidowane rynki": ", ".join(r["validated"]) or "—",
+                    }
+                    for r in rows
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Wersje protokołu v1 mają statusy zawieszone (holdout był użyty do decyzji) — "
+            "ich typy są zawsze eksperymentalne."
+        )
+        chosen = {}
+        cols = st.columns(2)
+        for col, family, label in (
+            (cols[0], ELO_FAMILY, "Elo (1X2, podwójna szansa)"),
+            (cols[1], GOALS_FAMILY, "Dixon–Coles (gole i rynki)"),
+        ):
+            options = [r for r in rows if r["family"] == family]
+            if not options:
+                continue
+            active = next((i for i, r in enumerate(options) if r["role"] == "active"), 0)
+            pick = col.selectbox(
+                label,
+                options,
+                index=active,
+                key=f"learn_pick_{scope}_{family}",
+                format_func=lambda r: (
+                    f"{r['version']} · {r['protocol']} · {ROLE_LABELS[r['role']]}"
+                ),
             )
-            if st.button("Przywróć wybraną wersję", key=f"learn_back_{scope}"):
-                learning.rollback(
-                    db,
-                    scope=scope,
-                    family=ELO_FAMILY,
-                    version_id=choice,
-                    now=c.now(),
-                    reason="Przywrócenie przez użytkownika",
-                )
-                st.cache_data.clear()
-                st.rerun()
+            if pick["role"] != "active":
+                chosen[family] = pick["version_id"]
+        sure = st.checkbox(
+            "Rozumiem: wybrane wersje zastąpią aktywne modele tego zakresu",
+            key=f"learn_pick_sure_{scope}",
+        )
+        if st.button(
+            "Ustaw wybrane jako aktywne",
+            key=f"learn_pick_go_{scope}",
+            icon=":material/restore:",
+            disabled=not (sure and chosen),
+        ):
+            _switch(scope, chosen, "Wybór wersji przez użytkownika w panelu Uczenie AI")
+
+
+def _train(scope: str) -> None:
+    """Training on demand: new versions become challengers; activation stays with the user."""
+    if st.button(
+        f"Trenuj teraz — {SCOPE_LABELS[scope]}",
+        key=f"learn_train_{scope}",
+        icon=":material/model_training:",
+        help="Protokół v2 na aktualnych danych (1–2 min). Nowe wersje trafiają do trybu cienia "
+        "jako challengery — aktywujesz je sam po porównaniu.",
+    ):
+        with st.status("Trening w toku…", expanded=True) as box:
+            try:
+                train_now(c.store(), c.paths(), now=c.now(), scope=scope, progress=box.write)
+            except ValueError as error:
+                box.update(label="Trening nieudany", state="error")
+                st.error(str(error))
+                return
+            box.update(label="Walidacja zakończona — challengery gotowe", state="complete")
+        st.cache_data.clear()
+        st.rerun()
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=8)
+def _conditions(_db, version: tuple, at) -> dict:
+    """Training conditions of every scope (unique matches since training) — cached."""
+    return {
+        scope: retraining.conditions(_db, scope, competitions, now=at)
+        for scope, competitions in MODEL_SCOPES.items()
+    }
 
 
 def _review(db, now) -> None:
-    ui.section("Przegląd modeli", "co tydzień; trening tylko przy spełnionych warunkach")
-    last = last_success(db, "retraining_review")
-    due = retraining.due(db, now=now)
-    ui.pills(
-        [
-            (f"Ostatni przegląd: {c.local_time(last.isoformat()) if last else 'nigdy'}", "neutral"),
-            ("Przegląd zalecany" if due else "Przegląd aktualny", "warn" if due else "ok"),
-        ]
+    ui.section(
+        "Przegląd modeli",
+        "w panelu Automatyzacja AI według harmonogramu; na żądanie — Trenuj teraz wyżej",
     )
+    due = retraining.due(db, now=now)
+    ui.pills([("Przegląd zalecany" if due else "Przegląd aktualny", "warn" if due else "ok")])
+    found = _conditions(db, c.data_version(db), c.minute())
     rows = []
-    for scope, competitions in MODEL_SCOPES.items():
-        ready, reasons = retraining.conditions(db, scope, competitions, now=now)
+    for scope in MODEL_SCOPES:
+        ready, reasons = found[scope]
+        moments = retraining.timeline(db, scope)
         rows.append(
             {
                 "Zakres": SCOPE_LABELS[scope],
+                "Ostatni przegląd": c.local_time(moments["review"], "%d.%m %H:%M"),
+                "Ostatni trening": c.local_time(moments["training"], "%d.%m %H:%M"),
+                "Ostatnia walidacja": c.local_time(moments["validation"], "%d.%m %H:%M"),
+                "Ostatnia aktywacja": c.local_time(moments["activation"], "%d.%m %H:%M"),
                 "Warunki treningu": "spełnione" if ready else "niespełnione",
                 "Powód": "; ".join(reasons) or "—",
             }
         )
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    if st.button("Uruchom przegląd teraz", icon=":material/model_training:"):
-        with st.spinner("Trening w toku — protokół v2 (kilka minut)…"):
-            found = retraining.review(db, c.paths(), now=c.now(), trigger="manual")
-        st.json(found, expanded=False)
     st.caption(
-        "Harmonogram w Windows (opcjonalnie, ustawiasz sam): Harmonogram zadań → Utwórz zadanie "
-        "co tydzień z poleceniem: .venv\\Scripts\\sports-edge.exe learning review "
-        "(w folderze projektu). Aplikacja nie tworzy zadań systemowych sama."
+        "Przegląd zakończony decyzją „za mało danych” jest zapisany jako wykonany — kolejny "
+        "nastąpi po upływie okresu przeglądu. Walidacja w protokole v2 jest częścią treningu."
     )
+    if st.button("Uruchom przegląd teraz", icon=":material/fact_check:"):
+        with st.spinner("Przegląd modeli…"):
+            result = retraining.review(db, c.paths(), now=c.now(), trigger="manual")
+        st.cache_data.clear()
+        st.json(result, expanded=False)
 
 
 def _quality(db, now) -> None:
@@ -203,41 +290,60 @@ def _quality(db, now) -> None:
     if not rows:
         ui.empty_state("Brak rozliczonych prognoz", "Pojawią się po wynikach meczów z prognozą.")
         return
-    pooled = fq.metrics(rows)
-    ui.metric_cards(
-        [
-            ("Rozliczone prognozy", str(pooled["events"]), f"{pooled['n']} selekcji"),
-            (
-                "Log loss",
-                ins.num(pooled["log_loss"], 3),
-                f"95%: {ins.num(pooled['log_loss_ci95'][0], 3)}–{ins.num(pooled['log_loss_ci95'][1], 3)}",
-            ),
-            ("Brier", ins.num(pooled["brier"], 3), "niżej = lepiej"),
-            ("ECE", ins.num(pooled["ece"], 3), "błąd kalibracji"),
-            (
-                "Trafność faworyta",
-                ins.pct(pooled["accuracy"]),
-                f"95%: {ins.pct(pooled['accuracy_ci95'][0])}–{ins.pct(pooled['accuracy_ci95'][1])}"
-                if pooled["accuracy_ci95"]
-                else "—",
-            ),
-        ]
-    )
-    if pooled["small_sample"]:
-        st.warning("Mała próba (mniej niż 30 rozliczonych prognoz) — wnioski są wstępne.")
+    markets = fq.by_market(rows)
+    table = []
+    for group, m in markets.items():
+        low, high = m["log_loss_ci95"]
+        table.append(
+            {
+                "Rynek": group,
+                "Mecze (niezależne)": m["matches"],
+                "Prognozy": m["events"],
+                "Log loss": m["log_loss"],
+                "95% log loss": f"{ins.num(low, 3)}–{ins.num(high, 3)}",
+                "Brier": m["brier"],
+                "ECE": m["ece"],
+                "Trafność": ins.pct(m["accuracy"])
+                if group != "Remisy"
+                else f"prognoza {ins.pct(m['predicted'])} · wynik {ins.pct(m['observed'])}",
+                "Co znaczy trafność": m["accuracy_basis"],
+                "Próba": "mała" if m["small_sample"] else "wystarczająca",
+            }
+        )
+    st.markdown("**Każdy rynek osobno** — bez mieszania łatwych i trudnych rynków")
+    st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch")
+    if any(m["small_sample"] for m in markets.values()):
+        st.warning(
+            "Mała próba: mniej niż 30 niezależnych meczów w części rynków — wnioski są wstępne. "
+            "Kilka rynków jednego meczu to nie są niezależne dowody."
+        )
     left, right = st.columns(2, gap="large")
     with left:
-        st.markdown("**Kalibracja wg przedziału szansy**")
+        st.markdown("**Kalibracja wg przedziału szansy (wszystkie rynki)**")
         st.dataframe(pd.DataFrame(fq.calibration(rows)), hide_index=True, width="stretch")
     with right:
-        st.markdown("**Wg rynku**")
-        frame = pd.DataFrame(
-            [
-                {"rynek": k, **{m: v.get(m) for m in ("events", "log_loss", "brier", "ece")}}
-                for k, v in fq.by(rows, "family").items()
-            ]
+        st.markdown("**Kupony: SOLO, AKO i profile**")
+        split = fq.coupon_split(builder_coupons(db))
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Grupa": r["grupa"],
+                        "Kupony": r["kupony"],
+                        "Rozliczone": r["rozliczone"],
+                        "Trafność": ins.pct(r["trafność"]),
+                        "95%": f"{ins.pct(r['trafność_ci95'][0])}–{ins.pct(r['trafność_ci95'][1])}"
+                        if r["trafność_ci95"]
+                        else "—",
+                        "Prognoza (śr.)": ins.pct(r["prognoza_średnio"]),
+                        "ROI": ins.pct(r["roi"]),
+                    }
+                    for r in split
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
         )
-        st.dataframe(frame, hide_index=True, width="stretch")
     with st.expander("Wg ligi, wersji modelu i tygodnia (stabilność)"):
         for title, key in (("Liga", "competition"), ("Wersja modelu", "version")):
             st.markdown(f"**{title}**")

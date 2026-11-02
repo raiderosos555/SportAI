@@ -190,7 +190,7 @@ def backup(include_raw: bool) -> None:
 
 
 def learning(action: str, *, force: bool = False) -> None:
-    """Weekly review (Windows Task Scheduler friendly), catch-up and status reports."""
+    """Model review, catch-up and status reports (automation itself runs from the web UI)."""
     from sports_edge import collection, retraining, services
 
     paths, settings, store = _context()

@@ -143,6 +143,9 @@ PAGES = {
     "budzet": "from sports_edge.app.page_simulators import budget_page; budget_page()",
     "historyczny": "from sports_edge.app.page_simulators import historical_page; historical_page()",
     "uczenie": "from sports_edge.app.page_learning import learning_page; learning_page()",
+    "automatyzacja": (
+        "from sports_edge.app.page_automation import automation_page; automation_page()"
+    ),
 }
 
 

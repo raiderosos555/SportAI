@@ -1147,6 +1147,14 @@ def run_analysis(
         forecasts = generate_predictions(store, paths, now=now, events=upcoming)
     if any(pair["goals"] for pair in served.values()):
         goals = generate_goals_predictions(store, paths, now=now, events=upcoming)
+    shadow_advanced = None
+    if forecasts:
+        from sports_edge import advanced_lab
+
+        try:  # admitted extended challengers: frozen, archived, never served
+            shadow_advanced = advanced_lab.generate(store, paths, now=now, events=upcoming)
+        except (ValueError, KeyError) as error:
+            errors.append(f"model rozszerzony (tryb cienia): {error}")
     core = served["core"]["elo"] or next((p["elo"] for p in served.values() if p["elo"]), None)
     core_goals = served["core"]["goals"] or next(
         (p["goals"] for p in served.values() if p["goals"]), None
@@ -1173,6 +1181,7 @@ def run_analysis(
         forecasts_saved=forecasts["saved"] if forecasts else 0,
         forecasts_kept=forecasts["kept"] if forecasts else 0,
         goals_saved=goals["saved"] if goals else 0,
+        advanced_shadow_saved=(shadow_advanced or {}).get("saved", 0),
         skipped=(forecasts or {}).get("skipped", [])[:50],
         errors=errors,
     )
@@ -1352,6 +1361,7 @@ def proposal_payload(proposal: Proposal, *, policy_version: str) -> dict:
         "legs": [
             {
                 "event": leg.event,
+                "event_id": leg.event_id,
                 "league": leg.league,
                 "start_at": leg.start_at,
                 "market": leg.market_label,
@@ -1483,6 +1493,7 @@ def my_coupon_payload(rows: list[Candidate], summary: dict, *, policy_version: s
         "legs": [
             {
                 "event": leg.event,
+                "event_id": leg.event_id,
                 "league": leg.league,
                 "start_at": leg.start_at,
                 "market": leg.market_label,
@@ -1517,27 +1528,48 @@ def save_my_coupon(
     stake: Decimal,
     now: datetime,
     real: bool = False,
+    late: bool = False,
 ) -> str:
     """Save MÓJ KUPON as a virtual coupon (or a manually recorded real one). Refused while a
-    blocking problem remains (stale price, started event, contradiction, one match twice)."""
+    blocking problem remains (stale price, started event, contradiction, one match twice).
+
+    ``late``: a coupon already placed in STS, recorded after its matches started. It is a
+    real entry with prices observed before each start, kept apart from prospective coupons
+    (profile "my_coupon_after") because choosing legs after seeing results is hindsight."""
     from sports_edge import my_coupon as mine
 
     sts = load_profiles(paths.config)["sts"]
-    summary = mine.summary(cart, rows, stake=stake, cost=sts.cost, on_date=now.date())
+    first = min((row.start_at for row in rows if row is not None and row.start_at), default=None)
+    on_date = datetime.fromisoformat(first).date() if late and first else now.date()
+    summary = mine.summary(cart, rows, stake=stake, cost=sts.cost, on_date=on_date, late=late)
     blocking = [i.message for i in summary["issues"] if i.severity == "block"]
     if blocking:
         raise ValueError("Kupon nie może być zapisany: " + "; ".join(blocking))
     present = [row for row in rows if row is not None]
     payload = my_coupon_payload(present, summary, policy_version=probability_policy(paths).version)
+    if late:
+        payload.update(
+            profile="my_coupon_after",
+            label="MÓJ KUPON — wpis po fakcie",
+            entered_after_start=True,
+        )
     return create_coupon(
         store,
         odds_ids=[row.odds_id for row in present],
         stake=stake,
-        mode="real_manual" if real else "paper_manual",
+        mode="real_manual" if real or late else "paper_manual",
         profile=sts,
         now=now,
-        note="Mój kupon" + (" — postawiony w STS (wpis ręczny)" if real else ""),
+        note="Mój kupon"
+        + (
+            " — postawiony w STS, wpis po rozpoczęciu meczu"
+            if late
+            else " — postawiony w STS (wpis ręczny)"
+            if real
+            else ""
+        ),
         proposal=payload,
+        late_entry=late,
     )
 
 
@@ -1999,6 +2031,320 @@ def run_protocol_v2(
                 family=family,
             )
     return {"elo": elo, "goals": goals, "summary": summary}
+
+
+ROLE_LABELS = {
+    "active": "aktywna",
+    "challenger": "challenger (tryb cienia)",
+    "rejected": "odrzucona",
+    "previous": "poprzednio aktywna",
+    "unused": "nieużywana",
+}
+
+
+def model_versions_of(store: Store, scope: str) -> list[dict]:
+    """Every version of both models of a scope with its role (for choosing what to serve)."""
+    out = []
+    for family in (ELO_FAMILY, GOALS_FAMILY):
+        champion = scope_version(store, MODEL_SCOPES[scope], family)
+        events = learning.events(store, scope=scope, family=family)
+        waiting = set(learning.challengers(store, scope, family))
+        rejected = {
+            e["model_version_id"] for e in events if e["kind"] in ("rejected", "kept_previous")
+        }
+        served = {e["model_version_id"] for e in events if e["kind"] in learning.ROLE_KINDS}
+        for row in model_overview(store):
+            competitions = version_competitions(row)
+            if row["family"] != family or not competitions:
+                continue
+            if not set(competitions) <= set(MODEL_SCOPES[scope]):
+                continue
+            report = json.loads(row["validation_json"])
+            vid = row["version_id"]
+            role = (
+                "active"
+                if champion and vid == champion["version_id"]
+                else "challenger"
+                if vid in waiting
+                else "rejected"
+                if vid in rejected
+                else "previous"
+                if vid in served
+                else "unused"
+            )
+            decision = report.get("decision") if report.get("protocol") == "v2" else None
+            validated = [
+                k
+                for k, v in (report.get("predictive") or report.get("elo_predictive") or {}).items()
+                if v.get("status") == "validated_predictive"
+            ]
+            out.append(
+                {
+                    "family": family,
+                    "version_id": vid,
+                    "version": row["version"],
+                    "created_at": row["created_at"],
+                    "protocol": report.get("protocol", "v1"),
+                    "role": role,
+                    "log_loss": (decision or {}).get("log_loss"),
+                    "validated": validated if report.get("protocol") == "v2" else [],
+                }
+            )
+    return out
+
+
+def switch_models(
+    store: Store,
+    paths: AppPaths,
+    *,
+    scope: str,
+    versions: dict[str, str],
+    now: datetime,
+    reason: str,
+) -> dict:
+    """Serve the chosen versions (user decision) and forecast upcoming events with them at
+    once, so the new champions do not start without forecasts."""
+    learning.activate(store, scope=scope, versions=versions, now=now, reason=reason)
+    out = {"activated": versions}
+    try:
+        out["elo"] = generate_predictions(store, paths, now=now)["scopes"].get(scope)
+        out["goals"] = generate_goals_predictions(store, paths, now=now)["scopes"].get(scope)
+    except ValueError as error:
+        out["forecasts"] = str(error)
+    return out
+
+
+def train_now(store: Store, paths: AppPaths, *, now: datetime, scope: str, progress=None) -> dict:
+    """Training on demand (button in Uczenie AI): new versions under protocol v2 become
+    challengers in shadow mode at once; activating them stays the user's decision."""
+    found = run_protocol_v2(store, paths, now=now, scope=scope, progress=progress)
+    if progress:
+        progress("Prognozy challengerów (tryb cienia)")
+    try:
+        generate_predictions(store, paths, now=now)
+        generate_goals_predictions(store, paths, now=now)
+    except ValueError:
+        pass  # no served model at all: the challengers still exist
+    return found
+
+
+# ---------------------------------------------------------------- TASK 008: pre-match
+
+
+def lineup_fetcher(
+    store: Store, paths: AppPaths, settings: AppSettings, *, now: datetime, provider=None
+):
+    """``fetch(event) → (provider match id, lineup payload or None, requests)`` for the
+    pre-match engine. The PitchAPI match of an STS event is found once (verified team names,
+    kick-off within 36 h) and kept in ``provider_fixtures``; season lists are cached per run."""
+    from sports_edge.datasources.pitchapi import ENV_KEY as PITCH_KEY
+    from sports_edge.datasources.pitchapi import season_label
+    from sports_edge.results_engine import known_names
+
+    provider = provider or PitchApiProvider(local_secret(PITCH_KEY, paths.root))
+    status = provider.status(offline=settings.offline_mode)
+    seasons: dict[tuple, list] = {}
+    names: dict[str, dict] = {}
+    aliases = alias_map(store, team_aliases(paths))
+    norm = normalizer(paths)
+
+    def fetch(event: dict) -> tuple[str | None, dict | None, int]:
+        if not status.active:
+            raise SourceBlocked(status.reason)
+        code = league_code(event.get("league") or "", event.get("sport"))
+        if code is None or code not in provider.competitions:
+            return None, None, 0
+        requests = 0
+        cached = store.rows(
+            "SELECT provider_match_id FROM provider_fixtures WHERE event_id=? AND provider=?",
+            (event["id"], "pitchapi"),
+        )
+        match_id = cached[0]["provider_match_id"] if cached else None
+        if match_id is None:
+            start = datetime.fromisoformat(event["start_at"])
+            key = (code, season_label(start.date()))
+            if key not in seasons:
+                seasons[key], _raw, _url = provider.season_matches(*key)
+                requests += 1
+            if code not in names:
+                rows = effective_results(
+                    store,
+                    sport="football",
+                    until=now,
+                    competitions=(code,),
+                    identities=team_identities(paths),
+                )
+                names[code] = known_names(rows, "football", norm)
+
+            def canonical_name(name: str) -> str | None:
+                found = match_participant(name, "football", names[code], norm, aliases)
+                return found.target if found.status in {"exact", "alias"} else None
+
+            wanted = [canonical_name(event.get(s) or "") for s in ("home", "away")]
+            best, gap = None, timedelta(hours=36)
+            for match in seasons[key]:
+                when = match.get("time_utc")
+                if not when or None in wanted:
+                    continue
+                distance = abs(datetime.fromisoformat(when.replace("Z", "+00:00")) - start)
+                sides = [
+                    canonical_name((match.get(f"{s}_team") or {}).get("name") or "")
+                    for s in ("home", "away")
+                ]
+                if distance <= gap and sides == wanted:
+                    best, gap = match, distance
+            if best is None:
+                return None, None, requests
+            match_id = best["id"]
+            store.insert(
+                "provider_fixtures",
+                id=digest(["fixture", event["id"], "pitchapi"]),
+                event_id=event["id"],
+                provider="pitchapi",
+                provider_match_id=match_id,
+                method="zweryfikowane nazwy drużyn + godzina ±36 h",
+                matched_at=now.isoformat(),
+            )
+        payload, _raw, _url = provider.get(f"/v1/matches/{match_id}/lineups")
+        requests += 1
+        data = payload.get("data") or {}
+        if not any((data.get(s) or {}).get("starters") for s in ("home", "away")):
+            return match_id, None, requests
+        return match_id, payload, requests
+
+    fetch.blocked = None if status.active else status.reason  # type: ignore[attr-defined]
+    return fetch
+
+
+def prematch_overview(store: Store, *, now: datetime, horizon_hours: int = 48) -> dict:
+    """KONTROLA PRZED MECZEM: what the pre-match engine has stored (no network)."""
+    from sports_edge import prematch, reassessment
+
+    rows = [
+        {"event": event, "info": prematch.summary(store, event["id"])}
+        for event in prematch_targets(store, now=now, horizon_hours=horizon_hours)
+    ]
+    attention = []
+    for coupon in reassessment.active_coupons(store, now=now):
+        last = reassessment.latest(store, coupon["id"])
+        if last and last["result"] != "bez zmian":
+            attention.append({"coupon": coupon, "reassessment": last})
+    checks = [r["info"]["last_check"]["executed_at"] for r in rows if r["info"]["last_check"]]
+    confirmed = ("confirmed", "official")
+    return {
+        "monitored": len(rows),
+        "on_coupons": sum(r["event"]["priority"] == 1 for r in rows),
+        "confirmed": sum(r["info"]["lineup_status"] in confirmed for r in rows),
+        "predicted": sum(r["info"]["lineup_status"] == "predicted" for r in rows),
+        "without_data": sum(
+            r["info"]["lineup_status"] not in (*confirmed, "predicted") for r in rows
+        ),
+        "changes": sum(len(r["info"]["changes"]) for r in rows),
+        "attention": attention,
+        "last_update": max(checks, default=None),
+        "rows": rows,
+    }
+
+
+def prematch_targets(
+    store: Store, *, now: datetime, horizon_hours: int = 48, max_candidates: int = 30
+) -> list[dict]:
+    """Events to monitor before kick-off: every match on an unsettled coupon first (any
+    kind: automatic, my coupon, tasiemka, virtual, real), then forecast candidates."""
+    until = (now + timedelta(hours=horizon_hours)).isoformat()
+    on_coupons = store.rows(
+        """SELECT DISTINCT e.*, 1 priority FROM coupon_legs l JOIN odds o ON o.id=l.odds_id
+        JOIN selections s ON s.id=o.selection_id JOIN markets m ON m.id=s.market_id
+        JOIN events e ON e.id=m.event_id
+        WHERE e.start_at>? AND e.start_at<=?
+        AND NOT EXISTS (SELECT 1 FROM settlements x WHERE x.coupon_id=l.coupon_id)""",
+        (now.isoformat(), until),
+    )
+    chosen = {e["id"]: e for e in on_coupons}
+    candidates = store.rows(
+        """SELECT DISTINCT e.*, 2 priority FROM predictions p JOIN events e ON e.id=p.event_id
+        WHERE p.kind='prospective' AND e.start_at>? AND e.start_at<=? AND e.sport='football'
+        ORDER BY e.start_at LIMIT ?""",
+        (now.isoformat(), until, max_candidates * 3),
+    )
+    for event in candidates:
+        if len(chosen) >= len(on_coupons) + max_candidates:
+            break
+        chosen.setdefault(event["id"], event)
+    return sorted(chosen.values(), key=lambda e: (e["priority"], e["start_at"]))
+
+
+def run_prematch(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    *,
+    now: datetime,
+    checkpoints=None,
+    trigger: str = "automation",
+    only_coupons: bool = False,
+    force: bool = False,
+    fetch=None,
+    absence_provider=None,
+    max_candidates: int = 30,
+    event_ids: list[str] | None = None,
+) -> dict:
+    """Pre-match checks that are due (or every coupon event now, ``force``; or the chosen
+    ``event_ids`` now — e.g. the matches of a coupon that is not saved yet)."""
+    from sports_edge import alerts, prematch
+
+    checkpoints = checkpoints or prematch.CHECKPOINTS
+    fetch = fetch or lineup_fetcher(store, paths, settings, now=now)
+    absence_provider = absence_provider or prematch.NoVerifiedAbsenceSource()
+    if event_ids:
+        marks = ",".join("?" for _ in event_ids)
+        targets = [
+            {**e, "priority": 1}
+            for e in store.rows(f"SELECT * FROM events WHERE id IN ({marks})", tuple(event_ids))
+        ]
+        force = True
+    else:
+        targets = prematch_targets(store, now=now, max_candidates=max_candidates)
+    if only_coupons:
+        targets = [e for e in targets if e["priority"] == 1]
+    out = {
+        "events": len(targets),
+        "checked": 0,
+        "missed": 0,
+        "changes": 0,
+        "requests": 0,
+        "errors": 0,
+        "alerts": 0,
+    }
+    blocked = getattr(fetch, "blocked", None)
+    if blocked:  # no key / offline / disabled: one clear reason, not an error per match
+        return {**out, "blocked": blocked}
+    for event in targets:
+        if force:
+            due, missed = ("ręcznie", None), []
+        else:
+            due, missed = prematch.due_checkpoints(store, event, now=now, checkpoints=checkpoints)
+        for name, planned in missed:
+            prematch.record_missed(store, event, name, planned, now)
+            out["missed"] += 1
+        if due is None:
+            continue
+        result = prematch.check_event(
+            store,
+            event,
+            fetch_lineup=fetch,
+            absence_provider=absence_provider,
+            checkpoint=due[0],
+            now=now,
+            trigger=trigger,
+            planned_at=due[1],
+        )
+        out["checked"] += 1
+        out["requests"] += result.requests
+        out["changes"] += len(result.changes)
+        out["errors"] += result.status == "error"
+        out["alerts"] += alerts.from_check(store, event, result, now=now)
+    return out
 
 
 def newest_v2_version(store: Store, scope: str, family: str) -> dict | None:

@@ -209,6 +209,18 @@ def last_runs(store: Store) -> dict[str, dict]:
     return out
 
 
+def last_run(
+    store: Store, job: str, statuses: tuple[str, ...] = ("ok", "partial", "skipped")
+) -> datetime | None:
+    """When a job last FINISHED its work — a skip with a reason is a finished run too."""
+    marks = ",".join("?" for _ in statuses)
+    value = store.scalar(
+        f"SELECT MAX(finished_at) FROM job_runs WHERE job=? AND status IN ({marks})",
+        (job, *statuses),
+    )
+    return datetime.fromisoformat(value) if value else None
+
+
 def last_success(store: Store, job: str) -> datetime | None:
     value = store.scalar(
         "SELECT MAX(finished_at) FROM job_runs WHERE job=? AND status IN ('ok','partial')", (job,)

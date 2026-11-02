@@ -43,7 +43,9 @@ SYSTEM = (
     "nowych prawdopodobieństw, nie zgadujesz, nie obiecujesz wygranej i nie zachęcasz do "
     "gry. Gdy faktów brakuje, napisz, czego brakuje. Każdą liczbę przepisuj dokładnie z "
     "faktów. Łączna szansa kuponu AKO jest przybliżeniem (zakłada niezależność meczów) — "
-    "zaznacz to, jeśli o niej mówisz. Odpowiedz w formacie JSON zgodnym ze schematem."
+    "zaznacz to, jeśli o niej mówisz. O składach, absencjach i bramkarzach mów wyłącznie to, "
+    "co jest w polu sklady — nie wymyślaj zawodników, kontuzji ani źródeł; prognozy nie "
+    "uwzględniają składów. Odpowiedz w formacie JSON zgodnym ze schematem."
 )
 SCHEMA = {
     "type": "object",
@@ -82,6 +84,7 @@ def fact_sheet(report: dict) -> dict:
                 "status": r["status"],
                 "kalibracja": r.get("calibration"),
                 "ryzyka": r["risks"],
+                "sklady": _lineup_facts(r.get("lineups") or {}),
             }
             for i, r in enumerate(report["legs"])
         ],
@@ -92,6 +95,22 @@ def fact_sheet(report: dict) -> dict:
 
 def _pct(value) -> str | None:
     return None if value is None else f"{value * 100:.1f}%".replace(".", ",")
+
+
+def _lineup_facts(info: dict) -> dict:
+    """Stored lineup facts of one leg; empty observations are stated, never filled in."""
+    if not info:
+        return {"stan": "brak zapisanych obserwacji", "prognoza_uwzglednia_sklady": False}
+    return {
+        "stan": info["lineup_status"],
+        "ostatnia_kontrola": info.get("last_check"),
+        "zmiany": info.get("changes", []),
+        "absencje": info.get("absences", []),
+        "zrodlo_absencji": info.get("absence_source"),
+        "bramkarze": [name for name in (info.get("goalkeepers") or {}).values() if name],
+        "wymaga_swiezej_kontroli": info.get("needs_refresh"),
+        "prognoza_uwzglednia_sklady": False,
+    }
 
 
 def _numbers(text: str) -> set[str]:
@@ -221,9 +240,11 @@ def ask(
         return {"ok": False, "reason": "Lokalny model nie udzielił odpowiedzi."}
     unknown = unknown_numbers(answer, facts)
     seconds = (response.get("total_duration") or 0) / 1e9
+    ok = not unknown
     return {
-        "ok": not unknown,
-        "answer": answer,
+        "ok": ok,
+        "answer": answer if ok else "",  # a rejected answer is never offered for display
+        "rejected_answer": "" if ok else answer,
         "missing": str(data.get("missing", "")),
         "unknown_numbers": unknown,
         "reason": "Odpowiedź zawiera liczby spoza danych: " + ", ".join(unknown) if unknown else "",

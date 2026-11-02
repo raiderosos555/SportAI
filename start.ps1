@@ -26,4 +26,5 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 Write-Host "[Sports Edge AI] Interfejs: http://localhost:$Port"
-& $py -m streamlit run src\sports_edge\app\main.py --server.address 127.0.0.1 --server.port $Port --browser.gatherUsageStats false
+# The launcher starts the interface and - if enabled in AUTOMATYZACJA AI - the worker.
+& $py -m sports_edge.launch --port $Port

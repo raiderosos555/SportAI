@@ -44,6 +44,12 @@ Na co dzień — dwuklik `start.bat` (albo `.\start.ps1`). Skrypt sprawdza konfi
 (`sports-edge check`), uruchamia interfejs na `127.0.0.1:8501` i otwiera przeglądarkę.
 Start nie pobiera niczego z sieci; tryb offline jest domyślnie włączony.
 
+Automatyzacją steruje się wyłącznie ze strony **Automatyzacja AI**. **URUCHOM AUTOMATYZACJĘ**
+startuje osobny proces workera: wyniki, rozliczenia, składy przed meczem, kontrola kuponów
+i przeglądy modeli. Worker działa także po zamknięciu karty przeglądarki, dopóki działa serwer
+aplikacji. Po ponownym `start.bat` wraca sam, jeśli włączono „Automatycznie wznów po starcie
+serwera”. Harmonogram zadań Windows nie jest potrzebny.
+
 | Krok w aplikacji | Gdzie |
 |---|---|
 | Przegląd dnia: liczby, najlepsze prognozy, kupony, status danych | **Dashboard** |
@@ -51,7 +57,8 @@ Start nie pobiera niczego z sieci; tryb offline jest domyślnie włączony.
 | Własny kupon z oferty, ocena AI, najsłabsze ogniwo, alternatywy, pytania | **Mój kupon** |
 | Kupon jak najbliżej wybranego kursu; długi kupon 8–12 | **Kupon na kurs**, **Tasiemka** |
 | Ryzyko serii kuponów (Monte Carlo); odtworzenie przeszłego dnia as-of | **Symulator budżetu**, **Symulator historyczny** |
-| Champion i challenger, aktywacja nowego modelu, przegląd, jakość prognoz, ablacja | **Uczenie AI** |
+| Champion i challenger, aktywacja nowego modelu, przegląd, jakość prognoz, eksperyment cech (model rozszerzony) | **Uczenie AI** |
+| Worker automatyzacji: uruchom / wstrzymaj / wznów / zatrzymaj, harmonogram, historia zadań, alerty | **Automatyzacja AI** |
 | Ocena modelu, najbardziej prawdopodobny typ, uzasadnienie, forma, statystyki, składy, tryb po meczu | **Analiza meczów** |
 | Terminarz, zakończone mecze z wynikami, pełna oferta STS i historia kursów, import PDF | **Wydarzenia i wyniki** |
 | Kupony, trafność, ROI, wykres w czasie, rozliczenia, CLV, analizy | **Historia i skuteczność** |
@@ -108,7 +115,7 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge research results            # wyniki z danych niezależnych (pewne dopasowanie)
 .\.venv\Scripts\sports-edge research protocol-v2 --scope core   # nowe modele (challengery) w protokole v2
 .\.venv\Scripts\sports-edge research ablation --scope core      # ablacja A Elo / B DC / C DC+cechy / D ML
-.\.venv\Scripts\sports-edge learning review             # przegląd tygodniowy (np. z Harmonogramu zadań)
+.\.venv\Scripts\sports-edge learning review             # przegląd modeli na żądanie (automatycznie: panel Automatyzacja AI)
 .\.venv\Scripts\sports-edge learning catch-up           # uzupełnienie po przerwie (rozliczenia, wyniki)
 .\.venv\Scripts\sports-edge learning status             # kompletność danych i statusy modeli
 .\.venv\Scripts\sports-edge export json
@@ -141,11 +148,12 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-266 testów (69 z TASK 001 + 102 z TASK 002–004 + 25 z TASK 005 + 27 z TASK 006 + 43 z TASK 007:
-m.in. spójność przedziałów, holdout bez wpływu na decyzje, Mój kupon, generator i tasiemka,
-symulatory, rozliczenia prognoz, uczenie oraz 20 ścieżek interfejsu). Artefakt QA w GitHub
-Actions („qa-report”) zawiera raport ścieżek UI, wersje bibliotek i syntetyczny PDF — nigdy
-bazy ani kluczy. Testy parserów używają oznaczonych fixture
+299 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia).
+Ścieżki interfejsu: `python -m sports_edge.qa` (22 ścieżki). Zrzuty ekranu:
+`python -m sports_edge.qa_browser` (Playwright; w CI). Artefakty QA w GitHub Actions
+(`qa-report-Windows`, `qa-report-Linux`) zawierają raport ścieżek UI, wersje bibliotek,
+syntetyczny PDF i zrzuty ekranu z danych DEMO — nigdy bazy ani kluczy. Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
 (katalog nie jest w repozytorium, więc na GitHubie ten test jest pomijany). Te same kontrole
 uruchamia GitHub Actions (`.github/workflows/ci.yml`) po każdym pushu.
@@ -192,6 +200,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 008](docs/task_008_report.md) | Automatyzacja AI (worker), składy przed meczem, absencje, kontrola kuponów, Advanced Football Prediction Engine, QA, TASK 009 |
 | [Raport TASK 007](docs/task_007_report.md) | P0 (przedziały, protokół v2, zależność par), Mój kupon, profile, symulatory, zbieranie danych, uczenie, TASK 008 |
 | [Raport TASK 006](docs/task_006_report.md) | Redesign, Kupon dnia, analiza meczu, pokrycie 12 lig, zakresy modeli, TASK 007 |
 | [Raport TASK 005](docs/task_005_report.md) | Źródła statystyk, Sports Intelligence, modele i kalibracja, kreator kuponów, TASK 006 |

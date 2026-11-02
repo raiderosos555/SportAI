@@ -129,7 +129,9 @@ def remove(cart: list[dict], selection_id: str) -> list[dict]:
     return [leg for leg in cart if leg["selection_id"] != selection_id]
 
 
-def validate(cart: list[dict], rows: list[Candidate | None]) -> list[Issue]:
+def validate(cart: list[dict], rows: list[Candidate | None], *, late: bool = False) -> list[Issue]:
+    """Problems of the coupon. ``late``: a coupon already placed in STS and recorded after
+    the start — a started match and an old price are expected then (shown, not blocking)."""
     issues: list[Issue] = []
     if not cart:
         return [Issue("empty", "block", "Kupon jest pusty — dodaj co najmniej jedną selekcję")]
@@ -142,11 +144,17 @@ def validate(cart: list[dict], rows: list[Candidate | None]) -> list[Issue]:
             continue
         if row.event_status != "before_start":
             issues.append(
-                Issue("started", "block", f"{name}: wydarzenie nie jest przed startem", (i,))
+                Issue(
+                    "started",
+                    "warn" if late else "block",
+                    f"{name}: wydarzenie nie jest przed startem"
+                    + (" (wpis po fakcie)" if late else ""),
+                    (i,),
+                )
             )
         if row.presence == "withdrawn":
             issues.append(Issue("withdrawn", "block", f"{name}: rynek wycofany z oferty", (i,)))
-        if row.freshness != "fresh":
+        if row.freshness != "fresh" and not late:
             issues.append(
                 Issue(
                     "stale",
@@ -203,10 +211,11 @@ def summary(
     stake: Decimal,
     cost: CostProfile,
     on_date,
+    late: bool = False,
 ) -> dict:
     """Odds, payout, net profit, break-even hit rate and — when it can be computed — the
     approximate probability of the whole coupon (never from odds alone)."""
-    issues = validate(cart, rows)
+    issues = validate(cart, rows, late=late)
     present = [r for r in rows if r is not None]
     out: dict = {
         "legs": len(cart),

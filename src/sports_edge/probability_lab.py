@@ -116,6 +116,33 @@ def dc_walk_forward(
 ) -> dict[str, dict]:
     """Predictions for every match on/after ``from_date`` from the latest weekly as-of fit."""
     out: dict[str, dict] = {}
+    for row, model in _dc_fits(
+        rows, half_life=half_life, from_date=from_date, refit_days=refit_days
+    ):
+        matrix = model.score_matrix(row["home"], row["away"])
+        if matrix is None:
+            continue  # a team without history in the window: no forecast
+        out[row["id"]] = markets(matrix, LINES)
+    return out
+
+
+def dc_walk_forward_rates(
+    rows: list[dict], *, half_life: float, from_date: str, refit_days: int = REFIT_DAYS
+) -> dict[str, tuple[float, float, float]]:
+    """(λ, μ, ρ) of every match on/after ``from_date`` — the same as-of fits as
+    ``dc_walk_forward``; ``score_matrix(λ, μ, ρ)`` gives exactly its markets."""
+    out: dict[str, tuple[float, float, float]] = {}
+    for row, model in _dc_fits(
+        rows, half_life=half_life, from_date=from_date, refit_days=refit_days
+    ):
+        found = model.rates(row["home"], row["away"])
+        if found is not None:
+            out[row["id"]] = (found[0], found[1], model.rho)
+    return out
+
+
+def _dc_fits(rows: list[dict], *, half_life: float, from_date: str, refit_days: int):
+    """(match, latest weekly as-of fit) of every match on/after ``from_date``."""
     for _code, mine in _league_matches(rows).items():
         mine.sort(key=lambda r: (r["match_date"], r["id"]))
         goals = [
@@ -132,13 +159,8 @@ def dc_walk_forward(
             if fit_date not in cache:
                 cache[fit_date] = fit(goals, fit_date=fit_date, half_life_days=half_life)
             model = cache[fit_date]
-            if model is None:
-                continue
-            matrix = model.score_matrix(row["home"], row["away"])
-            if matrix is None:
-                continue  # a team without history in the window: no forecast
-            out[row["id"]] = markets(matrix, LINES)
-    return out
+            if model is not None:
+                yield row, model
 
 
 def _items(rows_by_id: dict[str, dict], predictions: dict[str, dict], family: str):

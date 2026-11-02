@@ -357,6 +357,8 @@ def kind_label(coupon: dict, now) -> tuple[str, str]:
     if coupon["outcome"]:
         return "Rozliczony", "neutral"
     if coupon["mode"] == "real_manual":
+        if (coupon.get("proposal") or {}).get("entered_after_start"):
+            return "Rzeczywisty — wpis po fakcie", "info"
         return "Rzeczywisty (wpis ręczny)", "info"
     if datetime.fromisoformat(coupon["first_start_at"]) > now:
         if coupon["mode"] == "paper_manual":

@@ -387,7 +387,11 @@ def _v1_version(store, family, name, when):
         created_at=when,
         trained_through=when,
         training_data={"competitions": ["es.1"]},
-        validation={"hyperparameters": {"k": 20.0, "home_advantage": 60.0}},
+        validation={  # SYNTHETIC v1 report: holdout-based fields as stored before TASK 007
+            "competitions": ["es.1"],
+            "hyperparameters": {"k": 20.0, "home_advantage": 60.0, "draw_margin_holdout": 0.25},
+            "holdout": {"n": 500, "ece": 0.02, "log_loss": 1.0, "reliability": []},
+        },
         policy=POLICY,
     )
     return version_id
@@ -709,7 +713,17 @@ def test_local_model_is_off_by_default_free_and_sends_only_coupon_facts(store):
     assert usage["provider"] == "ollama" and usage["cost_usd"] == "0"
     invented = _Ollama('{"answer": "Szansa wynosi 91,3%.", "facts_used": [], "missing": ""}')
     wrong = llm.ask("?", report, store=store, settings=on, now=NOW, opener=invented)
-    assert not wrong["ok"] and wrong["unknown_numbers"] == ["91.3"]
+    assert not wrong["ok"] and wrong["unknown_numbers"] == ["91.3"] and wrong["answer"] == ""
+    assert "91,3" in wrong["rejected_answer"]  # kept for diagnostics only, never displayed
+
+    class _Slow(_Ollama):
+        def __call__(self, request, timeout):
+            if request.full_url.endswith("/api/chat"):
+                raise TimeoutError("timed out")
+            return super().__call__(request, timeout)
+
+    slow = llm.ask("?", report, store=store, settings=on, now=NOW, opener=_Slow(answer))
+    assert not slow["ok"] and "TimeoutError" in slow["reason"] and not slow.get("answer")
 
 
 def test_local_model_refuses_other_hosts_and_explains_what_is_missing(store):
@@ -1046,7 +1060,7 @@ def test_weekly_review_skips_with_a_reason_and_trains_only_on_request(store, app
 
     found = retraining.review(store, app_paths, now=NOW, scopes=("core",), train=train)
     assert found["core"]["status"] == "skipped" and calls == []
-    assert any("nowych wyników" in r for r in found["core"]["reasons"])
+    assert any("nowych unikalnych meczów" in r for r in found["core"]["reasons"])
     assert collection.last_runs(store)["retraining_review"]["status"] == "skipped"
     assert retraining.scope_status(store, "core", now=NOW) == "Oczekuje na nowe dane"
     forced = retraining.review(
@@ -1168,3 +1182,73 @@ def test_storage_report_integrity_and_restore_test(app_paths):
     folder = create_backup(app_paths, now=NOW)
     test = maintenance.restore_test(folder / "sports_edge.db", store)
     assert test["ok"] and test["integrity"] == "ok" and not test["problems"]
+
+
+def test_any_version_can_be_served_again_and_training_runs_on_demand(store, app_paths):
+    load(store, synthetic(1800))
+    old = _v1_version(store, services.ELO_FAMILY, "elo-v1", NOW - timedelta(days=30))
+    services.ensure_model_roles(store, now=NOW)
+    found = services.train_now(store, app_paths, now=NOW, scope="core")
+    new_elo = found["elo"]["version_id"]
+
+    def roles():
+        return {r["version_id"]: r["role"] for r in services.model_versions_of(store, "core")}
+
+    assert roles()[old] == "active" and roles()[new_elo] == "challenger"
+    learning.keep_previous(
+        store,
+        scope="core",
+        versions={services.ELO_FAMILY: new_elo},
+        now=NOW + timedelta(hours=1),
+        reason="przypadkowe odrzucenie (test)",
+    )
+    assert roles()[new_elo] == "rejected"
+    services.switch_models(
+        store,
+        app_paths,
+        scope="core",
+        versions={services.ELO_FAMILY: new_elo},
+        now=NOW + timedelta(hours=2),
+        reason="przywrócenie (test)",
+    )
+    assert services.scope_version(store, services.CORE_COMPETITIONS)["version_id"] == new_elo
+    assert roles()[new_elo] == "active" and roles()[old] == "previous"
+
+
+def test_late_entry_records_a_placed_coupon_apart_from_prospective_ones(
+    store, import_sts, policy, profiles, rules, app_paths
+):
+    later = NOW + timedelta(days=1)  # every fixture match has started by then
+    found = evaluate(
+        offer_table(store, day="2026-10-31"),
+        predictions={},
+        profile=profiles["sts"],
+        market_rules=rules,
+        policy=policy,
+        now=later,
+        max_age=timedelta(minutes=180),
+        stake=Decimal("10.00"),
+    )
+    leg = next(c for c in found if c.event.startswith("Legia") and c.market_key == "1x2")
+    assert leg.event_status != "before_start"
+    cart = [mine.leg_from(leg, day="2026-10-31", now=later)]
+    with pytest.raises(ValueError, match="nie może być zapisany"):
+        services.save_my_coupon(store, app_paths, cart, [leg], stake=Decimal("10"), now=later)
+    coupon_id = services.save_my_coupon(
+        store, app_paths, cart, [leg], stake=Decimal("10.00"), now=later, late=True
+    )
+    saved = store.get("coupons", coupon_id)
+    assert saved["mode"] == "real_manual" and saved["profile"] == "my_coupon_after"
+    assert json.loads(saved["proposal_json"])["entered_after_start"] is True
+    from sports_edge.paper import create_coupon
+
+    with pytest.raises(ValueError, match="wyłącznie kuponów postawionych"):
+        create_coupon(
+            store,
+            odds_ids=[leg.odds_id],
+            stake=Decimal("5.00"),
+            mode="paper_manual",
+            profile=profiles["sts"],
+            now=later,
+            late_entry=True,
+        )

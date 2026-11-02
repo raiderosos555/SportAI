@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -36,6 +36,7 @@ MIGRATIONS = {
     4: "results providers: provenance columns and update reports",
     5: "sports statistics store, feature snapshots, coupon proposals",
     6: "TASK 007: model history, prediction settlements, job runs, simulations, LLM usage",
+    7: "TASK 008: lineups, absences, pre-match checks, alerts, coupon reassessments, automation",
 }
 
 SCHEMA = """
@@ -226,6 +227,78 @@ CREATE TABLE IF NOT EXISTS llm_usage (
  purpose TEXT NOT NULL, input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
  cache_read_tokens INTEGER NOT NULL DEFAULT 0, cost_usd TEXT NOT NULL, status TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS provider_fixtures (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id), provider TEXT NOT NULL,
+ provider_match_id TEXT NOT NULL, method TEXT NOT NULL, matched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lineup_observations (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id),
+ side TEXT NOT NULL CHECK(side IN ('home','away')), provider TEXT NOT NULL,
+ provider_match_id TEXT, team_name TEXT, formation TEXT,
+ status TEXT NOT NULL CHECK(status IN ('predicted','confirmed','official','not_published',
+   'no_data','error')),
+ coach TEXT, starters_json TEXT NOT NULL, subs_json TEXT NOT NULL, content_hash TEXT NOT NULL,
+ published_at TEXT, observed_at TEXT NOT NULL, available_at TEXT NOT NULL,
+ known_before_start INTEGER NOT NULL CHECK(known_before_start IN (0,1)),
+ previous_id TEXT REFERENCES lineup_observations(id)
+);
+CREATE TABLE IF NOT EXISTS player_absence_observations (
+ id TEXT PRIMARY KEY, event_id TEXT REFERENCES events(id), team_name TEXT NOT NULL,
+ player_name TEXT NOT NULL, player_id TEXT,
+ reason TEXT NOT NULL CHECK(reason IN ('injury_confirmed','injury_reported','suspension',
+   'doubtful','unavailable','return')),
+ source TEXT NOT NULL, source_url TEXT, published_at TEXT, observed_at TEXT NOT NULL,
+ expected_return TEXT, quality TEXT NOT NULL,
+ match_status TEXT NOT NULL CHECK(match_status IN ('verified','needs_review')),
+ entered_by TEXT NOT NULL CHECK(entered_by IN ('provider','user')),
+ known_before_start INTEGER NOT NULL CHECK(known_before_start IN (0,1)),
+ previous_id TEXT REFERENCES player_absence_observations(id)
+);
+CREATE TABLE IF NOT EXISTS prematch_checks (
+ id TEXT PRIMARY KEY, event_id TEXT NOT NULL REFERENCES events(id), checkpoint TEXT NOT NULL,
+ planned_at TEXT, executed_at TEXT NOT NULL, trigger TEXT NOT NULL,
+ status TEXT NOT NULL CHECK(status IN ('ok','not_published','no_data','error','missed',
+   'skipped')),
+ lineup_status TEXT, absence_status TEXT, changes_json TEXT NOT NULL DEFAULT '[]',
+ requests INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0,
+ detail TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS prematch_alerts (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, event_id TEXT REFERENCES events(id),
+ coupon_id TEXT REFERENCES coupons(id), kind TEXT NOT NULL, message TEXT NOT NULL,
+ source TEXT NOT NULL, priority TEXT NOT NULL CHECK(priority IN ('high','medium','low')),
+ payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS alert_reads (
+ id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES prematch_alerts(id),
+ read_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coupon_reassessments (
+ id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id), checked_at TEXT NOT NULL,
+ trigger TEXT NOT NULL,
+ result TEXT NOT NULL CHECK(result IN ('bez zmian','wymaga uwagi','nieaktualny')),
+ previous_result TEXT, reasons_json TEXT NOT NULL, risks_json TEXT NOT NULL,
+ sources_json TEXT NOT NULL, previous_id TEXT REFERENCES coupon_reassessments(id)
+);
+CREATE TABLE IF NOT EXISTS automation_settings (
+ id TEXT PRIMARY KEY, saved_at TEXT NOT NULL, settings_json TEXT NOT NULL, saved_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS automation_commands (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, command TEXT NOT NULL,
+ payload_json TEXT NOT NULL DEFAULT '{}', requested_by TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS automation_events (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, worker_id TEXT,
+ detail TEXT NOT NULL DEFAULT '', payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS fixture_event ON provider_fixtures(event_id, provider);
+CREATE INDEX IF NOT EXISTS lineup_event ON lineup_observations(event_id, side, observed_at);
+CREATE INDEX IF NOT EXISTS absence_event ON player_absence_observations(event_id, team_name);
+CREATE INDEX IF NOT EXISTS prematch_event ON prematch_checks(event_id, checkpoint);
+CREATE INDEX IF NOT EXISTS alert_time ON prematch_alerts(created_at);
+CREATE INDEX IF NOT EXISTS reassessment_coupon ON coupon_reassessments(coupon_id, checked_at);
+CREATE INDEX IF NOT EXISTS command_time ON automation_commands(created_at);
+CREATE INDEX IF NOT EXISTS automation_event_time ON automation_events(created_at);
 CREATE INDEX IF NOT EXISTS model_event_role ON model_events(scope, family, kind, created_at);
 CREATE INDEX IF NOT EXISTS prediction_settlement ON prediction_settlements(prediction_id);
 CREATE INDEX IF NOT EXISTS job_run ON job_runs(job, started_at);
@@ -296,6 +369,8 @@ class Store:
         v6: new append-only tables only (model history, prediction settlements, job runs,
         simulation runs, LLM usage); no existing row is touched. Model roles of the versions
         that already exist are recorded by the application (``learning.ensure_roles``).
+        v7: new append-only tables only (lineups, absences, pre-match checks, alerts, coupon
+        reassessments, automation settings / commands / events).
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 
 from sports_edge import learning
-from sports_edge.collection import last_success, record_job, settled_forecasts
+from sports_edge.collection import last_run, record_job, settled_forecasts
 from sports_edge.ingestion.types import iso
 from sports_edge.storage import Store
 
@@ -36,25 +36,41 @@ STATUSES = (
 
 
 def due(store: Store, *, now: datetime, every_days: int = EVERY_DAYS) -> bool:
-    last = last_success(store, "retraining_review")
+    """A review is due ``every_days`` after the last FINISHED review — one that ended with
+    "too little data to train" counts as finished (TASK 008 P0)."""
+    last = last_run(store, "retraining_review")
     return last is None or now - last >= timedelta(days=every_days)
 
 
-def conditions(store: Store, scope: str, competitions, *, now: datetime) -> tuple[bool, list[str]]:
+def new_matches(
+    store: Store, competitions, *, since: str | None, now: datetime, identities=None
+) -> int:
+    """Unique, verified matches available after ``since`` (one match counts once, however
+    many sources confirmed it — TASK 008 P0)."""
+    from sports_edge.results_engine import effective_results
+
+    rows = effective_results(
+        store,
+        sport="football",
+        until=now,
+        competitions=tuple(competitions),
+        identities=identities,
+    )
+    return sum(1 for r in rows if since is None or r["available_at"] > since)
+
+
+def conditions(
+    store: Store, scope: str, competitions, *, now: datetime, identities=None
+) -> tuple[bool, list[str]]:
     """(ready, reasons) for training a new challenger of one scope."""
     from sports_edge.services import ELO_FAMILY, scope_version
 
     reasons = []
     champion = scope_version(store, competitions, ELO_FAMILY)
     since = champion["trained_through"] if champion else None
-    marks = ",".join("?" for _ in competitions)
-    new = store.scalar(
-        f"SELECT COUNT(*) FROM historical_results WHERE competition IN ({marks}) "
-        "AND (? IS NULL OR available_at>?)",
-        (*competitions, since, since),
-    )
+    new = new_matches(store, competitions, since=since, now=now, identities=identities)
     if new < MIN_NEW_RESULTS:
-        reasons.append(f"nowych wyników od treningu: {new} < {MIN_NEW_RESULTS}")
+        reasons.append(f"nowych unikalnych meczów od treningu: {new} < {MIN_NEW_RESULTS}")
     if learning.challengers(store, scope, ELO_FAMILY):
         reasons.append("challenger tego zakresu czeka już na decyzję (tryb cienia)")
     last = [e for e in learning.events(store, scope=scope) if e["kind"] == "challenger_ready"]
@@ -74,6 +90,7 @@ def review(
     force: bool = False,
     scopes: tuple[str, ...] | None = None,
     train=None,
+    allow_training: bool = True,
 ) -> dict:
     """One weekly review of every scope. ``train`` (scope → report) defaults to protocol v2."""
     from sports_edge.services import MODEL_SCOPES, run_protocol_v2
@@ -92,6 +109,19 @@ def review(
                 now=now,
                 scope=scope,
                 payload={"reasons": reasons, "trigger": trigger},
+            )
+            continue
+        if not allow_training and not force:
+            reasons = ["dane wystarczające, ale trening challengera jest wyłączony w automatyzacji"]
+            out[scope] = {"status": "skipped", "reasons": reasons}
+            learning.record(
+                store,
+                kind="review",
+                actor="system",
+                reason="Przegląd: " + reasons[0],
+                now=now,
+                scope=scope,
+                payload={"trigger": trigger},
             )
             continue
         try:
@@ -139,12 +169,16 @@ def _decision(row: dict | None) -> dict:
     }
 
 
-def paired(store: Store, champion: str, challenger: str, *, seed: int = 7) -> dict:
+def paired(
+    store: Store, champion: str, challenger: str, *, seed: int = 7, markets: set | None = None
+) -> dict:
     """Log loss of both versions on the SAME settled selections (prospective, shadow mode);
-    the interval of the difference resamples events."""
+    the interval of the difference resamples events. ``markets`` limits the market keys."""
     by_key: dict[tuple, dict[str, list]] = defaultdict(dict)
     for row in settled_forecasts(store):
         if row["status"] != "settled" or row["model_version_id"] not in (champion, challenger):
+            continue
+        if markets is not None and row["market_key"] not in markets:
             continue
         key = (row["event_id"], row["market_key"], row["line"])
         by_key[key][row["model_version_id"]] = [
@@ -270,6 +304,21 @@ def scope_status(store: Store, scope: str, *, now: datetime, running: str | None
     if last is not None and last["kind"] == "activated" and last["actor"] == "user":
         return "Aktywowany"
     return "Oczekuje na nowe dane"
+
+
+def timeline(store: Store, scope: str) -> dict[str, str | None]:
+    """Separate moments (TASK 008 P0): last review, training, validation and activation.
+    Under protocol v2 a challenger is validated as part of its training run."""
+    found = learning.events(store, scope=scope)
+    trained = [e["created_at"] for e in found if e["kind"] == "challenger_ready"]
+    activated = [e["created_at"] for e in found if e["kind"] in learning.ROLE_KINDS]
+    review = last_run(store, "retraining_review")
+    return {
+        "review": review.isoformat() if review else None,
+        "training": trained[-1] if trained else None,
+        "validation": trained[-1] if trained else None,
+        "activation": activated[-1] if activated else None,
+    }
 
 
 def history(store: Store) -> list[dict]:

@@ -2,9 +2,11 @@
 
 import streamlit as st
 
+from sports_edge import alerts, automation
 from sports_edge import insights as ins
 from sports_edge.app import cart, ui
 from sports_edge.app import common as c
+from sports_edge.app.page_automation import automation_page
 from sports_edge.app.page_coupon import coupon_page
 from sports_edge.app.page_dashboard import dashboard_page
 from sports_edge.app.page_events import events_page
@@ -73,6 +75,12 @@ pages = {
     "uczenie": st.Page(
         learning_page, title="Uczenie AI", icon=":material/model_training:", url_path="uczenie"
     ),
+    "automatyzacja": st.Page(
+        automation_page,
+        title="Automatyzacja AI",
+        icon=":material/autoplay:",
+        url_path="automatyzacja",
+    ),
     "zrodla": st.Page(
         sources_page, title="Źródła i ustawienia", icon=":material/tune:", url_path="zrodla"
     ),
@@ -83,8 +91,20 @@ SECTIONS = {
     "Analiza": ("analiza", "wydarzenia"),
     "Symulacje": ("budzet", "historyczny"),
     "Wyniki i modele": ("historia", "modele", "uczenie"),
-    "Ustawienia": ("zrodla",),
+    "Ustawienia": ("automatyzacja", "zrodla"),
 }
+
+
+@st.cache_resource(show_spinner=False)
+def _autostart_once() -> str:
+    """Safety net for a server started without the launcher: resume once per server
+    process, only if the user enabled it (the launcher normally does this at start-up)."""
+    import os
+
+    try:
+        return automation.autostart(c.paths(), c.store(), parent=os.getpid())
+    except Exception as error:  # noqa: BLE001 — the interface must work anyway
+        return f"autostart: {type(error).__name__}"
 
 
 def sidebar() -> None:
@@ -110,6 +130,13 @@ def sidebar() -> None:
                 ("Modele", f"{sum(1 for p in served.values() if p['elo'] or p['goals'])} zakresy"),
                 ("Ostatnia analiza", c.local_time(last_run, "%d.%m %H:%M") if last_run else "—"),
                 ("Mój kupon", cart.summary_line()),
+                (
+                    "Automatyzacja",
+                    "niedostępna w DEMO"
+                    if c.demo_mode()
+                    else automation.status(c.paths(), db, now=c.now())["label"],
+                ),
+                ("Alerty", str(alerts.unread_count(db))),
                 ("Tryb", "offline" if settings.offline_mode else "online (na żądanie)"),
             ]
         )
@@ -124,6 +151,10 @@ def sidebar() -> None:
             st.rerun()
 
 
+if st.query_params.get("demo") == "1":  # a link to the synthetic DEMO (browser QA)
+    st.session_state["demo_mode"] = True
+if not c.demo_mode():
+    _autostart_once()
 try:
     sidebar()
 except Exception as error:  # noqa: BLE001 — a broken status must never hide the pages

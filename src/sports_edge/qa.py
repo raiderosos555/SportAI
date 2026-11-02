@@ -53,6 +53,7 @@ def _page(name: str) -> str:
         "uczenie": ("page_learning", "learning_page"),
         "zrodla": ("page_sources", "sources_page"),
         "analiza": ("page_match", "match_page"),
+        "automatyzacja": ("page_automation", "automation_page"),
     }
     module, function = modules[name]
     return f"from sports_edge.app.{module} import {function}; {function}()"
@@ -79,7 +80,10 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         errors = _errors(app)
         text = (
             " ".join(m.value for m in app.markdown)
-            + " ".join(str(x.value) for x in [*app.caption, *app.warning, *app.error, *app.info])
+            + " ".join(
+                str(x.value)
+                for x in [*app.caption, *app.warning, *app.error, *app.info, *app.success]
+            )
             + " ".join(d.value.to_string() for d in app.dataframe)
         )
         if errors:
@@ -96,6 +100,12 @@ def ui_paths(config: Path | None = None) -> list[dict]:
             app = _app(_page(name), demo=False)
             app.run()
             check(f"brak danych: {name}", app, ["Brak", "brak"])
+        # ------------------------------------------------ AUTOMATYZACJA AI (temporary home)
+        panel = _app(_page("automatyzacja"), demo=False)
+        panel.run()
+        check("automatyzacja: status", panel, ["zatrzymana"])
+        _button(panel, "ZAPISZ USTAWIENIA").click().run()
+        check("automatyzacja: zapis ustawień", panel, ["Ustawienia zapisane"])
         # ------------------------------------------------ DEMO home with a fresh offer
         os.environ["SPORTS_EDGE_HOME"] = str(_home(config))
         loader = _app("from sports_edge.app import common as c; c.load_demo_data()")
@@ -224,7 +234,7 @@ def write_artifact(out: Path) -> dict:
         "# Raport QA interfejsu (dane syntetyczne)\n\n"
         f"Ścieżki: {len(paths)}, zaliczone: {len(paths) - len(failed)}, błędy: {len(failed)}.\n\n"
         + "".join(f"- {'OK' if p['ok'] else 'BŁĄD'} — {p['path']} {p['detail']}\n" for p in paths)
-        + "\nZrzuty ekranu nie są wykonywane (wymagają przeglądarki).\n",
+        + "\nZrzuty ekranu (Playwright, desktop i telefon): katalog screenshots/ — w CI.\n",
         encoding="utf-8",
     )
     leaks = [str(p) for p in out.rglob("*") if p.suffix.lower() in FORBIDDEN or p.name == ".env"]

@@ -8,11 +8,12 @@ answered from the data. No guarantees of winning: every number is an estimate.
 """
 
 from collections import defaultdict
+from datetime import datetime
 from decimal import Decimal
 
 import streamlit as st
 
-from sports_edge import advisor, llm
+from sports_edge import advisor, automation, llm
 from sports_edge import explainer as ex
 from sports_edge import insights as ins
 from sports_edge import my_coupon as mine
@@ -37,6 +38,7 @@ EVALUATION = "my_coupon_evaluation"
 ALTERNATIVES = "my_coupon_alternatives"
 ANSWERS = "my_coupon_answers"
 SAVED = "my_coupon_saved"
+LATE = "mc_late"  # a coupon already placed in STS, recorded after its matches started
 
 
 def my_coupon_page() -> None:
@@ -75,10 +77,17 @@ def _browser(days: list[str]) -> None:
     leagues = sorted({x.league for x in pool if x.league})
     chosen_leagues = top[2].multiselect("Liga", leagues, key="mc_league")
     pool = [x for x in pool if not chosen_leagues or x.league in chosen_leagues]
+    st.toggle(
+        "Wpis po fakcie: kupon już postawiony w STS (pozwala dodać rozpoczęte mecze)",
+        key=LATE,
+        help="Do historii trafia jako kupon rzeczywisty z kursami sprzed rozpoczęcia meczów, "
+        "oddzielnie od kuponów zapisanych przed meczem (wybór po wyniku to wiedza z przyszłości).",
+    )
+    late = bool(st.session_state.get(LATE))
     row = st.columns([3, 1, 1])
     query = row[0].text_input("Szukaj drużyny lub zawodnika", key="mc_query").strip().lower()
     only_model = row[1].toggle("Tylko z prognozą", value=False, key="mc_only_model")
-    show_started = row[2].toggle("Pokaż rozpoczęte", value=False, key="mc_started")
+    show_started = row[2].toggle("Pokaż rozpoczęte", value=False, key="mc_started") or late
     events: dict[str, list] = defaultdict(list)
     for x in pool:
         events[x.event_id].append(x)
@@ -168,8 +177,13 @@ def event_panel(rows: list, day: str) -> None:
                 else:
                     cols[2].caption("Brak zwalidowanego modelu")
                 with cols[3]:
-                    if r.event_status == "before_start":
+                    if r.event_status == "before_start" or st.session_state.get(LATE):
                         cart.add_button(r, day=day, key=f"add_{r.selection_id}", compact=True)
+        if head.event_status != "before_start" and not st.session_state.get(LATE):
+            st.caption(
+                "Mecz już się rozpoczął — dodasz go tylko jako wpis po fakcie (przełącznik nad "
+                "listą wydarzeń), jeśli kupon był naprawdę postawiony w STS."
+            )
 
 
 # ---------------------------------------------------------------- the coupon
@@ -201,7 +215,12 @@ def _coupon() -> None:
     if stake != cart.stake():
         cart.set_stake(stake)
     sts = load_profiles(c.paths().config)["sts"]
-    summary = mine.summary(legs, rows, stake=stake, cost=sts.cost, on_date=c.today_local())
+    late = bool(st.session_state.get(LATE))
+    first = min((r.start_at for r in rows if r is not None and r.start_at), default=None)
+    on_date = c.today_local()
+    if late and first:
+        on_date = datetime.fromisoformat(first).date()
+    summary = mine.summary(legs, rows, stake=stake, cost=sts.cost, on_date=on_date, late=late)
     ui.metric_cards(
         [
             ("Kurs łączny", ins.num(summary["total_odds"], 2), f"{len(legs)} sel."),
@@ -233,23 +252,29 @@ def _coupon() -> None:
     if buttons[1].button("ZAPROPONUJ ALTERNATYWĘ", icon=":material/alt_route:", width="stretch"):
         st.session_state[EVALUATION] = True
         st.session_state[ALTERNATIVES] = True
-    real = st.checkbox(
+    real = late or st.checkbox(
         "Postawiłem ten kupon naprawdę w STS (wpis ręczny — oddzielony od wirtualnych)",
         key="mc_real",
     )
+    if late:
+        st.info(
+            "Wpis po fakcie: kupon trafi do Historii jako rzeczywisty, z kursami sprzed "
+            "rozpoczęcia meczów, i rozliczy się automatycznie. W statystykach jest oddzielony "
+            "od kuponów zapisanych przed meczem."
+        )
     save = st.columns(2)
     if save[0].button(
-        "Zapisz kupon",
+        "Zapisz kupon postawiony w STS" if late else "Zapisz kupon",
         icon=":material/save:",
         disabled=summary["blocked"],
         width="stretch",
         help="Zapis wymaga świeżych kursów i wydarzeń przed startem"
-        if summary["blocked"]
+        if summary["blocked"] and not late
         else None,
     ):
         try:
             coupon_id = save_my_coupon(
-                c.store(), c.paths(), legs, rows, stake=stake, now=c.now(), real=real
+                c.store(), c.paths(), legs, rows, stake=stake, now=c.now(), real=real, late=late
             )
             st.session_state[SAVED] = coupon_id
             st.rerun()
@@ -316,7 +341,13 @@ def _evaluation() -> None:
     stake = cart.stake()
     sts = load_profiles(c.paths().config)["sts"]
     report = advisor.evaluate(
-        legs, rows, stake=stake, cost=sts.cost, on_date=c.today_local(), now=c.now()
+        legs,
+        rows,
+        stake=stake,
+        cost=sts.cost,
+        on_date=c.today_local(),
+        now=c.now(),
+        store=c.store(),
     )
     ui.section("Ocena kuponu", "modele aplikacji (Elo, Dixon–Coles) i dane — nie gwarancja")
     tone = "accent" if report["summary"]["probability"] is not None else "warn"
@@ -326,6 +357,10 @@ def _evaluation() -> None:
         weak = " · NAJSŁABSZE OGNIWO" if i == report["weakest"] else ""
         points = [r["reason"]]
         points += [f"Ryzyko: {x}" for x in r["risks"]]
+        lineup = r.get("lineups") or {}
+        points += [f"Skład: {x}" for x in lineup.get("changes", [])]
+        if lineup.get("needs_refresh"):
+            points.append("Składy: brak świeżej kontroli (ponad 6 h) — sprawdź przed meczem")
         body = (
             f"<b>{i + 1}. {ui.esc(r['event'])}{weak}</b><br><small>{ui.esc(r['pick'])} @ "
             f"{ui.esc(r['odds'])} · {ui.esc(r.get('market', ''))}</small>"
@@ -340,6 +375,14 @@ def _evaluation() -> None:
                         "Świeżość kursu",
                         "potwierdzony" if r.get("freshness") == "fresh" else "niepotwierdzony",
                     ),
+                    ("Skład", lineup.get("lineup_status", "brak danych")),
+                    (
+                        "Absencje",
+                        ", ".join(lineup["absences"])
+                        if lineup.get("absences")
+                        else lineup.get("absence_source", "brak danych"),
+                    ),
+                    ("Model uwzględnia skład", "nie"),
                 ]
             )
             + ui.bullets(points)
@@ -364,9 +407,26 @@ def _evaluation() -> None:
     )
     if report["uncertainties"]:
         ui.explanation("Największe niepewności", report["uncertainties"], tone="warn")
+    _lineup_check(legs)
     if st.session_state.get(ALTERNATIVES):
         _alternatives(legs, rows, pool, stake, sts)
     _questions(report, legs, rows, stake, sts)
+
+
+def _lineup_check(legs) -> None:
+    """The matches of this (not yet saved) coupon go to the worker for a lineup check."""
+    ids = sorted({leg["event_id"] for leg in legs if leg.get("event_id")})
+    if st.button(
+        "Sprawdź składy meczów tego kuponu teraz",
+        icon=":material/groups:",
+        disabled=c.demo_mode() or not ids,
+        help="PitchAPI: do 2 zapytań na mecz. Prognozy nie zmieniają się od składów.",
+    ):
+        st.success(
+            automation.request(
+                c.paths(), c.store(), "check_events", now=c.now(), payload={"event_ids": ids}
+            )
+        )
 
 
 def _alternatives(legs, rows, pool, stake, sts) -> None:
@@ -401,11 +461,12 @@ def _alternatives(legs, rows, pool, stake, sts) -> None:
 
 def _questions(report, legs, rows, stake, sts) -> None:
     ui.section("Zapytaj o kupon", "odpowiedzi z danych aplikacji (objaśniacz szablonowy)")
-    examples = st.columns(len(ex.EXAMPLES))
     asked = None
-    for i, (col, example) in enumerate(zip(examples, ex.EXAMPLES, strict=True)):
-        if col.button(example, key=f"mc_q_{i}", width="stretch"):
-            asked = example
+    for row, group in enumerate((ex.EXAMPLES, ex.LINEUP_EXAMPLES)):
+        examples = st.columns(len(group))
+        for i, (col, example) in enumerate(zip(examples, group, strict=True)):
+            if col.button(example, key=f"mc_q_{row}_{i}", width="stretch"):
+                asked = example
     typed = st.text_input("Twoje pytanie", key="mc_question")
     if st.button("Zapytaj", icon=":material/help:") and typed.strip():
         asked = typed.strip()
@@ -454,10 +515,10 @@ def _questions(report, legs, rows, stake, sts) -> None:
                     local = llm.ask(
                         question, report, store=c.store(), settings=c.settings(), now=c.now()
                     )
-                if local.get("answer"):
+                if local["ok"]:  # only an answer that passed the checks is ever shown
                     st.write(local["answer"])
                     st.caption(f"Źródło: {local['source']} · {ins.num(local['seconds'], 1)} s")
-                if not local["ok"]:
+                else:
                     st.warning(local["reason"] + " Obowiązuje odpowiedź szablonowa powyżej.")
     if not usable:
         st.caption(f"Lokalny model AI (opcjonalny): {why_not}")

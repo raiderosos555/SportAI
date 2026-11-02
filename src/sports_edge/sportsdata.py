@@ -771,7 +771,11 @@ def predict_offer(
         raise ValueError("Nieznana wersja modelu")
     validation = json.loads(version["validation_json"])
     params = validation["hyperparameters"]
-    competitions = tuple(validation["competitions"])
+    competitions = tuple(
+        validation.get("competitions")
+        or json.loads(version["training_data_json"] or "{}").get("competitions")
+        or ()
+    )
     league_for = {
         sts: code
         for code, league in COMPETITIONS.items()

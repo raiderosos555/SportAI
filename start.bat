@@ -20,5 +20,6 @@ if errorlevel 1 (
   exit /b 1
 )
 echo [Sports Edge AI] Interfejs: http://localhost:8501  (zamknij okno lub Ctrl+C, aby zakonczyc)
-"%PY%" -m streamlit run src\sports_edge\app\main.py --server.address 127.0.0.1 --server.port 8501 --browser.gatherUsageStats false
+rem The launcher starts the interface and - if enabled in AUTOMATYZACJA AI - the worker.
+"%PY%" -m sports_edge.launch --port 8501
 endlocal

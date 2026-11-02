@@ -33,7 +33,7 @@ PROSPECTIVE = {"paper_system", "paper_manual", "real_manual"}
 LEG_SQL = """
 SELECT o.id odds_id, o.price, s.id selection_id, s.key selection, m.id market_id,
        m.market_key, m.period, m.overtime, m.line, e.id event_id, e.start_at, e.bookmaker_id,
-       e.home, e.away, q.status quote_status
+       e.home, e.away, q.status quote_status, q.ingested_at quote_ingested_at
 FROM odds o JOIN selections s ON s.id=o.selection_id JOIN markets m ON m.id=s.market_id
 JOIN events e ON e.id=m.event_id JOIN quote_sets q ON q.id=o.quote_set_id WHERE o.id=?
 """
@@ -52,9 +52,16 @@ def create_coupon(
     note: str = "",
     proposal: dict | None = None,
     key: str | None = None,
+    late_entry: bool = False,
 ) -> str:
     """Store a virtual coupon before its first event. ``proposal`` keeps the builder's profile,
-    policy, predicted probability and snapshots; ``key`` makes a proposal idempotent."""
+    policy, predicted probability and snapshots; ``key`` makes a proposal idempotent.
+
+    ``late_entry``: a coupon really placed in STS earlier and recorded only now (TASK 007
+    fix). Allowed for ``real_manual`` only and only with prices the application observed
+    before each event started — never a price seen after the kick-off."""
+    if late_entry and mode != "real_manual":
+        raise ValueError("Wpis po fakcie dotyczy wyłącznie kuponów postawionych w STS")
     if key is not None and store.get("coupons", key) is not None:
         return key
     if mode not in MODES:
@@ -77,7 +84,11 @@ def create_coupon(
             raise ValueError("Quote awaits manual review")
         if not leg["start_at"]:
             raise ValueError("Event start time unknown")
-        if mode in PROSPECTIVE and now >= datetime.fromisoformat(leg["start_at"]):
+        start = datetime.fromisoformat(leg["start_at"])
+        if late_entry:
+            if datetime.fromisoformat(leg["quote_ingested_at"]) >= start:
+                raise ValueError("Kurs zaobserwowany po rozpoczęciu meczu — nie do wpisu")
+        elif mode in PROSPECTIVE and now >= start:
             raise ValueError("Coupon must be stored before the event starts")
         legs.append(leg)
     if len({leg["event_id"] for leg in legs}) != len(legs):
