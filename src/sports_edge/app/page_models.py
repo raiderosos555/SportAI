@@ -19,6 +19,7 @@ from sports_edge.services import (
     MODEL_SCOPES,
     SCOPE_LABELS,
     active_versions,
+    challenger_versions,
     prediction_preference,
 )
 
@@ -35,7 +36,7 @@ FAMILIES = {
 def models_page() -> None:
     c.setup_page()
     ui.app_header(
-        "Modele i statystyki", "Jakie modele działają, dla kogo i jak bardzo można im ufać"
+        "Modele i statystyki", "Jakie modele działają, na jakich rynkach i z jaką jakością"
     )
     # a view switch instead of tabs: only the chosen view is computed (tabs run all bodies)
     views = {
@@ -58,6 +59,11 @@ def _basic() -> None:
     if not any(pair["elo"] or pair["goals"] for pair in served.values()):
         ui.empty_state("Brak modeli", "Uruchom analizę albo eksperyment w trybie zaawansowanym.")
         return
+    waiting = challenger_versions(db)
+    st.caption(
+        "„Zwalidowany” oznacza potwierdzoną trafność i kalibrację na nowych meczach (okno "
+        "selekcji protokołu v2). To nie jest gwarancja trafienia ani zysku."
+    )
     for name, scope in MODEL_SCOPES.items():
         pair = served[name]
         if not (pair["elo"] or pair["goals"]):
@@ -65,44 +71,66 @@ def _basic() -> None:
         report = json.loads(pair["goals"]["validation_json"]) if pair["goals"] else {}
         leagues = ", ".join(COMPETITIONS[code].name for code in scope if code in COMPETITIONS)
         one_x_two = preference.get(("1x2", scope[0]), ELO_FAMILY)
-        ui.section(SCOPE_LABELS[name].capitalize(), leagues)
         suspended = report.get("protocol") != "v2"
+        ui.section(SCOPE_LABELS[name].capitalize(), leagues)
         if suspended:
             ui.explanation(
                 "Statusy zawieszone (protokół v1)",
                 [learning.HOLDOUT_NOTE, "Nowe wersje (protokół v2) czekają w panelu Uczenie AI."],
                 tone="warn",
             )
-        cards = []
+        rows, chart, details = [], [], []
         for family, label in FAMILIES.items():
             info, model = _family_info(report, family, one_x_two)
             if info is None:
                 continue
+            metrics = (report.get("elo_families" if model == "elo" else "families") or {}).get(
+                family
+            ) or {}
+            cal = metrics.get("calibrated") or {}
             validated = info.get("status") == "validated_predictive" and not suspended
-            ranges = _ranges(report, family, model)
-            text = [
-                "Model: " + ("Elo (siła drużyn)" if model == "elo" else "Dixon–Coles (gole)"),
-                (
-                    "Trafność i kalibracja potwierdzone na nowych meczach"
-                    if validated
-                    else "Nie przeszedł walidacji — prognozy tylko eksperymentalne"
-                ),
-            ]
-            if info.get("note"):
-                text.append("Przewaga nad prostą częstością jest minimalna")
-            text += ranges
-            cards.append(
-                ui.card(
-                    f"<b>{ui.esc(label)}</b><br>"
-                    + ui.pill(
-                        "Można ufać (zwalidowany)" if validated else "Eksperymentalny",
-                        "ok" if validated else "warn",
-                    )
-                    + ui.bullets(text),
-                    tone="accent" if validated else "warn",
-                )
+            skill = info.get("skill_vs_baseline")
+            challenger = (waiting.get(name) or {}).get("elo" if model == "elo" else "goals")
+            rows.append(
+                [
+                    label,
+                    "Elo" if model == "elo" else "Dixon–Coles",
+                    "zwalidowany" if validated else "eksperymentalny",
+                    str(cal.get("n", "—")),
+                    f"{skill * 100:+.1f}%".replace(".", ",") if skill is not None else None,
+                    ins.num(cal.get("ece"), 3) if cal.get("ece") is not None else None,
+                    "czeka na decyzję" if challenger else "—",
+                ]
             )
-        ui.card_grid(cards)
+            if skill is not None:
+                chart.append(
+                    {
+                        "Rynek": label,
+                        "Przewaga nad częstością (%)": round(skill * 100, 2),
+                        "Status": "zwalidowany" if validated else "eksperymentalny",
+                    }
+                )
+            details.append((label, model, cal, metrics, info))
+        st.markdown(
+            ui.table(
+                [
+                    "Rynek",
+                    "Aktywny model",
+                    "Status walidacji",
+                    "Obserwacje",
+                    "Przewaga nad częstością",
+                    "Kalibracja (ECE)",
+                    "Challenger",
+                ],
+                rows,
+                numeric=(3, 4, 5),
+            ),
+            unsafe_allow_html=True,
+        )
+        if chart:
+            _skill_chart(chart)
+        with ui.details(f"Szczegółowe miary i kalibracja — {SCOPE_LABELS[name]}"):
+            _details(details)
     ui.section("Dyscypliny")
     ui.explanation(
         "Zakres modeli",
@@ -116,6 +144,81 @@ def _basic() -> None:
     )
 
 
+def _skill_chart(rows: list[dict]) -> None:
+    """Improvement of the log loss over the base rate, one bar per market (one axis)."""
+    import altair as alt
+
+    frame = pd.DataFrame(rows)
+    chart = (
+        alt.Chart(frame)
+        .mark_bar(cornerRadiusEnd=4, height=18)
+        .encode(
+            x=alt.X("Przewaga nad częstością (%):Q", title="Przewaga log loss nad częstością (%)"),
+            y=alt.Y(
+                "Rynek:N",
+                sort="-x",
+                title=None,
+                axis=alt.Axis(labelLimit=320, labelOverlap=False, labelFontSize=12),
+            ),
+            color=alt.Color(
+                "Status:N",
+                scale=alt.Scale(
+                    domain=["zwalidowany", "eksperymentalny"], range=["#22C55E", "#F59E0B"]
+                ),
+                legend=alt.Legend(orient="bottom", title=None),
+            ),
+            tooltip=["Rynek", "Przewaga nad częstością (%)", "Status"],
+        )
+        .properties(height=44 * len(frame) + 50)
+    )
+    st.altair_chart(chart, width="stretch")
+
+
+def _details(details: list) -> None:
+    body = []
+    for label, model, cal, metrics, _info in details:
+        body.append(
+            [
+                label,
+                "Elo" if model == "elo" else "Dixon–Coles",
+                ins.num(cal.get("log_loss"), 4) if cal.get("log_loss") is not None else None,
+                ins.num(metrics.get("baseline_log_loss"), 4)
+                if metrics.get("baseline_log_loss") is not None
+                else None,
+                ins.num(cal.get("brier"), 4) if cal.get("brier") is not None else None,
+                ins.num(cal.get("ece"), 4) if cal.get("ece") is not None else None,
+                str(cal.get("n", "—")),
+            ]
+        )
+    st.markdown(
+        ui.table(
+            ["Rynek", "Model", "Log loss", "Log loss bazowy", "Brier", "ECE", "n"],
+            body,
+            numeric=(2, 3, 4, 5, 6),
+        ),
+        unsafe_allow_html=True,
+    )
+    for label, model, _cal, _metrics, info in details:
+        lines = _ranges_for(label, model, _metrics)
+        reasons = info.get("reasons") or []
+        if lines or reasons:
+            st.markdown(f"**{label}**")
+            for line in lines:
+                st.caption(line)
+            for reason in reasons[:3]:
+                st.caption(f"Powód statusu: {reason}")
+
+
+def _ranges_for(label: str, model: str, metrics: dict) -> list[str]:
+    out = []
+    for row in metrics.get("ranges") or []:
+        if row.get("n", 0) >= 100 and row.get("freq") is not None:
+            out.append(
+                f"Typy z szansą {row['range']}: trafiło {ins.pct(row['freq'])} (n = {row['n']})"
+            )
+    return out
+
+
 def _family_info(report: dict, family: str, one_x_two: str):
     elo_first = family in ("1x2", "double_chance") and one_x_two == ELO_FAMILY
     if elo_first:
@@ -124,18 +227,6 @@ def _family_info(report: dict, family: str, one_x_two: str):
             return info, "elo"
     info = (report.get("predictive") or {}).get(family)
     return (info, "dc") if info else (None, None)
-
-
-def _ranges(report: dict, family: str, model: str) -> list[str]:
-    source = report.get("elo_families" if model == "elo" else "families") or {}
-    rows = (source.get(family) or {}).get("ranges") or []
-    out = []
-    for row in rows:
-        if row.get("n", 0) >= 100 and row.get("freq") is not None:
-            out.append(
-                f"Typy z szansą {row['range']}: trafiło {ins.pct(row['freq'])} (n = {row['n']})"
-            )
-    return out[-2:]
 
 
 # ---------------------------------------------------------------- coverage

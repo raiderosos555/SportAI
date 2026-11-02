@@ -63,25 +63,70 @@ def leg_status(db, event_id: str | None) -> str:
     return " · ".join(parts)
 
 
-def _alerts_list(db) -> None:
-    unread = alerts.recent(db, limit=6, unread_only=True)
-    if not unread:
-        st.caption("Brak nowych alertów przedmeczowych.")
-        return
-    for a in unread:
-        level = {"high": "bad", "medium": "warn"}.get(a["priority"], "info")
-        when = c.local_time(a["created_at"], "%d.%m %H:%M")
-        st.markdown(
-            ui.pill(a["label"], level) + f" {ui.esc(a['message'])} · {ui.esc(when)}",
-            unsafe_allow_html=True,
-        )
+PRIORITY_TONE = {"high": "bad", "medium": "warn"}
 
 
-def control_panel() -> None:
-    """KONTROLA PRZED MECZEM on the Dashboard."""
-    db, now = c.store(), c.now()
+def attention_block(db, now) -> None:
+    """Dashboard level 1: coupons that need attention, new alerts, one check button."""
     found = prematch_overview(db, now=now)
-    ui.section("Kontrola przed meczem", "składy i absencje meczów najbliższych 48 godzin")
+    rows = []
+    for item in found["attention"][:4]:
+        coupon, last = item["coupon"], item["reassessment"]
+        rows.append(
+            ui.list_row(
+                title=coupon["note"] or coupon["kind"].upper(),
+                meta="; ".join(last["reasons"][:2]),
+                badges=[
+                    ui.pill(last["result"], "warn" if last["result"] == "wymaga uwagi" else "bad")
+                ],
+                tone="warn",
+            )
+        )
+    unread = alerts.recent(db, limit=50, unread_only=True)
+    important = [a for a in unread if a["priority"] in ("high", "medium")]
+    minor = [a for a in unread if a["priority"] not in ("high", "medium")]
+    for a in important[:5]:
+        rows.append(
+            ui.list_row(
+                title=a["message"],
+                meta=c.local_time(a["created_at"], "%d.%m %H:%M") + f" · źródło: {a['source']}",
+                badges=[ui.pill(a["label"], PRIORITY_TONE.get(a["priority"], "info"))],
+                tone=PRIORITY_TONE.get(a["priority"], "info"),
+            )
+        )
+    if minor:
+        kinds = sorted({a["label"] for a in minor})
+        rows.append(
+            ui.list_row(
+                title=f"Informacje o niższym priorytecie: {len(minor)}",
+                meta=", ".join(kinds[:3]) + " — lista w Automatyzacji AI → Alerty",
+                badges=[ui.pill("informacja", "info")],
+            )
+        )
+    if rows:
+        ui.rows(rows)
+    else:
+        ui.empty_state(
+            "Nic nie wymaga uwagi",
+            "Brak nowych alertów i kuponów ze zmianami w składach. Kontrole przed meczem "
+            "(T-48 h … T-15 min) wykonuje worker Automatyzacji AI.",
+        )
+    if st.button(
+        "SPRAWDŹ WSZYSTKIE MOJE KUPONY TERAZ",
+        type="primary",
+        icon=":material/fact_check:",
+        width="stretch",
+        disabled=c.demo_mode(),
+        help="Zleca workerowi kontrolę składów meczów z niezakończonych kuponów i ich "
+        "ponowną ocenę (PitchAPI: do 2 zapytań na mecz).",
+    ):
+        st.success(automation.request(c.paths(), db, "check_coupons", now=now))
+    c.page_link("automatyzacja", "Harmonogram kontroli w Automatyzacji AI")
+
+
+def overview_metrics(db, now) -> None:
+    """Level 3: numbers of the pre-match monitoring (next 48 hours)."""
+    found = prematch_overview(db, now=now)
     ui.metric_cards(
         [
             (
@@ -94,44 +139,12 @@ def control_panel() -> None:
             ("Bez danych o składzie", str(found["without_data"]), "jeszcze nieopublikowane"),
             ("Nowe zmiany w składach", str(found["changes"]), "od poprzedniej kontroli"),
             (
-                "Kupony wymagające uwagi",
-                str(len(found["attention"])),
-                "ostatnia kontrola: "
-                + (
-                    c.local_time(found["last_update"], "%d.%m %H:%M")
-                    if found["last_update"]
-                    else "—"
-                ),
+                "Ostatnia kontrola",
+                c.local_time(found["last_update"], "%d.%m %H:%M") if found["last_update"] else "—",
+                f"kupony wymagające uwagi: {len(found['attention'])}",
             ),
         ]
     )
-    left, right = st.columns([3, 2], gap="large")
-    with left:
-        for item in found["attention"][:5]:
-            coupon, last = item["coupon"], item["reassessment"]
-            st.markdown(
-                ui.pill(last["result"], "warn" if last["result"] == "wymaga uwagi" else "bad")
-                + f" {ui.esc(coupon['note'] or coupon['kind'].upper())} — "
-                + ui.esc("; ".join(last["reasons"][:2])),
-                unsafe_allow_html=True,
-            )
-        _alerts_list(db)
-    with right:
-        if st.button(
-            "SPRAWDŹ WSZYSTKIE MOJE KUPONY TERAZ",
-            type="primary",
-            icon=":material/fact_check:",
-            width="stretch",
-            disabled=c.demo_mode(),
-            help="Zleca workerowi kontrolę składów meczów z niezakończonych kuponów i ich "
-            "ponowną ocenę (PitchAPI: do 2 zapytań na mecz).",
-        ):
-            st.success(automation.request(c.paths(), db, "check_coupons", now=now))
-        st.caption(
-            "Automatyczne kontrole (T-48 h … T-15 min) ustawisz w Automatyzacji AI. "
-            "Prognozy nie uwzględniają składów — to informacja i ostrzeżenia."
-        )
-        c.page_link("automatyzacja", "Przejdź do Automatyzacji AI")
 
 
 def _side_table(side: dict) -> pd.DataFrame:

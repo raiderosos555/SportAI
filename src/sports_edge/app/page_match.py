@@ -12,7 +12,8 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
-from sports_edge.app import advanced_ui, cart, prematch_ui, ui
+from sports_edge import prematch
+from sports_edge.app import advanced_ui, cart, match_view, prematch_ui, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
 from sports_edge.services import (
@@ -104,33 +105,49 @@ def match_page() -> None:
     features = _features(db, c.data_version(db), choice, decision)
     teams = (features or {}).get("features", {}).get("teams", {})
     max_odds = float(probability_policy(c.paths()).builder["max_odds_per_leg"])
-    _header(head, context, rows, started, review)
+    info = prematch.summary(db, choice)
+    # level 1: who plays, the probabilities, the pick
+    match_view.header(head, context, rows, started, review, info)
     if started:
         _post_match(review, head)
-    ui.section("Ocena modelu", "przed meczem" if not started else "prognoza sprzed rozpoczęcia")
-    _outlook(rows, context, head, review)
+    ui.section(
+        "Prawdopodobieństwa",
+        "prognoza sprzed rozpoczęcia"
+        if started
+        else "każdy rynek osobno, z modelem i jego statusem",
+    )
+    match_view.probabilities(head, rows, context, review)
     ui.section("Najbardziej prawdopodobny obsługiwany typ")
-    _pick(rows, now, max_odds, started, day)
-    ui.section("Dlaczego model tak ocenia ten mecz?")
-    advanced_ui.why(db, rows, context, teams, review.get("forecast") if started else None)
+    pick = _pick(rows, now, max_odds, started, day)
+    # level 2: comparison, risk factors, short reasoning
+    ui.section("Porównanie drużyn", "dane znane przed prognozą")
+    match_view.comparison(head, teams)
+    ui.section("Analiza meczu")
+    match_view.analysis(rows, teams, info, pick, started=started)
+    # level 3: everything else on demand
+    with ui.details(
+        "Pełne uzasadnienie: dane użyte i nieuwzględnione przez model, model rozszerzony",
+        icon=":material/fact_check:",
+    ):
+        advanced_ui.why(db, rows, context, teams, review.get("forecast") if started else None)
     tabs = st.tabs(
         [
-            "Forma",
-            "Statystyki",
             "Składy i absencje",
             "Wszystkie rynki i kursy",
+            "Ostatnie mecze",
+            "Statystyki meczowe",
             "Modele i kalibracja",
             "Dane techniczne",
         ]
     )
     with tabs[0]:
-        _form(context, teams, started)
-    with tabs[1]:
-        _stats(teams, head)
-    with tabs[2]:
         _lineups(db, context, choice, now, started)
-    with tabs[3]:
+    with tabs[1]:
         _markets(rows, day, started)
+    with tabs[2]:
+        _form(context, teams, started)
+    with tabs[3]:
+        _stats(teams, head)
     with tabs[4]:
         _models(rows, context)
     with tabs[5]:
@@ -145,50 +162,6 @@ def match_page() -> None:
 
 
 # ---------------------------------------------------------------- header and modes
-
-
-def _header(head, context, rows, started, review) -> None:
-    status = c.EVENT_STATUS.get(head.event_status, head.event_status)
-    has_forecast = any(r.p_model is not None for r in rows)
-    badges = [ui.pill(status.capitalize(), c.EVENT_TONE.get(head.event_status, "neutral"))]
-    if started:
-        badges.append(
-            ui.pill("Prognoza sprzed meczu zapisana", "ok")
-            if review.get("forecast")
-            else ui.pill("Brak prognozy sprzed meczu", "neutral")
-        )
-    else:
-        badges.append(
-            ui.pill("Prognoza modelu dostępna", "ok")
-            if has_forecast
-            else ui.pill("Brak prognozy modelu", "neutral")
-        )
-    badges.append(
-        ui.pill("Oferta STS potwierdzona", "ok")
-        if head.freshness == "fresh"
-        else ui.pill(
-            "Kurs niepotwierdzony"
-            + (f" ({ins.num(head.odds_age_hours, 1)} h)" if head.odds_age_hours else ""),
-            "warn",
-        )
-    )
-    badges.append(
-        ui.pill("Tryb analizy po meczu", "info")
-        if started
-        else ui.pill("Tryb przedmeczowy", "info")
-    )
-    st.markdown(
-        ui.card(
-            f'<div class="se-match"><div class="teams" style="font-size:1.45rem">'
-            f"{ui.esc(head.event.upper())}</div>"
-            f'<div class="meta">{ui.esc(c.local_time(head.start_at, "%d.%m.%Y · %H:%M"))} · '
-            f"{ui.esc(head.league)} · {ui.esc(head.sport)}</div>" + "".join(badges) + "</div>",
-            tone="accent",
-        ),
-        unsafe_allow_html=True,
-    )
-    if not context.get("competition"):
-        st.caption("Ta liga nie ma legalnego źródła wyników w aplikacji — brak modelu.")
 
 
 def _post_match(review: dict, head) -> None:
@@ -249,50 +222,12 @@ def _post_match(review: dict, head) -> None:
     ui.explanation("Czego model nie wiedział przed meczem", review["unknown_before"])
 
 
-def _outlook(rows, context, head, review) -> None:
-    probs = {
-        r.selection: r.p_model
-        for r in rows
-        if r.market_key == "1x2" and r.period == "FT" and r.p_model is not None
-    }
-    original = review.get("forecast") if review.get("started") else None
-    if original:  # after kick-off: exactly the forecast made before the match
-        probs = original["probabilities"]
-    elif len(probs) < 3 and context.get("prediction"):
-        probs = context["prediction"]["probabilities"]
-    home, away = (head.event.split(" - ", 1) + [""])[:2]
-    view = ins.outlook(probs if len(probs) == 3 else None, home, away)
-    if view is None:
-        ui.empty_state(
-            "Brak prognozy 1X2",
-            "Model nie przygotował prognozy (liga bez danych, nieaktualne dane, za krótka "
-            "historia drużyny albo mecz już się rozpoczął).",
-        )
-        return
-    model = (original or {}).get("family") or next(
-        (r.model for r in rows if r.market_key == "1x2" and r.model), ""
-    )
-    body = (
-        f"<b>{ui.esc(ins.sentence(view['character']))}</b>"
-        + ui.probability_bars(
-            [
-                (f"{home} wygrywa", view["home"], ins.pct(view["home"])),
-                ("Remis", view["draw"], ins.pct(view["draw"])),
-                (f"{away} wygrywa", view["away"], ins.pct(view["away"])),
-            ]
-        )
-        + f"<div style='color:#94A3B8;font-size:.82rem'>Model: "
-        f"{ui.esc(_model_text(model))}</div>"
-    )
-    st.markdown(ui.card(body), unsafe_allow_html=True)
-
-
 def _model_text(model: str) -> str:
     key = "elo" if model.startswith("elo") else "dixon" if "dixon" in model else ""
     return MODEL_TEXT.get(key, model or "brak")
 
 
-def _pick(rows, now, max_odds, started, day) -> None:
+def _pick(rows, now, max_odds, started, day) -> dict | None:
     pick = ins.best_pick(rows, now=now, max_odds=max_odds) if not started else None
     if pick is None:
         ui.empty_state(
@@ -302,7 +237,7 @@ def _pick(rows, now, max_odds, started, day) -> None:
             if not started
             else "Mecz już się rozpoczął — nie jest kandydatem do kuponu.",
         )
-        return
+        return None
     x = pick["candidate"]
     qualifies = (
         ("Kwalifikuje się do kuponu", "ok")
@@ -326,6 +261,7 @@ def _pick(rows, now, max_odds, started, day) -> None:
         unsafe_allow_html=True,
     )
     cart.add_button(x, day=day, key=f"match_add_{x.selection_id}")
+    return pick
 
 
 # ---------------------------------------------------------------- tabs

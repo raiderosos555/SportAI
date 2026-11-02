@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
-from sports_edge.app import cart, prematch_ui, ui
+from sports_edge.app import cart, coupon_view, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
 from sports_edge.services import (
@@ -20,18 +20,6 @@ from sports_edge.services import (
     saved_proposals,
 )
 
-PROFILE_ORDER = ("high_hit", "standard", "higher_payout", "tasiemka")
-PROFILE_TEXT = {
-    "high_hit": "Kurs 1,25–1,60: najwyższa szansa trafienia, preferowany SOLO.",
-    "standard": "Kurs 1,80–2,20: główny profil — szansa i wypłata w równowadze.",
-    "higher_payout": "Kurs 2,50–4,00: wyższa wypłata za wyraźnie niższą szansę.",
-    "tasiemka": "Kurs 8–12: najmniejsza uzasadniona liczba zdarzeń; zwykle brak, gdy dane "
-    "nie pozwalają.",
-    # profiles of coupons saved before TASK 007
-    "safe": "Profil sprzed TASK 007 (Bezpieczny).",
-    "balanced": "Profil sprzed TASK 007 (Zrównoważony).",
-    "aggressive": "Profil sprzed TASK 007 (Agresywny).",
-}
 PHASES = (
     "Pobieranie danych",
     "Analizowanie wydarzeń",
@@ -223,32 +211,20 @@ def _day(db, settings, rules, day, run, online) -> None:
         _no_coupon(explanation, day, run is not None, online)
         return
     by_odds = {x.odds_id: x for x in candidates}
-    columns = st.container(key=f"cards-{day}").columns(len(rules.profiles))
-    for col, name in zip(columns, rules.profiles, strict=True):
-        with col:
-            _card(
-                name,
-                rules.profiles[name],
-                proposals.get(name),
-                refusals.get(name),
-                ids.get(name),
-                [
-                    proposal_payload(a, policy_version=rules.version)
-                    for a in alternatives.get(name, ())
-                ],
-            )
-            payload = proposals.get(name)
-            legs = [by_odds.get(leg["odds_id"]) for leg in (payload or {}).get("legs", [])]
-            if payload and all(legs):
-                st.button(
-                    cart.ADD_LABEL,
-                    key=f"to_cart_{day}_{name}",
-                    icon=":material/add_shopping_cart:",
-                    on_click=cart.add_many,
-                    args=([(x, day) for x in legs],),
-                    help="Przenosi typy tej propozycji do Mojego kuponu (do oceny lub zmian)",
-                    width="stretch",
-                )
+    for name in rules.profiles:  # one full-width card per profile: never squeezed
+        coupon_view.card(
+            name,
+            proposals.get(name),
+            db=db,
+            day=day,
+            by_odds=by_odds,
+            refusal=refusals.get(name),
+            coupon_id=ids.get(name),
+            alternatives=[
+                proposal_payload(a, policy_version=rules.version)
+                for a in alternatives.get(name, ())
+            ],
+        )
 
 
 def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool) -> None:
@@ -275,135 +251,6 @@ def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool)
     ):
         attempts = refresh_offers(c.store(), c.paths(), c.settings(), [day], now=c.now())
         _refresh_panel(attempts)
-
-
-def _card(name, profile, payload, refusal, coupon_id, alternatives) -> None:
-    db = c.store()
-    with st.container(border=True):
-        st.markdown(
-            f'<div class="se-title">{ui.esc(profile["label"])}</div>'
-            f'<p class="se-desc">{ui.esc(PROFILE_TEXT.get(name, ""))}</p>',
-            unsafe_allow_html=True,
-        )
-        span = (
-            f"kurs {ins.num(profile['min_total_odds'])}–{ins.num(profile['max_total_odds'])}"
-            if profile.get("max_total_odds")
-            else f"kurs ≥ {ins.num(profile['min_total_odds'])}"
-        )
-        floor = profile.get("min_coupon_probability")
-        st.caption(
-            f"{span} · do {profile['max_legs']} selekcji · każda ≥ "
-            f"{ins.pct(profile['min_leg_probability'], 0)} ostrożnie"
-            + (f" · kupon ≥ {ins.pct(floor, 0)} ostrożnie" if floor else "")
-        )
-        if payload is None:
-            st.markdown(ui.pill("Brak propozycji", "neutral"), unsafe_allow_html=True)
-            st.write(refusal or "Profil nie znalazł kombinacji spełniającej warunki.")
-            return
-        validated = payload["level"] == "validated_predictive"
-        st.markdown(
-            ui.pill("Zwalidowany predykcyjnie", "ok")
-            if validated
-            else ui.pill("SYMULACJA — model eksperymentalny", "warn"),
-            unsafe_allow_html=True,
-        )
-        p = payload["probability"]
-        st.markdown(
-            ui.probability_bars(
-                [
-                    ("Szansa kuponu", p["calibrated"], ins.pct(p["calibrated"])),
-                    ("Ostrożnie", p["conservative"], ins.pct(p["conservative"])),
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            ui.key_values(
-                [
-                    ("Kurs łączny", ins.num(payload["total_odds"])),
-                    ("Stawka", ins.money(payload.get("stake", "10.00"))),
-                    ("Wypłata", ins.money(payload["payout"])),
-                    ("Zysk netto", ins.money(payload["net_profit"])),
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
-        st.markdown(
-            ui.legs_html(
-                [
-                    {
-                        "event": leg["event"].replace(" - ", " – "),
-                        "when": f"{c.local_time(leg['start_at'], '%d.%m %H:%M')} · "
-                        f"{leg.get('league', '')} · nr STS {leg['offer_code'] or '—'}",
-                        "pick": ins.pick_label(
-                            leg.get("market_key", ""),
-                            leg.get("line"),
-                            leg["selection"],
-                            leg["event"],
-                            leg["market"],
-                        ),
-                        "odds": ins.num(leg["odds"]),
-                        "detail": f"szansa {ins.pct(leg['p_model'])} (ostrożnie "
-                        f"{ins.pct(leg['p_conservative'])}) · "
-                        + (
-                            "zwalidowany"
-                            if leg["predictive_status"] == "validated_predictive"
-                            else "eksperymentalny"
-                        ),
-                        "note": prematch_ui.leg_status(
-                            db,
-                            leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"]),
-                        ),
-                    }
-                    for leg in payload["legs"]
-                ]
-            ),
-            unsafe_allow_html=True,
-        )
-        with st.expander("Dlaczego ten kupon?"):
-            for line in payload["reasons"]:
-                st.write("• " + line)
-            st.write(
-                f"• Niepewność: szansa całego kuponu od {ins.pct(p['conservative'])} (ostrożnie) "
-                f"do {ins.pct(p['calibrated'])} (model); {p['basis']}."
-            )
-            st.write(
-                f"• Opłacalność (diagnostyka): EV netto {ins.num(payload['ev_net'], 3)} zł na 1 zł "
-                "— wysoka szansa trafienia nie oznacza zysku."
-            )
-            for warning in payload["warnings"]:
-                st.warning(warning)
-        if alternatives:
-            with st.expander(f"Alternatywne propozycje ({len(alternatives)})"):
-                for alt in alternatives:
-                    q = alt["probability"]
-                    legs = " + ".join(
-                        ins.pick_label(
-                            leg.get("market_key", ""),
-                            leg.get("line"),
-                            leg["selection"],
-                            leg["event"],
-                            leg["market"],
-                        )
-                        + f" ({leg['event']})"
-                        for leg in alt["legs"]
-                    )
-                    st.write(
-                        f"• {legs}"
-                        f" — kurs {ins.num(alt['total_odds'])}, szansa {ins.pct(q['calibrated'])} "
-                        f"(ostrożnie {ins.pct(q['conservative'])})"
-                    )
-        if coupon_id and not str(coupon_id).startswith("nie zapisano"):
-            st.caption(
-                f"Zapisano jako kupon wirtualny {str(coupon_id)[:10]}… — rozliczy się automatycznie."
-            )
-        elif coupon_id:
-            st.caption(str(coupon_id))
-        if payload.get("outcome"):
-            label, tone = {"win": ("Trafiony", "ok"), "loss": ("Nietrafiony", "bad")}.get(
-                payload["outcome"], (payload["outcome"], "neutral")
-            )
-            st.markdown(ui.pill(label, tone), unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------- candidate pool

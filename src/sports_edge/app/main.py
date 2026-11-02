@@ -160,5 +160,6 @@ try:
 except Exception as error:  # noqa: BLE001 — a broken status must never hide the pages
     st.sidebar.warning(f"Status danych niedostępny: {error}")
 st.navigation(
-    {section: [pages[key] for key in keys if key in pages] for section, keys in SECTIONS.items()}
+    {section: [pages[key] for key in keys if key in pages] for section, keys in SECTIONS.items()},
+    expanded=True,  # every page visible — no collapsed "View more" link
 ).run()

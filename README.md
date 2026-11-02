@@ -58,7 +58,7 @@ serwera”. Harmonogram zadań Windows nie jest potrzebny.
 | Kupon jak najbliżej wybranego kursu; długi kupon 8–12 | **Kupon na kurs**, **Tasiemka** |
 | Ryzyko serii kuponów (Monte Carlo); odtworzenie przeszłego dnia as-of | **Symulator budżetu**, **Symulator historyczny** |
 | Champion i challenger, aktywacja nowego modelu, przegląd, jakość prognoz, eksperyment cech (model rozszerzony) | **Uczenie AI** |
-| Worker automatyzacji: uruchom / wstrzymaj / wznów / zatrzymaj, harmonogram, historia zadań, alerty | **Automatyzacja AI** |
+| Worker automatyzacji w zakładkach: przegląd, harmonogram (kalendarz, stałe godziny i dni, zadania jednorazowe, kontrole przed meczem), procesy, historia, alerty | **Automatyzacja AI** |
 | Ocena modelu, najbardziej prawdopodobny typ, uzasadnienie, forma, statystyki, składy, tryb po meczu | **Analiza meczów** |
 | Terminarz, zakończone mecze z wynikami, pełna oferta STS i historia kursów, import PDF | **Wydarzenia i wyniki** |
 | Kupony, trafność, ROI, wykres w czasie, rozliczenia, CLV, analizy | **Historia i skuteczność** |
@@ -148,10 +148,16 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-299 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
-kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia).
+308 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
+9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
+wizualny).
 Ścieżki interfejsu: `python -m sports_edge.qa` (22 ścieżki). Zrzuty ekranu:
-`python -m sports_edge.qa_browser` (Playwright; w CI). Artefakty QA w GitHub Actions
+`python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
+`python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
+768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,
+czytelne szerokości kart, widoczne przyciski, działające zakładki, długie nazwy) i scenariuszami;
+lokalnie wymaga `pip install playwright` i `python -m playwright install chromium`. Artefakty QA w GitHub Actions
 (`qa-report-Windows`, `qa-report-Linux`) zawierają raport ścieżek UI, wersje bibliotek,
 syntetyczny PDF i zrzuty ekranu z danych DEMO — nigdy bazy ani kluczy. Testy parserów używają oznaczonych fixture
 syntetycznych; test autentycznych PDF STS uruchamia się, gdy istnieje `data/samples/sts`
@@ -200,6 +206,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 009](docs/task_009_report.md) | Przebudowa interfejsu (Sports Edge AI 3.0): system projektowy, trzy poziomy informacji, harmonogram przez WWW, testy wizualne Playwright |
 | [Raport TASK 008](docs/task_008_report.md) | Automatyzacja AI (worker), składy przed meczem, absencje, kontrola kuponów, Advanced Football Prediction Engine, QA, TASK 009 |
 | [Raport TASK 007](docs/task_007_report.md) | P0 (przedziały, protokół v2, zależność par), Mój kupon, profile, symulatory, zbieranie danych, uczenie, TASK 008 |
 | [Raport TASK 006](docs/task_006_report.md) | Redesign, Kupon dnia, analiza meczu, pokrycie 12 lig, zakresy modeli, TASK 007 |

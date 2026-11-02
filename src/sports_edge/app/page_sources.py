@@ -147,6 +147,7 @@ def _monitoring() -> None:
 
 
 def _panel() -> None:
+    """Basic view: one readable row per provider; licences, limits and coverage on demand."""
     db = c.store()
     settings = c.settings()
     providers = {p.id: p for p in results_providers(c.paths(), settings)}
@@ -165,7 +166,7 @@ def _panel() -> None:
     for league in freshness:
         for family in league["providers"]:
             leagues.setdefault(family, []).append(league["name"])
-    cards = [_sts_card(db, settings)]
+    rows, details = [_sts_row(db, settings)], []
     for source in SOURCES:
         family = source["id"]
         adapters = [p for p in providers.values() if getattr(p, "family", p.id) == family]
@@ -176,86 +177,80 @@ def _panel() -> None:
             if family == "football_data_org"
             else local_secret(source["key"], c.paths().root)
         )
-        found = stats.get(family) or stats.get(
-            "openfootball" if family == "openfootball" else family, {}
+        found = stats.get(family) or {}
+        key_text = (
+            "bez klucza" if not source["key"] else "klucz: jest" if has_key else "brak klucza"
         )
-        tone = "ok" if active else "warn" if has_key else "neutral"
-        cards.append(
-            ui.card(
-                f"<b>{ui.esc(source['name'])}</b><br>"
-                + ui.pill("aktywne" if active else "nieaktywne", tone)
-                + ui.pill(
-                    "klucz: jest"
-                    if source["key"] and has_key
-                    else "bez klucza"
-                    if not source["key"]
-                    else "brak klucza",
-                    "neutral" if has_key else "warn",
-                )
-                + ui.key_values(
-                    [
-                        ("Zakres", source["scope"]),
-                        ("Status", "; ".join(s.reason for s in status) or "—"),
-                        ("Rekordy", f"{found.get('n', 0)} wyników"),
-                        (
-                            "Ostatnia aktualizacja",
-                            c.local_time(found.get("last")) if found.get("last") else "—",
-                        ),
-                        ("Ligi z danymi", ", ".join(leagues.get(family, [])) or "—"),
-                        ("Ograniczenia", source["limits"]),
-                    ]
-                ),
-                tone="" if active else "warn",
+        rows.append(
+            ui.list_row(
+                title=source["name"],
+                meta=f"{source['scope']} · ostatnia aktualizacja "
+                + (c.local_time(found["last"], "%d.%m.%Y %H:%M") if found.get("last") else "—"),
+                value=f"{found.get('n', 0):,}".replace(",", " "),
+                value_hint="rekordów",
+                badges=[
+                    ui.pill("aktywne" if active else "nieaktywne", "ok" if active else "neutral"),
+                    ui.pill(key_text, "neutral" if has_key else "warn"),
+                ],
+                tone="ok" if active else "",
             )
         )
-    cards.append(
-        ui.card(
-            "<b>OpenScores (MCP)</b><br>"
-            + ui.pill("sprawdzone — niewdrożone", "neutral")
-            + ui.key_values(
+        details.append(
+            (
+                source["name"],
                 [
-                    ("Zakres", "top 5 lig, wyłącznie sezon 2025/26"),
-                    ("Powód", "brak bieżącego sezonu — nie nadaje się do prognoz"),
-                ]
+                    ("Status", "; ".join(s.reason for s in status) or "—"),
+                    ("Zmienna klucza", source["key"] or "—"),
+                    ("Limity i licencja", source["limits"]),
+                    ("Ligi z danymi", ", ".join(leagues.get(family, [])) or "—"),
+                ],
             )
         )
+    rows.append(
+        ui.list_row(
+            title="OpenScores (MCP)",
+            meta="top 5 lig, wyłącznie sezon 2025/26 — brak bieżącego sezonu",
+            badges=[ui.pill("sprawdzone — niewdrożone", "neutral")],
+        )
     )
-    ui.card_grid(cards)
-    st.caption(
-        f"Ligi z modelem: {len(RESEARCH_COMPETITIONS)}. Dostawca jest pokazany jako źródło ligi "
-        "tylko wtedy, gdy w bazie są jego wyniki — sam adapter nie oznacza pokrycia. Źródła, które "
-        "odmówiły dostępu do bieżącego sezonu, nie są odpytywane ponownie przez 7 dni. "
-        + " · ".join(f"{k}: {v}" for k, v in SOURCE_LABELS.items())
-    )
+    ui.rows(rows)
+    with ui.details("Szczegóły źródeł: status, licencje, limity i pokrycie lig"):
+        st.markdown(
+            '<div class="se-grid two">'
+            + "".join(
+                ui.card(f"<b>{ui.esc(name)}</b>" + ui.key_values(pairs)) for name, pairs in details
+            )
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Ligi z modelem: {len(RESEARCH_COMPETITIONS)}. Dostawca jest pokazany jako źródło "
+            "ligi tylko wtedy, gdy w bazie są jego wyniki — sam adapter nie oznacza pokrycia. "
+            "Źródła, które odmówiły dostępu do bieżącego sezonu, nie są odpytywane ponownie przez "
+            "7 dni. " + " · ".join(f"{k}: {v}" for k, v in SOURCE_LABELS.items())
+        )
 
 
-def _sts_card(db, settings) -> str:
+def _sts_row(db, settings) -> str:
     rows = [i for i in imports(db) if i["data_kind"] in c.data_kinds()]
     last = rows[0] if rows else None
     newest = max((i["generated_at"] or "" for i in rows if i["rows_total"]), default="")
-    empty = sum(1 for i in rows if i["rows_total"] == 0)
     allowed = not settings.offline_mode and settings.sts_download_enabled
-    return ui.card(
-        "<b>STS — oferta PDF</b><br>"
-        + ui.pill(
-            "pobieranie na żądanie" if allowed else "tylko import ręczny",
-            "ok" if allowed else "neutral",
-        )
-        + ui.key_values(
-            [
-                ("Zakres", "oficjalne pliki: na dziś, na jutro, kolejne dni"),
-                ("Najnowszy dokument z kursami", c.local_time(newest) if newest else "—"),
-                (
-                    "Ostatni import",
-                    f"{c.local_time(last['ingested_at'])} ({last['rows_total']} wierszy)"
-                    if last
-                    else "—",
-                ),
-                ("Puste pliki", str(empty)),
-                ("Ograniczenia", "maks. raz na 10 minut na plik; plik „na dziś” bywa pusty"),
-            ]
-        ),
-        tone="accent",
+    return ui.list_row(
+        title="STS — oferta PDF",
+        meta="oficjalne pliki na dziś, jutro i kolejne dni · najnowszy dokument "
+        + (c.local_time(newest, "%d.%m.%Y %H:%M") if newest else "—")
+        + " · maks. raz na 10 minut na plik",
+        value=str(last["rows_total"]) if last else "—",
+        value_hint="wierszy w ostatnim imporcie",
+        badges=[
+            ui.pill(
+                "pobieranie na żądanie" if allowed else "tylko import ręczny",
+                "ok" if allowed else "neutral",
+            ),
+            ui.pill("bez klucza", "neutral"),
+        ],
+        tone="ok" if newest else "warn",
     )
 
 

@@ -130,6 +130,18 @@ def demo_document(day: date, generated: datetime) -> bytes:
             },
             {"market": "Liczba goli", "labels": ["-", "+"]},
             {"event": ("9003", "Orły Testowo - Sokoły Demo (2.5)", ["1.95", "1.85"], "18:00")},
+            # long names on purpose (the longest that fit the printed column): the
+            # interface must wrap them between words, never letter by letter
+            {"league": "DEMOLANDIA - EKSTRAKLASA MISTRZÓW KRAJU"},
+            {"market": "Mecz", "labels": ["1", "X", "2", "1X", "X2", "12"]},
+            {
+                "event": (
+                    "9005",
+                    "Wysokogórskie Towarzystwo - Nadwiślańskie Stowarzyszenie",
+                    ["2.40", "3.30", "2.90", "1.40", "1.55", "1.30"],
+                    "21:15",
+                )
+            },
             {"sport": "TENIS"},
             {"league": "DEMO TOUR - TURNIEJ PRZYKŁADOWY"},
             {"market": "Zwycięzca meczu", "labels": ["1", "2"]},

@@ -30,6 +30,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.settings import AppPaths
@@ -76,7 +77,11 @@ DEFAULTS = {
     },
     "checkpoints_minutes": [2880, 1440, 360, 90, 60, 30, 15],
     "max_candidates": 30,
+    "one_off": [],  # jobs planned once: {"id", "job", "at", "created_at"}
 }
+WARSAW = ZoneInfo("Europe/Warsaw")  # fixed times are wall-clock times in Poland
+WEEKDAYS = ("pon", "wt", "śr", "czw", "pt", "sob", "niedz")
+MODES = {"interval": "co określony czas", "daily": "o stałych godzinach"}
 CHECKPOINT_NAMES = {
     2880: "T-48h",
     1440: "T-24h",
@@ -398,8 +403,52 @@ def failures(store: Store, job: str) -> int:
     return count
 
 
+def _valid_time(value: str) -> bool:
+    try:
+        hour, minute = (int(x) for x in str(value).split(":"))
+    except ValueError:
+        return False
+    return 0 <= hour < 24 and 0 <= minute < 60
+
+
+def slots(cfg: dict, start: datetime, end: datetime) -> list[datetime]:
+    """Fixed-time runs (Europe/Warsaw, chosen weekdays) between ``start`` and ``end``."""
+    times = sorted({t for t in cfg.get("times") or [] if _valid_time(t)})
+    days = set(cfg["weekdays"]) if cfg.get("weekdays") is not None else set(range(7))
+    out = []
+    day = start.astimezone(WARSAW).date() - timedelta(days=1)
+    last = end.astimezone(WARSAW).date() + timedelta(days=1)
+    while day <= last:
+        if day.weekday() in days:
+            for value in times:
+                hour, minute = (int(x) for x in value.split(":"))
+                moment = datetime(day.year, day.month, day.day, hour, minute, tzinfo=WARSAW)
+                moment = moment.astimezone(UTC)
+                if start <= moment <= end:
+                    out.append(moment)
+        day += timedelta(days=1)
+    return sorted(out)
+
+
+def _daily_next(store: Store, job: str, cfg: dict, *, now: datetime) -> datetime | None:
+    previous = slots(cfg, now - timedelta(days=8), now)
+    upcoming = slots(cfg, now + timedelta(seconds=1), now + timedelta(days=8))
+    following = upcoming[0] if upcoming else None
+    failed = failures(store, job)
+    if failed:
+        last = store.scalar("SELECT MAX(finished_at) FROM job_runs WHERE job=?", (_job_name(job),))
+        retry = datetime.fromisoformat(last) + timedelta(minutes=5 * 2 ** (failed - 1))
+        return min(retry, following) if following else retry
+    done = last_finished(store, job)
+    if previous and (done is None or done < previous[-1]):
+        return previous[-1]  # a planned time passed (e.g. the app was off): run it once
+    return following
+
+
 def next_run(store: Store, job: str, settings: dict, *, now: datetime) -> datetime | None:
     cfg = settings["jobs"].get(job) or {}
+    if cfg.get("enabled") and cfg.get("mode") == "daily":
+        return _daily_next(store, job, cfg, now=now)
     every = int(cfg.get("every_minutes") or 0)
     if not cfg.get("enabled") or every <= 0:
         return None
@@ -607,6 +656,73 @@ def due_jobs(store: Store, settings: dict, *, now: datetime) -> list[str]:
     return out
 
 
+def done_one_offs(store: Store) -> set[str]:
+    return {
+        json.loads(r["payload_json"]).get("id")
+        for r in store.rows("SELECT payload_json FROM automation_events WHERE kind='one_off_done'")
+    }
+
+
+def due_one_offs(store: Store, settings: dict, *, now: datetime) -> list[dict]:
+    """One-off tasks whose time has come and which have not run yet."""
+    done = done_one_offs(store)
+    return [
+        task
+        for task in settings.get("one_off") or []
+        if task.get("job") in JOBS
+        and task["id"] not in done
+        and datetime.fromisoformat(task["at"]) <= now
+    ]
+
+
+def add_one_off(store: Store, *, job: str, at: datetime, now: datetime) -> str:
+    if job not in JOBS:
+        raise ValueError("Nieznane zadanie")
+    settings = load_settings(store)
+    task_id = digest(["one_off", job, iso(at), iso(now)])[:16]
+    settings["one_off"] = [
+        *(settings.get("one_off") or []),
+        {"id": task_id, "job": job, "at": iso(at), "created_at": iso(now)},
+    ]
+    save_settings(store, settings, now=now)
+    return task_id
+
+
+def cancel_one_off(store: Store, task_id: str, *, now: datetime) -> None:
+    """Removes a planned one-off task from the current settings (older versions keep it)."""
+    settings = load_settings(store)
+    settings["one_off"] = [t for t in settings.get("one_off") or [] if t["id"] != task_id]
+    save_settings(store, settings, now=now)
+
+
+def planned(store: Store, settings: dict, *, now: datetime, days: int = 7) -> list[dict]:
+    """The calendar: fixed times, long intervals (6 h and more) and one-off tasks; short
+    intervals are summarised by the panel instead of being listed one by one."""
+    end = now + timedelta(days=days)
+    out = []
+    for job, cfg in settings["jobs"].items():
+        if job not in JOBS or not cfg.get("enabled"):
+            continue
+        if cfg.get("mode") == "daily":
+            out += [{"at": at, "job": job, "kind": "o godzinie"} for at in slots(cfg, now, end)]
+            continue
+        every = int(cfg.get("every_minutes") or 0)
+        if every >= 360:
+            first = next_run(store, job, settings, now=now) or now
+            moment = max(first, now)
+            while moment <= end:
+                out.append({"at": moment, "job": job, "kind": "interwał"})
+                moment += timedelta(minutes=every)
+    done = done_one_offs(store)
+    for task in settings.get("one_off") or []:
+        at = datetime.fromisoformat(task["at"])
+        if task["id"] not in done and at <= end:
+            out.append(
+                {"at": max(at, now), "job": task["job"], "kind": "jednorazowo", "id": task["id"]}
+            )
+    return sorted(out, key=lambda x: x["at"])
+
+
 # ---------------------------------------------------------------- the worker
 
 
@@ -747,8 +863,21 @@ class Worker:
                 self._run(store, job, settings, "schedule")
                 if self._stop.is_set():
                     return False
+            self._one_offs(store, settings)
         self.beat(store, settings)
         return True
+
+    def _one_offs(self, store: Store, settings: dict) -> None:
+        for task in due_one_offs(store, settings, now=self.clock()):
+            self._run(store, task["job"], settings, "one_off")
+            event(
+                store,
+                "one_off_done",
+                now=self.clock(),
+                worker_id=self.worker_id,
+                detail=task["job"],
+                payload={"id": task["id"]},
+            )
 
     def run(
         self,
@@ -792,6 +921,7 @@ class Worker:
                 self.handle(store, settings)
                 for job in due_jobs(store, settings, now=self.clock()):
                     self._run(store, job, settings, "once")
+                self._one_offs(store, settings)
                 return "jednorazowe uruchomienie zakończone"
             ticks = 0
             while not self._stop.is_set():

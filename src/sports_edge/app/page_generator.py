@@ -83,17 +83,22 @@ def _page(default: str) -> None:
     with st.expander("Filtry i wymagania", expanded=chosen == "custom"):
         row = st.columns(3)
         sports = row[0].multiselect(
-            "Dyscypliny", sorted({x.sport for x in candidates}), key=f"gen_sp_{chosen}"
+            "Dyscypliny",
+            sorted({x.sport for x in candidates}),
+            key=f"gen_sp_{chosen}",
+            placeholder="wszystkie",
         )
         leagues = row[1].multiselect(
             "Wyklucz ligi",
             sorted({x.league for x in candidates if x.league}),
             key=f"gen_l_{chosen}",
+            placeholder="wszystkie",
         )
         markets = row[2].multiselect(
             "Wyklucz rynki",
             sorted({x.market_key for x in candidates if x.p_model is not None}),
             key=f"gen_m_{chosen}",
+            placeholder="wszystkie",
         )
         row = st.columns(4)
         minimum = row[0].slider(

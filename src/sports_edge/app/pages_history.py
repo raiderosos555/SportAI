@@ -137,7 +137,10 @@ def _coupons(db) -> None:
                     f"{c.SELECTIONS.get(key, key)} @ {quote['price']}"
                 )
         chosen = st.multiselect(
-            "Selekcje (AKO: różne wydarzenia)", list(options), format_func=options.get
+            "Selekcje (AKO: różne wydarzenia)",
+            list(options),
+            format_func=options.get,
+            placeholder="wybierz…",
         )
         stake = st.number_input("Stawka (PLN)", min_value=1.0, value=10.0, step=1.0)
         mode = st.selectbox("Tryb", ["paper_manual", "simulation"], format_func=MODES.get)
@@ -252,7 +255,11 @@ def _overview(db) -> None:
     wins = sum(x["outcome"] == "win" for x in decided)
     stake = sum((Decimal(x["stake"]) for x in settled), Decimal(0))
     profit = sum((x["net_profit"] for x in settled), Decimal(0))
-    predicted = [x["proposal"]["probability"]["calibrated"] for x in decided]
+    predicted = [
+        x["proposal"]["probability"]["calibrated"]
+        for x in decided
+        if x["proposal"]["probability"].get("calibrated") is not None
+    ]
     roi = profit / stake if stake else None
     ui.section("Podsumowanie", "kupony kreatora (wirtualne)")
     ui.metric_cards(
@@ -303,25 +310,173 @@ def _overview(db) -> None:
             )
         ui.section("Skuteczność w czasie")
         st.line_chart(pd.DataFrame(series).set_index("Data"), height=220)
-    ui.section("Ostatnie kupony")
-    outcomes = {r["odds_id"]: r["outcome"] for r in selection_outcomes(db)}
-    cards = []
-    for coupon in list(reversed(coupons))[:12]:
-        payload = coupon["proposal"]
-        legs = payload["legs"]
-        known = sum(outcomes.get(leg["odds_id"]) is not None for leg in legs)
-        if coupon["outcome"]:
-            label, tone = OUTCOME.get(coupon["outcome"], (coupon["outcome"], "neutral"))
-        elif known:
-            label, tone = (f"Częściowo rozstrzygnięty ({known}/{len(legs)})", "warn")
-        else:
-            label, tone = ("Nierozliczony", "neutral")
-        settlement = (
-            f"zysk netto {ins.money(coupon['net_profit'])}"
-            if coupon["outcome"]
-            else "czeka na wyniki"
+    _coupon_list(db, coupons)
+
+
+LEGACY_PROFILES = {"safe", "balanced", "aggressive"}  # profiles before TASK 007
+STATUS = {
+    "wszystkie": None,
+    "nierozliczone": lambda x: not x["outcome"],
+    "trafione": lambda x: x["outcome"] == "win",
+    "nietrafione": lambda x: x["outcome"] == "loss",
+    "inne rozliczenia": lambda x: x["outcome"] not in (None, "win", "loss"),
+}
+
+
+def newest_variants(db, coupons: list[dict]) -> set[str]:
+    """The newest saved proposal of every profile and analysis day; older ones are
+    historical variants (kept in the database, shown as such)."""
+    days = {r["id"]: r["analysis_date"] for r in db.rows("SELECT id, analysis_date FROM analyses")}
+    newest: dict[tuple, dict] = {}
+    for x in coupons:
+        key = (x["profile"], days.get(x.get("analysis_id")) or x["first_start_at"][:10])
+        if key not in newest or x["created_at"] > newest[key]["created_at"]:
+            newest[key] = x
+    return {x["id"] for x in newest.values()}
+
+
+def kind_label(coupon: dict, now, newest: set[str] | None = None) -> tuple[str, str]:
+    """Which kind of saved coupon this is: settled, real, current candidate, saved virtual
+    or a historical variant of a proposal."""
+    if coupon["outcome"]:
+        return "Kupon rozliczony", "neutral"
+    if coupon["mode"] == "real_manual":
+        if (coupon.get("proposal") or {}).get("entered_after_start"):
+            return "Rzeczywisty — wpis po fakcie", "info"
+        return "Rzeczywisty (postawiony w STS)", "info"
+    builder = coupon["mode"] != "paper_manual"
+    if builder and coupon.get("profile") in LEGACY_PROFILES:
+        return "Historyczny wariant propozycji", "neutral"  # a profile the builder no longer uses
+    if builder and newest is not None and coupon["id"] not in newest:
+        return "Historyczny wariant propozycji", "neutral"
+    if datetime.fromisoformat(coupon["first_start_at"]) > now:
+        return ("Bieżący kandydat", "info") if builder else ("Zapisany wirtualny kupon", "info")
+    return "Zapisany wirtualny — czeka na wyniki", "warn"
+
+
+def _coupon_list(db, coupons: list[dict]) -> None:
+    ui.section("Kupony", "filtry · zaznacz wiersz, aby zobaczyć szczegóły")
+    now = c.now()
+    newest = newest_variants(db, coupons)
+    rows = [{**x, "kind": kind_label(x, now, newest)} for x in reversed(coupons)]
+    dates = [datetime.fromisoformat(x["first_start_at"]).date() for x in rows]
+    with st.container(key="row-history"):
+        cols = st.columns([1.5, 1, 1, 1])
+        span = cols[0].date_input(
+            "Data", value=(min(dates), max(dates)), format="DD.MM.YYYY", key="hist_dates"
         )
-        review = ""
+        profiles = sorted({x["proposal"].get("label") or x["profile"] for x in rows})
+        chosen = cols[1].multiselect(
+            "Profil", profiles, key="hist_profiles", placeholder="wszystkie"
+        )
+        status = cols[2].selectbox("Status", list(STATUS), key="hist_status")
+        kinds = sorted({x["kind"][0] for x in rows})
+        types = cols[3].multiselect("Typ kuponu", kinds, key="hist_types", placeholder="wszystkie")
+    low, high = (
+        (span[0], span[-1]) if isinstance(span, tuple) and span else (min(dates), max(dates))
+    )
+    shown = [
+        x
+        for x, day in zip(rows, dates, strict=True)
+        if low <= day <= high
+        and (not chosen or (x["proposal"].get("label") or x["profile"]) in chosen)
+        and (STATUS[status] is None or STATUS[status](x))
+        and (not types or x["kind"][0] in types)
+    ]
+    if not shown:
+        ui.empty_state("Brak kuponów dla filtrów", "Zmień zakres dat, profil, status lub typ.")
+        return
+    frame = pd.DataFrame(
+        [
+            {
+                "Data": c.local_time(x["first_start_at"], "%d.%m.%Y %H:%M"),
+                "Profil": x["proposal"].get("label") or x["profile"],
+                "Typ": x["kind"][0],
+                "Mecze": ", ".join(leg["event"] for leg in x["proposal"]["legs"][:2])
+                + (
+                    f" + {len(x['proposal']['legs']) - 2}" if len(x["proposal"]["legs"]) > 2 else ""
+                ),
+                "Kurs": float(x["total_odds"]),
+                "Szansa": round(x["proposal"]["probability"]["calibrated"] * 100, 1)
+                if x["proposal"]["probability"].get("calibrated") is not None
+                else None,
+                "Stawka": float(x["stake"]),
+                "Wynik": OUTCOME.get(x["outcome"], (x["outcome"] or "oczekuje",))[0],
+                "Zysk netto": float(x["net_profit"]) if x["net_profit"] is not None else None,
+            }
+            for x in shown
+        ]
+    )
+    picked = st.dataframe(
+        frame,
+        hide_index=True,
+        width="stretch",
+        height=min(38 * (len(frame) + 1) + 4, 460),
+        on_select="rerun",
+        selection_mode="single-row",
+        key="hist_table",
+        column_config={
+            "Kurs": st.column_config.NumberColumn(format="%.2f"),
+            "Szansa": st.column_config.NumberColumn(format="%.1f%%"),
+            "Stawka": st.column_config.NumberColumn(format="%.2f zł"),
+            "Zysk netto": st.column_config.NumberColumn(format="%.2f zł"),
+        },
+    )
+    st.caption(
+        f"Pokazano {len(shown)} z {len(rows)} kuponów. Historyczne warianty propozycji zostają "
+        "w bazie — nic nie jest usuwane."
+    )
+    if picked.selection.rows:
+        _coupon_details(db, shown[picked.selection.rows[0]])
+
+
+def _coupon_details(db, coupon: dict) -> None:
+    payload = coupon["proposal"]
+    outcomes = {r["odds_id"]: r["outcome"] for r in selection_outcomes(db)}
+    legs = payload["legs"]
+    with st.container(border=True):
+        st.markdown(
+            ui.profile_badge(coupon["profile"], payload.get("label"))
+            + " "
+            + ui.pill(*coupon["kind"])
+            + ui.stat_strip(
+                [
+                    ("Kurs łączny", ins.num(coupon["total_odds"])),
+                    ("Szansa", ins.pct(payload["probability"]["calibrated"])),
+                    ("Ostrożnie", ins.pct(payload["probability"]["conservative"])),
+                    ("Stawka", ins.money(coupon["stake"])),
+                    ("Wypłata", ins.money(payload.get("payout"))),
+                    (
+                        "Zysk netto",
+                        ins.money(coupon["net_profit"])
+                        if coupon["net_profit"] is not None
+                        else "czeka",
+                    ),
+                ]
+            )
+            + ui.legs_html(
+                [
+                    {
+                        "event": leg["event"],
+                        "when": c.local_time(leg.get("start_at"), "%d.%m %H:%M"),
+                        "pick": ins.pick_label(
+                            leg.get("market_key", ""),
+                            leg.get("line"),
+                            leg["selection"],
+                            leg["event"],
+                            leg["market"],
+                        ),
+                        "odds": ins.num(leg["odds"]),
+                        "chance": f"szansa {ins.pct(leg.get('p_model'))}",
+                        "detail": {"win": "trafiony", "loss": "nietrafiony"}.get(
+                            outcomes.get(leg["odds_id"]) or "", "czeka na wynik"
+                        ),
+                    }
+                    for leg in legs
+                ]
+            ),
+            unsafe_allow_html=True,
+        )
         if coupon["outcome"] in {"win", "loss"}:  # ANALIZA WYNIKU KUPONU (TASK 007)
             judged = {
                 **coupon,
@@ -330,41 +485,7 @@ def _overview(db) -> None:
                     "legs": [{**leg, "outcome": outcomes.get(leg["odds_id"])} for leg in legs],
                 },
             }
-            review = ui.bullets(coupon_review(judged)[:4])
-        cards.append(
-            ui.card(
-                f"<b>{ui.esc(payload.get('label', coupon['profile']))}</b> · "
-                f"{ui.esc(c.local_time(coupon['first_start_at'], '%d.%m.%Y'))}<br>"
-                + ui.pill(label, tone)
-                + ui.pill(*kind_label(coupon, c.now()))
-                + review
-                + ui.key_values(
-                    [
-                        ("Zdarzenia", str(len(legs))),
-                        ("Kurs", ins.num(coupon["total_odds"])),
-                        ("Prognozowana szansa", ins.pct(payload["probability"]["calibrated"])),
-                        ("Rozliczenie", settlement),
-                    ]
-                ),
-                tone="accent" if tone == "ok" else "bad" if tone == "bad" else "",
-            )
-        )
-    ui.card_grid(cards, wide=False)
-
-
-def kind_label(coupon: dict, now) -> tuple[str, str]:
-    """Which kind of saved coupon this is (TASK 007): settled, real, current or historical."""
-    if coupon["outcome"]:
-        return "Rozliczony", "neutral"
-    if coupon["mode"] == "real_manual":
-        if (coupon.get("proposal") or {}).get("entered_after_start"):
-            return "Rzeczywisty — wpis po fakcie", "info"
-        return "Rzeczywisty (wpis ręczny)", "info"
-    if datetime.fromisoformat(coupon["first_start_at"]) > now:
-        if coupon["mode"] == "paper_manual":
-            return "Zapisany wirtualny (Mój kupon)", "info"
-        return "Bieżący kandydat", "info"
-    return "Historyczny — czeka na wyniki", "warn"
+            ui.explanation("Analiza wyniku", coupon_review(judged)[:6])
 
 
 def _pct(value, digits: int = 0) -> str:
