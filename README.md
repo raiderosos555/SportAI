@@ -160,11 +160,12 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-325 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+338 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
-klubów, reprezentacje, bramka generatora, harmonogram, kategorie interfejsu).
+klubów, reprezentacje, bramka generatora, harmonogram, kategorie interfejsu; 13 z HOTFIX 009.1:
+własne pule profili generatora, wybór widocznego przycisku i diagnostyka w Playwright).
 Ścieżki interfejsu: `python -m sports_edge.qa` (25 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
