@@ -225,7 +225,23 @@ def _scenario_analysis(page, base: str, shot: Path) -> dict:
     return found
 
 
+def _scenario_cups(page, base: str, shot: Path) -> dict:
+    """TASK 009: the "Europejskie puchary" category of the analysis (no model percentages)."""
+    page.goto(f"{base}/analiza?demo=1")
+    _settle(page)
+    page.get_by_text("Europejskie puchary", exact=True).first.click()  # segmented control
+    _settle(page)
+    found = _assess(page)
+    found["message_visible"] = (
+        page.get_by_text("model predykcyjny jeszcze niezwalidowany").count() > 0
+    )
+    found["ok"] = found["ok"] and found["message_visible"]
+    _full_screenshot(page, shot)
+    return found
+
+
 SCENARIOS = (
+    ("puchary_kategoria", "Analiza meczu: kategoria Europejskie puchary", _scenario_cups),
     ("moj_kupon_ocena", "Mój kupon: dodanie typu i ocena AI", _scenario_my_coupon),
     ("dlugie_nazwy", "Analiza meczu: długie nazwy klubu i ligi", _scenario_long_names),
     ("kupon_analiza", "Kupon dnia: analiza bez internetu", _scenario_analysis),

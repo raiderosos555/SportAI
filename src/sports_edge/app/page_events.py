@@ -7,6 +7,7 @@ import streamlit as st
 
 from sports_edge.app import cart, ui
 from sports_edge.app import common as c
+from sports_edge.app import international_ui as iui
 from sports_edge.app.page_my_coupon import event_panel
 from sports_edge.app.pages_offers import offer_content
 from sports_edge.repository import offer_days
@@ -34,9 +35,11 @@ def _schedule() -> None:
     with cols[0]:
         day = c.offer_day_choice(days, key="schedule_day")
     _report, candidates = c.day_candidates(day)
+    kind = iui.category_filter("schedule_category")
     events = defaultdict(list)
     for x in candidates:
-        events[x.event_id].append(x)
+        if iui.matches(kind, x.league, x.sport):
+            events[x.event_id].append(x)
     sports = sorted({rows[0].sport for rows in events.values()})
     sport = cols[1].selectbox("Dyscyplina", ["wszystkie", *sports], key="schedule_sport")
     leagues = sorted(
@@ -55,6 +58,7 @@ def _schedule() -> None:
                 "Godzina": c.local_time(head.start_at, "%H:%M"),
                 "Wydarzenie": head.event,
                 "Liga": head.league,
+                "Rozgrywki": iui.CHOICES.get(iui.category(head.league, head.sport), "inne"),
                 "Dyscyplina": head.sport,
                 "Status": c.EVENT_STATUS.get(head.event_status, head.event_status),
                 "Prognoza modelu": "tak" if any(r.p_model is not None for r in rows) else "nie",

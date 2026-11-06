@@ -9,6 +9,7 @@ import streamlit as st
 from sports_edge import insights as ins
 from sports_edge import learning
 from sports_edge.app import common as c
+from sports_edge.app import international_ui as iui
 from sports_edge.app import ui
 from sports_edge.app.page_learning import learning_panel
 from sports_edge.app.pages_models import _data, _forecasts, _models, _results
@@ -43,6 +44,7 @@ def models_page() -> None:
         "Podstawowy": _basic,
         "Uczenie AI": learning_panel,
         "Pokrycie oferty": _coverage,
+        "Puchary i reprezentacje": lambda: iui.models_block(c.store()),
         "Zaawansowany": _advanced,
     }
     view = st.segmented_control("Widok", list(views), default="Podstawowy", key="models_view")

@@ -13,6 +13,7 @@ API, then community archives. Settlement never uses a conflicted result automati
 """
 
 import hashlib
+import json
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -38,6 +39,20 @@ SOURCE_PRIORITY = {
     "pitchapi": 3,
     "api_sports": 4,
     "openfootball": 5,
+    "openfootball_cups": 5,
+    "openfootball_int": 5,
+    "csv": 6,
+}
+# TASK 009: in cups and national-team competitions the score semantics decide the order —
+# football-data.org and openfootball/champions-league report the 90-minute score, extra time
+# and penalties separately; PitchAPI counts extra-time goals in its score and has no stage.
+CUP_SOURCE_PRIORITY = {
+    "manual_official": 1,
+    "football_data_org": 2,
+    "openfootball_cups": 3,
+    "openfootball_int": 3,
+    "pitchapi": 4,
+    "api_sports": 5,
     "csv": 6,
 }
 SOURCE_LABELS = {
@@ -46,8 +61,11 @@ SOURCE_LABELS = {
     "pitchapi": "PitchAPI",
     "api_sports": "API-Sports",
     "openfootball": "openfootball (CC0)",
+    "openfootball_cups": "openfootball/champions-league (CC0)",
+    "openfootball_int": "openfootball/internationals (CC0)",
     "csv": "import CSV użytkownika",
 }
+UNCERTAIN = '"regulation_certain":false'  # canonical JSON of details (no spaces)
 OVERLAP_DAYS = 3
 FIRST_WINDOW_DAYS = 60
 AVAILABILITY_LAG = timedelta(hours=36)
@@ -62,8 +80,16 @@ def provider_of(row: dict) -> str:
     return "openfootball" if str(row.get("source_name", "")).startswith("openfootball") else "csv"
 
 
-def priority(provider: str) -> int:
+def priority(provider: str, competition: str | None = None) -> int:
+    league = COMPETITIONS.get(competition) if competition else None
+    if league is not None and league.category != "domestic":
+        return CUP_SOURCE_PRIORITY.get(provider, 9)
     return SOURCE_PRIORITY.get(provider, 9)
+
+
+def regulation_certain(row: dict) -> bool:
+    """False when the stored score may include extra-time goals (never a 90-minute fact)."""
+    return UNCERTAIN not in (row.get("details_json") or "")
 
 
 def source_family(provider: SportsResultsProvider) -> str:
@@ -86,6 +112,8 @@ def effective_results(
 
     Each row carries ``providers`` (all sources that reported it), ``conflict`` (sources
     disagree on the score) and ``corrections`` (earlier observations of the chosen source).
+    A score that may include extra time (``regulation_certain`` False, TASK 009) is chosen
+    only when no source reports the 90-minute score, and it never counts as a conflict.
     """
     sql = """SELECT h.*, d.source_name FROM historical_results h
              JOIN data_imports d ON d.id=h.import_id
@@ -113,11 +141,15 @@ def effective_results(
                 current["id"],
             ):
                 newest[source] = row
-        chosen_source = min(newest, key=priority)
+        code = items[0]["competition"]
+        certain = [s for s, r in newest.items() if regulation_certain(r)]
+        pool = certain or list(newest)
+        chosen_source = min(pool, key=lambda s: priority(s, code))
         chosen = dict(newest[chosen_source])
-        scores = {(r["home_score"], r["away_score"]) for r in newest.values()}
+        scores = {(newest[s]["home_score"], newest[s]["away_score"]) for s in pool}
         chosen["provider_resolved"] = chosen_source
-        chosen["providers"] = sorted(newest, key=priority)
+        chosen["providers"] = sorted(newest, key=lambda s: priority(s, code))
+        chosen["regulation_certain"] = bool(certain)
         chosen["conflict"] = len(scores) > 1
         chosen["corrections"] = sum(provider_of(r) == chosen_source for r in items) - 1
         out.append(chosen)
@@ -395,6 +427,18 @@ def backfill_results(
     return report
 
 
+def apply_fetched(
+    store: Store,
+    provider: SportsResultsProvider,
+    competition: str,
+    records: list[ResultRecord],
+    payloads: list[tuple[str, bytes]],
+    **kwargs,
+) -> dict:
+    """Public entry of the verification and storage step (TASK 009 importers)."""
+    return _apply(store, provider, competition, records, payloads, **kwargs)
+
+
 def _apply(
     store: Store,
     provider: SportsResultsProvider,
@@ -441,6 +485,7 @@ def _apply(
     # skipped earlier, e.g. before the user confirmed an alias, can still be imported.
     seen_payload = store.get("data_imports", import_id) is not None
     known = known_names(existing, sport, normalizer)
+    countries = _countries(existing)
     bootstrap = not existing
     owner = Counter(provider_of(r) for r in existing).most_common(1)[0][0] if existing else family
     introduces = accept_new_clubs or owner == family
@@ -470,6 +515,8 @@ def _apply(
         else:
             home = match_participant(record.home, sport, known, normalizer, aliases)
             away = match_participant(record.away, sport, known, normalizer, aliases)
+            home = _other_country(home, record.details.get("home_country"), countries)
+            away = _other_country(away, record.details.get("away_country"), countries)
             if introduces:  # a club unlike every known name is a new club of this source
                 if home.status == "none":
                     home = ParticipantMatch(record.home, "source", record.home, 1.0)
@@ -507,16 +554,17 @@ def _apply(
         if available > now:
             out["incomplete"].append(f"{label}: wynik niedostępny według reguły dostępności")
             continue
-        row_id = digest(
-            [
-                "hist",
-                family,
-                record.source_event_id or [record.match_date, home.target, away.target],
-                record.home_score,
-                record.away_score,
-                record.status,
-            ]
-        )
+        identity = [
+            "hist",
+            family,
+            record.source_event_id or [record.match_date, home.target, away.target],
+            record.home_score,
+            record.away_score,
+            record.status,
+        ]
+        if "regulation_certain" in record.details:  # TASK 009: a re-assessed cup score is new
+            identity.append(["regulation", record.details["regulation_certain"]])
+        row_id = digest(identity)
         if store.get("historical_results", row_id) is not None:
             summary["duplicates"] += 1
             continue
@@ -530,6 +578,10 @@ def _apply(
         elif other is not None and provider_of(other) != family:
             if (other["home_score"], other["away_score"]) == score:
                 summary["confirmations"] += 1
+            elif record.details.get("regulation_certain") is False or not other.get(
+                "regulation_certain", True
+            ):
+                pass  # a score that may include extra time is no evidence against the 90'
             else:
                 out["conflicts"].append(
                     {
@@ -597,6 +649,28 @@ def _apply(
         for row in rows:
             store.insert("historical_results", **row)
     return out
+
+
+def _countries(rows: list[dict]) -> dict[str, str]:
+    """Country of every club spelling whose source prints it (openfootball cups, TASK 009)."""
+    out: dict[str, str] = {}
+    for row in rows:
+        text = row.get("details_json") or ""
+        if "_country" not in text:
+            continue
+        details = json.loads(text)
+        for side in ("home", "away"):
+            if details.get(f"{side}_country"):
+                out.setdefault(row[side], details[f"{side}_country"])
+    return out
+
+
+def _other_country(found: ParticipantMatch, country: str | None, countries: dict[str, str]):
+    """A similar spelling of a club from ANOTHER country is a different club (FK Partizani,
+    Albania ≠ FK Partizan, Serbia) — never a candidate for the same identity."""
+    if found.status == "candidate" and country and countries.get(found.target, country) != country:
+        return ParticipantMatch(found.name, "none", None, found.score)
+    return found
 
 
 def _availability(record: ResultRecord) -> tuple[datetime, str]:

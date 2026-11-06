@@ -142,6 +142,18 @@ def demo_document(day: date, generated: datetime) -> bytes:
                     "21:15",
                 )
             },
+            # TASK 009: a European cup header (the real observed STS text) with fictional
+            # clubs — the analysis shows the cup block without any model percentage
+            {"league": "KLUBOWE - LIGA MISTRZÓW"},
+            {"market": "Mecz", "labels": ["1", "X", "2", "1X", "X2", "12"]},
+            {
+                "event": (
+                    "9006",
+                    "Demo Klub Europejski - Testowy Puchar FC",
+                    ["2.10", "3.50", "3.30", "1.35", "1.70", "1.32"],
+                    "21:00",
+                )
+            },
             {"sport": "TENIS"},
             {"league": "DEMO TOUR - TURNIEJ PRZYKŁADOWY"},
             {"market": "Zwycięzca meczu", "labels": ["1", "2"]},

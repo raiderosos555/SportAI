@@ -15,6 +15,7 @@ from sports_edge import insights as ins
 from sports_edge import prematch
 from sports_edge.app import advanced_ui, cart, match_view, prematch_ui, ui
 from sports_edge.app import common as c
+from sports_edge.app import international_ui as iui
 from sports_edge.repository import offer_days
 from sports_edge.services import (
     event_context,
@@ -50,6 +51,9 @@ def match_page() -> None:
         day = c.offer_day_choice(days, key="match_day")
     only_model = top[1].toggle("Tylko z prognozą", value=True, key="match_only_model")
     show_done = top[2].toggle("Pokaż rozpoczęte", value=False, key="match_done")
+    kind = iui.category_filter("match_category")
+    # cups and national teams have no served model: the filter shows them anyway (TASK 009)
+    needs_model = only_model and kind in ("all", "domestic")
     _report, candidates = c.day_candidates(day)
     cart.flash()
     events = defaultdict(list)
@@ -71,9 +75,10 @@ def match_page() -> None:
     shown = [
         eid
         for eid, rows in events.items()
-        if (show_done or rows[0].event_status == "before_start")
+        if iui.matches(kind, rows[0].league, rows[0].sport)
+        and (show_done or rows[0].event_status == "before_start")
         and (
-            not only_model
+            not needs_model
             or any(r.p_model is not None for r in rows)
             or (rows[0].event_status != "before_start" and eid in forecast_any)
         )
@@ -108,6 +113,8 @@ def match_page() -> None:
     info = prematch.summary(db, choice)
     # level 1: who plays, the probabilities, the pick
     match_view.header(head, context, rows, started, review, info)
+    if iui.category(head.league, head.sport) in ("european", "national"):
+        iui.event_block(db, choice, now)
     if started:
         _post_match(review, head)
     ui.section(

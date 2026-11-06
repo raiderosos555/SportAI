@@ -54,6 +54,7 @@ def _page(name: str) -> str:
         "zrodla": ("page_sources", "sources_page"),
         "analiza": ("page_match", "match_page"),
         "automatyzacja": ("page_automation", "automation_page"),
+        "modele": ("page_models", "models_page"),
     }
     module, function = modules[name]
     return f"from sports_edge.app.{module} import {function}; {function}()"
@@ -68,7 +69,7 @@ def _button(app, label: str):
 
 
 def ui_paths(config: Path | None = None) -> list[dict]:
-    """Run the 17 paths; returns [{"path", "ok", "detail"}]."""
+    """Run the 20 paths; returns [{"path", "ok", "detail"}]."""
     config = config or ROOT / "config"
     results: list[dict] = []
     previous = os.environ.get("SPORTS_EDGE_HOME")
@@ -194,6 +195,19 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         )
         failing.run()
         check("awaria źródła wyników", failing, ["failed", "ConnectionError"])
+        # ------------------------------------------------ TASK 009: cups and national teams
+        cups = _app(_page("analiza"))
+        cups.session_state["match_category"] = "european"
+        cups.run()
+        check("analiza: europejskie puchary", cups, ["model predykcyjny jeszcze niezwalidowany"])
+        sources = _app(_page("zrodla"))
+        sources.session_state["sources_view"] = "Puchary i reprezentacje"
+        sources.run()
+        check("źródła: puchary i reprezentacje", sources, ["Europejskie puchary i reprezentacje"])
+        models = _app(_page("modele"))
+        models.session_state["models_view"] = "Puchary i reprezentacje"
+        models.run()
+        check("modele: puchary i reprezentacje", models, ["Brak eksperymentu międzynarodowego"])
     finally:
         if previous is None:
             os.environ.pop("SPORTS_EDGE_HOME", None)

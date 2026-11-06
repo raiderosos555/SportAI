@@ -15,6 +15,14 @@ Checked 2026-11-01 (docs.football-data.org/general/v4, football-data.org/about, 
 Availability: ``lastUpdated`` is the source's timestamp of the record's last change, so the
 final result existed no later than that moment (basis ``source_last_updated``). Without it
 the conservative 36-hour assumption is used and labelled as such.
+
+TASK 009 (verified 2026-11-02 with the user's key): the free plan also returns the UEFA
+Champions League ``CL`` (seasons 2023/24–2026/27; older seasons HTTP 403), the European
+Championship ``EC`` (2024) and the World Cup ``WC`` (2026; 2022: 403). ``EC`` is the EURO of
+national teams, NOT the Europa League (not available on the free plan). Cup scores:
+``duration`` REGULAR / EXTRA_TIME / PENALTY_SHOOTOUT; ``fullTime`` then contains extra time
+AND the shoot-out, so the stored score is ``regularTime`` and extra time and penalties are
+kept separately. There is no leg field: legs follow from the stage, the clubs and the date.
 """
 
 import json
@@ -24,7 +32,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from sports_edge.datasources import openfootball
+from sports_edge.cups import FOOTBALL_DATA_STAGES
 from sports_edge.datasources.base import (
     FetchOutcome,
     ProviderStatus,
@@ -32,6 +40,8 @@ from sports_edge.datasources.base import (
     ResultRecord,
     http_get,
 )
+from sports_edge.datasources.competitions import COMPETITIONS as CATALOGUE
+from sports_edge.datasources.competitions import with_source
 from sports_edge.offers.sources import SourceBlocked
 from sports_edge.settings import local_secret
 
@@ -42,7 +52,7 @@ LICENSE = (
     "football-data.org Free Tier (football-data.org/about): atrybucja wymagana, klucz na jedną "
     "aplikację; użycie prywatne, niekomercyjne"
 )
-COMPETITIONS = {"en.1": "PL", "de.1": "BL1", "es.1": "PD", "it.1": "SA", "fr.1": "FL1"}
+COMPETITIONS = with_source("football_data")  # PL BL1 PD SA FL1 + CL, EC, WC (TASK 009)
 STATUS_MAP = {
     "SCHEDULED": "scheduled",
     "TIMED": "scheduled",
@@ -112,7 +122,10 @@ class FootballDataOrgProvider:
         code = COMPETITIONS[competition]
         if (date_to - date_from).days > MAX_WINDOW_DAYS:
             last_day = date_to - timedelta(days=1)
-            seasons = sorted({season_start(date_from), season_start(last_day)})
+            if CATALOGUE[competition].kind == "national_tournament":  # seasons = calendar years
+                seasons = list(range(date_from.year, last_day.year + 1))
+            else:
+                seasons = sorted({season_start(date_from), season_start(last_day)})
             queries = [f"season={year}" for year in seasons]
         else:  # the API excludes matches of the dateTo day itself
             queries = [f"dateFrom={date_from.isoformat()}&dateTo={date_to.isoformat()}"]
@@ -137,7 +150,9 @@ class FootballDataOrgProvider:
 
 def parse(data: bytes, *, competition: str, observed_at: datetime) -> list[ResultRecord]:
     """Standardised records; unknown statuses stay ``unknown`` (never guessed)."""
-    zone = ZoneInfo(openfootball.LEAGUES[competition].zone)
+    league = CATALOGUE[competition]
+    zone = ZoneInfo(league.zone)
+    cup = league.category != "domestic"
     payload = json.loads(data)
     out = []
     for match in payload.get("matches", []):
@@ -148,20 +163,42 @@ def parse(data: bytes, *, competition: str, observed_at: datetime) -> list[Resul
         half = score.get("halfTime") or {}
         duration = score.get("duration")
         home_score, away_score = full.get("home"), full.get("away")
+        aet = pens = None
         if duration not in (None, "REGULAR"):
             regular = score.get("regularTime") or {}
+            extra = score.get("extraTime") or {}
             home_score, away_score = regular.get("home"), regular.get("away")
+            if None not in (home_score, away_score, extra.get("home"), extra.get("away")):
+                aet = [home_score + extra["home"], away_score + extra["away"]]
+            shootout = score.get("penalties") or {}
+            if duration == "PENALTY_SHOOTOUT" and shootout.get("home") is not None:
+                pens = [shootout.get("home"), shootout.get("away")]
         updated = _instant(match.get("lastUpdated"))
         if updated and start and updated < start + timedelta(minutes=MIN_MATCH_MINUTES):
             updated = None  # inconsistent with a final record: fall back to the assumption
         season = match.get("season") or {}
         home, away = match.get("homeTeam") or {}, match.get("awayTeam") or {}
+        extra_details = {}
+        if cup:  # TASK 009: stage, extra time and penalties of cups and tournaments
+            raw_stage = str(match.get("stage") or "")
+            extra_details = {
+                "stage": FOOTBALL_DATA_STAGES.get(raw_stage, "other"),
+                "stage_label": raw_stage,
+                "group": match.get("group"),
+                "aet": aet,
+                "pens": pens,
+                "regulation_certain": True,
+            }
         out.append(
             ResultRecord(
                 provider=FootballDataOrgProvider.id,
                 sport="football",
                 competition=competition,
-                season=_season_label(season.get("startDate")),
+                season=(
+                    season.get("startDate", "")[:4] or None
+                    if league.kind == "national_tournament"
+                    else _season_label(season.get("startDate"))
+                ),
                 source_event_id=str(match["id"]) if match.get("id") is not None else None,
                 home=home.get("name") or "",
                 away=away.get("name") or "",
@@ -183,6 +220,7 @@ def parse(data: bytes, *, competition: str, observed_at: datetime) -> list[Resul
                     "away_short": away.get("shortName"),
                     "source": FootballDataOrgProvider.name,
                     "attribution": ATTRIBUTION,
+                    **extra_details,
                 },
                 published_at=updated,
                 observed_at=observed_at,

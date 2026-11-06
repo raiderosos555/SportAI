@@ -140,6 +140,18 @@ CLI (te same funkcje bez interfejsu):
 | `backups/YYYY-MM-DD_HH-MM-SS/` | kopie zapasowe: config, baza (snapshot SQLite), ustawienia, manifest SHA-256 |
 | `config/` | profil STS i podatki, `sts_rules.toml` (zweryfikowane reguły), polityka kuponu, aliasy; `config/archive/` — wycofany Superbet |
 
+## Europejskie puchary i reprezentacje (TASK 009)
+
+Liga Mistrzów, Liga Europy i Liga Konferencji (openfootball/champions-league CC0 od 2011/12,
+football-data.org CL od 2023/24, PitchAPI LE/LK od 2021/22) oraz reprezentacje (Liga Narodów,
+eliminacje i turnieje EURO i MŚ: openfootball/internationals CC0, football-data.org EURO 2024 i
+MŚ 2026). Wynik meczu w bazie to zawsze wynik po 90 minutach — dogrywka, karne, dwumecz i awans
+są zapisywane osobno; wynik źródła, który może zawierać gole z dogrywki, nie trafia do modeli ani
+rozliczeń. Import: przycisk w **Źródła → Puchary i reprezentacje** albo zadania harmonogramu
+(„Wyniki i terminarz pucharów UEFA”, „Wyniki reprezentacji”). Statusy modeli: **Modele → Puchary
+i reprezentacje**; rynki pucharowe trafiają do generatora dopiero po walidacji i decyzji
+użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszcze niezwalidowany”).
+
 ## Testy i jakość
 
 ```powershell
@@ -148,11 +160,12 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-308 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+325 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
-wizualny).
-Ścieżki interfejsu: `python -m sports_edge.qa` (22 ścieżki). Zrzuty ekranu:
+wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
+klubów, reprezentacje, bramka generatora, harmonogram, kategorie interfejsu).
+Ścieżki interfejsu: `python -m sports_edge.qa` (25 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
 768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,

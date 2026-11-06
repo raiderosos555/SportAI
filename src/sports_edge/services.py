@@ -24,7 +24,7 @@ from sports_edge.datasources.api_sports import (
 )
 from sports_edge.datasources.base import SportsResultsProvider
 from sports_edge.datasources.bookmaker_results import StsResultsProvider, SuperbetResultsProvider
-from sports_edge.datasources.competitions import COMPETITIONS, for_sts_league
+from sports_edge.datasources.competitions import COMPETITIONS, by_category, for_sts_league
 from sports_edge.datasources.football_data import FootballDataOrgProvider, api_key
 from sports_edge.datasources.pitchapi import ENV_KEY as PITCH_ENV
 from sports_edge.datasources.pitchapi import PitchApiProvider
@@ -121,7 +121,13 @@ PROTOCOLS = {
 }
 # What the registered Elo model forecasts (double chance follows from the same 1X2).
 MODEL_MARKETS = {("1x2", "FT"), ("double_chance", "FT")}
-RESULTS_COMPETITIONS = tuple(COMPETITIONS)  # every league with a results source
+# TASK 009: the regular results update covers domestic leagues and the other sports; cups and
+# national teams have their own import (international_data) with fixture-evidence aliases.
+RESULTS_COMPETITIONS = tuple(
+    code for code, c in COMPETITIONS.items() if c.sport != "football" or c.category == "domestic"
+)
+EUROPEAN_COMPETITIONS = by_category("european")
+NATIONAL_COMPETITIONS = by_category("national")
 
 
 def open_store(paths: AppPaths) -> Store:
@@ -238,6 +244,9 @@ def analyse_day(
         max_age=timedelta(minutes=settings.max_quote_age_minutes),
         stake=Decimal(settings.nominal_stake),
     )
+    from sports_edge.international import gate_candidates
+
+    candidates = gate_candidates(store, candidates)  # TASK 009: cups only after validation
     report = build_daily_coupon(
         candidates,
         rules,
@@ -632,6 +641,103 @@ def backfill_history(
     return out
 
 
+# ---------------------------------------------------------------- TASK 009: international
+
+
+def international_providers(
+    paths: AppPaths, settings: AppSettings, *, opener=None, members=None
+) -> dict[str, SportsResultsProvider]:
+    """Sources of UEFA cups and national teams (keys stay in the environment or .env)."""
+    from sports_edge.datasources.openfootball_cups import OpenfootballCupsProvider
+    from sports_edge.datasources.openfootball_int import OpenfootballIntProvider
+
+    raw = paths.data / "sources" / "openfootball"
+    found: dict[str, SportsResultsProvider] = {
+        "openfootball_cups": OpenfootballCupsProvider(raw / "champions-league", opener=opener),
+        "openfootball_int": OpenfootballIntProvider(
+            raw / "internationals", opener=opener, members=members
+        ),
+    }
+    if settings.football_data_enabled:
+        found["football_data_org"] = FootballDataOrgProvider(api_key(paths.root), opener=opener)
+    if settings.pitchapi_enabled:
+        found["pitchapi"] = PitchApiProvider(local_secret(PITCH_ENV, paths.root), opener=opener)
+    return found
+
+
+def club_identities(store: Store, paths: AppPaths, *, now: datetime) -> TeamIdentities:
+    """Reviewed renames plus the evidence-based links of cup clubs to domestic clubs."""
+    from sports_edge.clubs import links, with_links
+
+    base = team_identities(paths)
+    found = links(
+        store,
+        normalizer=normalizer(paths),
+        aliases=alias_map(store, team_aliases(paths)),
+        identities=base,
+        until=now,
+    )
+    return with_links(base, found)
+
+
+def import_international(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    *,
+    now: datetime,
+    cups: bool = True,
+    national: bool = True,
+    current_only: bool = False,
+    providers: dict[str, SportsResultsProvider] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict:
+    """UEFA cups (history or the current season) and, optionally, national teams."""
+    from sports_edge import international_data as data
+
+    if settings.offline_mode:
+        raise ValueError("Tryb offline jest włączony — import rozgrywek wymaga sieci")
+    available = providers or international_providers(paths, settings)
+    common = {
+        "now": now,
+        "normalizer": normalizer(paths),
+        "extra_aliases": team_aliases(paths),
+        "raw_dir": paths.data / "sources" / "results",
+        "identities": team_identities(paths),
+        "progress": progress,
+    }
+    plan = data.current_plan(now) if current_only else data.CUP_PLAN
+    report = {
+        "cups": data.run_plan(store, available, plan, **common) if cups else [],
+        "national": [],
+    }
+    if national:
+        plan = data.national_current_plan(now) if current_only else data.NATIONAL_PLAN
+        first = [p for p in plan if p[0] in ("uefa.nl", "uefa.euro_q")]
+        report["national"] = data.run_plan(store, available, first, **common)
+        if "openfootball_int" in available and hasattr(available["openfootball_int"], "members"):
+            available["openfootball_int"].members = data.members(store, until=now)
+        rest = [p for p in plan if p[0] not in ("uefa.nl", "uefa.euro_q")]
+        report["national"] += data.run_plan(store, available, rest, **common)
+    entries = report["cups"] + report["national"]
+    errors = [f"{e['competition']}: {e['error']}" for e in entries if e.get("error")]
+    record_job(
+        store,
+        "international_results",
+        trigger="analysis",
+        started=now,
+        finished=now,
+        status="partial" if errors else "ok",
+        reason="; ".join(errors[:3])[:500],
+        payload={
+            "inserted": sum(e.get("inserted", 0) for e in entries),
+            "unmatched": sum(len(e.get("unmatched", [])) for e in entries),
+            "learned_aliases": sum(len(e.get("learned_aliases", [])) for e in entries),
+        },
+    )
+    return report
+
+
 def update_results_data(
     store: Store,
     paths: AppPaths,
@@ -665,7 +771,7 @@ def update_results_data(
         normalizer=names,
         team_aliases=extra,
         only_coupons=False,
-        identities=team_identities(paths),
+        identities=club_identities(store, paths, now=now),  # cup clubs = league clubs
     )
     report["settlements"] = settle_coupons(store, paths, now=now)
     # TASK 007: every prospective forecast is settled, not only the legs of coupons

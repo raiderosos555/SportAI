@@ -48,6 +48,12 @@ FREQUENCIES = {
     "sts_offer": [180, 360, 720, 1440],
     "quality": [1440, 4320, 10080],
     "review": [10080, 20160, 0],  # 0 = only on demand
+    # TASK 009: international football (own sources, own limits)
+    "uefa_results": [180, 360, 720, 1440],
+    "national_results": [1440, 4320, 10080],
+    "cup_monitor": [60, 180, 360],
+    "intl_completeness": [1440, 4320, 10080],
+    "cup_training": [1440, 4320, 10080],
 }
 JOB_LABELS = {
     "results": "Aktualizacja wyników sportowych",
@@ -60,6 +66,11 @@ JOB_LABELS = {
     "quality": "Analiza jakości modeli",
     "review": "Przegląd potrzeby retreningu",
     "training": "Trening challengera (po spełnieniu kryteriów)",
+    "uefa_results": "Wyniki i terminarz pucharów UEFA (LM, LE, LK)",
+    "national_results": "Wyniki reprezentacji (Liga Narodów, eliminacje, turnieje)",
+    "cup_monitor": "Nowe mecze pucharowe w ofercie STS i prognozy cieniowe",
+    "intl_completeness": "Kontrola kompletności danych międzynarodowych",
+    "cup_training": "Eksperymenty modeli pucharowych (po spełnieniu warunków)",
 }
 DEFAULTS = {
     "auto_resume": False,
@@ -74,6 +85,11 @@ DEFAULTS = {
         "quality": {"enabled": True, "every_minutes": 1440},
         "review": {"enabled": True, "every_minutes": 10080},
         "training": {"enabled": False},
+        "uefa_results": {"enabled": True, "every_minutes": 360},
+        "national_results": {"enabled": True, "every_minutes": 4320},
+        "cup_monitor": {"enabled": True, "every_minutes": 180},
+        "intl_completeness": {"enabled": True, "every_minutes": 1440},
+        "cup_training": {"enabled": True, "every_minutes": 4320},
     },
     "checkpoints_minutes": [2880, 1440, 360, 90, 60, 30, 15],
     "max_candidates": 30,
@@ -98,7 +114,7 @@ CHECKPOINT_NAMES = {
 
 def load_settings(store: Store) -> dict:
     rows = store.rows(
-        "SELECT settings_json FROM automation_settings ORDER BY saved_at DESC, id DESC LIMIT 1"
+        "SELECT settings_json FROM automation_settings ORDER BY saved_at DESC, rowid DESC LIMIT 1"
     )
     saved = json.loads(rows[0]["settings_json"]) if rows else {}
     merged = json.loads(json.dumps(DEFAULTS))
@@ -635,6 +651,109 @@ def job_sts_offer(store, paths, *, now, settings) -> JobOutcome:
     return JobOutcome("ok", "", {"processed": len(attempts)})
 
 
+def _international(store, paths, *, now, cups: bool, national: bool) -> JobOutcome:
+    from sports_edge.international_data import EUROPEAN, NATIONAL
+    from sports_edge.services import import_international
+
+    app = _app(paths)
+    if app.offline_mode:
+        return JobOutcome("skipped", "tryb offline — pobieranie wyników wyłączone")
+    codes = EUROPEAN if cups else NATIONAL
+    marks = ",".join("?" for _ in codes)
+    history = store.scalar(
+        f"SELECT COUNT(*) FROM historical_results WHERE competition IN ({marks})", codes
+    )
+    report = import_international(
+        store, paths, app, now=now, cups=cups, national=national, current_only=bool(history)
+    )
+    entries = report["cups"] + report["national"]
+    errors = [f"{e['competition']}: {e['error']}" for e in entries if e.get("error")]
+    return JobOutcome(
+        "partial" if errors else "ok",
+        "; ".join(errors[:2])[:300],
+        {
+            "processed": sum(e.get("records", 0) for e in entries),
+            "new": sum(e.get("inserted", 0) for e in entries),
+            "fixtures": sum(e.get("fixtures", 0) for e in entries),
+            "unmatched": sorted({n for e in entries for n in e.get("unmatched", [])})[:20],
+            "history_import": not history,
+            "errors": len(errors),
+        },
+    )
+
+
+def job_uefa_results(store, paths, *, now, settings) -> JobOutcome:
+    return _international(store, paths, now=now, cups=True, national=False)
+
+
+def job_national_results(store, paths, *, now, settings) -> JobOutcome:
+    return _international(store, paths, now=now, cups=False, national=True)
+
+
+def job_cup_monitor(store, paths, *, now, settings) -> JobOutcome:
+    from sports_edge.international import shadow_forecasts
+    from sports_edge.international_data import cup_monitor
+
+    found = cup_monitor(store, paths, now=now)
+    shadow = shadow_forecasts(store, paths, now=now)
+    return JobOutcome(
+        "ok",
+        "",
+        {
+            "processed": found["events"],
+            "new": shadow.get("stored", 0),
+            "detail": found,
+            "shadow": shadow,
+        },
+    )
+
+
+def job_intl_completeness(store, paths, *, now, settings) -> JobOutcome:
+    from sports_edge.international_data import completeness
+
+    rows = completeness(store, now=now)
+    gaps = [f"{r['competition']} {r['season']}: {r['status']}" for r in rows if r["status"] != "ok"]
+    return JobOutcome(
+        "partial" if gaps else "ok",
+        "; ".join(gaps[:3])[:300],
+        {"processed": len(rows), "gaps": gaps[:20]},
+    )
+
+
+CUP_TRAINING_MIN_NEW = 30  # new international results needed before experiments are re-run
+
+
+def job_cup_training(store, paths, *, now, settings) -> JobOutcome:
+    from sports_edge import international
+
+    codes = (*international.CUPS, *international.NATIONAL_OFFICIAL)
+    marks = ",".join("?" for _ in codes)
+    count = store.scalar(
+        f"SELECT COUNT(*) FROM historical_results WHERE competition IN ({marks})", codes
+    )
+    last = international.latest(store)
+    if count < 1000:
+        return JobOutcome("skipped", f"za mało wyników międzynarodowych ({count})")
+    if last and count - int(last.get("results_count") or 0) < CUP_TRAINING_MIN_NEW:
+        return JobOutcome(
+            "skipped",
+            f"warunki niespełnione: mniej niż {CUP_TRAINING_MIN_NEW} nowych wyników od ostatniego "
+            "eksperymentu",
+        )
+    report = international.run(store, paths, now=now)
+    validated = [
+        f"{scope}:{market}"
+        for scope in ("european", "national")
+        for market, v in international.market_status(report, scope).items()
+        if v["validated"]
+    ]
+    return JobOutcome(
+        "ok",
+        "eksperyment zapisany; aktywacja wymaga decyzji użytkownika",
+        {"processed": count, "validated": validated},
+    )
+
+
 JOBS: dict[str, Callable] = {
     "results": job_results,
     "prediction_settlement": job_prediction_settlement,
@@ -644,6 +763,11 @@ JOBS: dict[str, Callable] = {
     "quality": job_quality,
     "review": job_review,
     "sts_offer": job_sts_offer,
+    "uefa_results": job_uefa_results,
+    "national_results": job_national_results,
+    "cup_monitor": job_cup_monitor,
+    "intl_completeness": job_intl_completeness,
+    "cup_training": job_cup_training,
 }
 
 

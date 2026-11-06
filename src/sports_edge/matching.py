@@ -29,16 +29,32 @@ class ParticipantMatch:
 
 def alias_map(
     store: Store, extra: dict[tuple[str, str], str] | None = None
-) -> dict[tuple[str, str], str]:
-    """Reviewed pairs from config plus pairs the user confirmed in the application."""
-    found = dict(extra or {})
-    found.update(
-        {
-            (r["sport"], r["alias_key"]): r["canonical_key"]
-            for r in store.rows("SELECT sport, alias_key, canonical_key FROM aliases")
-        }
-    )
+) -> dict[tuple[str, str], str | tuple[str, ...]]:
+    """Reviewed pairs from config plus pairs the user confirmed in the application.
+
+    A user confirmation replaces an earlier pair of the same key. Pairs learned from fixture
+    evidence (TASK 009) are added: one source spelling may denote a club whose canonical
+    spelling differs between competitions (``Braga`` = ``Sporting Braga`` in the Europa
+    League and ``Sporting Clube de Braga`` in the Champions League)."""
+    found: dict[tuple[str, str], str | tuple[str, ...]] = dict(extra or {})
+    for r in store.rows(
+        "SELECT sport, alias_key, canonical_key, origin FROM aliases ORDER BY created_at, rowid"
+    ):
+        key = (r["sport"], r["alias_key"])
+        if key in found and str(r["origin"]).startswith("fixture_evidence"):
+            if r["canonical_key"] not in alias_targets(found, key):
+                found[key] = (*alias_targets(found, key), r["canonical_key"])
+        else:
+            found[key] = r["canonical_key"]
     return found
+
+
+def alias_targets(aliases: dict, key: tuple[str, str]) -> tuple[str, ...]:
+    """Canonical keys of one alias key (none, one or several)."""
+    value = aliases.get(key)
+    if value is None:
+        return ()
+    return (value,) if isinstance(value, str) else tuple(value)
 
 
 def load_team_aliases(path: Path, normalizer: NameNormalizer) -> dict[tuple[str, str], str]:
@@ -76,9 +92,9 @@ def match_participant(
     key = participant_key(name, sport, normalizer)
     if key in known:
         return ParticipantMatch(name, "exact", known[key], 1.0)
-    alias = aliases.get((sport, key))
-    if alias is not None and alias in known:
-        return ParticipantMatch(name, "alias", known[alias], 1.0)
+    for alias in alias_targets(aliases, (sport, key)):
+        if alias in known:
+            return ParticipantMatch(name, "alias", known[alias], 1.0)
     best, score = None, 0.0
     for other in known:
         value = similarity(key, other)

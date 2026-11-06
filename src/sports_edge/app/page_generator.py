@@ -14,6 +14,7 @@ from sports_edge import insights as ins
 from sports_edge.analysis.generator import Request, generate, preset
 from sports_edge.app import cart, ui
 from sports_edge.app import common as c
+from sports_edge.app import international_ui as iui
 from sports_edge.bookmakers import load_profiles
 from sports_edge.repository import offer_days
 from sports_edge.services import RANGES, analysis_days, probability_policy
@@ -80,6 +81,16 @@ def _page(default: str) -> None:
         for x in c.day_candidates(day)[1]:
             candidates.append(x)
             day_of[x.odds_id] = day
+    kind = iui.category_filter(f"gen_kind_{chosen}")
+    candidates = [x for x in candidates if iui.matches(kind, x.league, x.sport)]
+    if kind in ("european", "national"):
+        modelled = sum(1 for x in candidates if x.p_model is not None)
+        st.info(
+            f"{iui.CHOICES[kind]}: {len({x.event_id for x in candidates})} wydarzeń w ofercie, "
+            f"selekcji z prognozą: {modelled}. Do automatycznego generatora trafiają wyłącznie "
+            "wybory z modelem i świeżymi kursami — modele tej kategorii czekają na walidację "
+            "i decyzję."
+        )
     with st.expander("Filtry i wymagania", expanded=chosen == "custom"):
         row = st.columns(3)
         sports = row[0].multiselect(

@@ -549,6 +549,11 @@ def import_source_results(
                 f"{event['name_raw']}: źródła podają różne wyniki — rozliczenie wstrzymane"
             )
             continue
+        if not match.get("regulation_certain", True):  # TASK 009: score may include extra time
+            unresolved.append(
+                f"{event['name_raw']}: wynik po 90 min niepotwierdzony — rozliczenie wstrzymane"
+            )
+            continue
         details = json.loads(match["details_json"] or "{}")
         ht = details.get("ht") or [None, None]
         source = match["provider_resolved"]
@@ -569,6 +574,10 @@ def import_source_results(
                 "available_at_basis": match["available_at_basis"],
                 "after_ot": details.get("after_ot"),
                 "periods": details.get("periods"),
+                # cups (TASK 009): kept apart from the 90-minute score that settles bets
+                "stage": details.get("stage"),
+                "after_extra_time": details.get("aet"),
+                "penalties": details.get("pens"),
             },
             source=source,
             verified=True,

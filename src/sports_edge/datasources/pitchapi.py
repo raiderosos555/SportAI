@@ -12,6 +12,15 @@ Verified 2026-11-01 with the user's key (``X-API-KEY``):
 * Terms of service were not found publicly (the SDK says the data is governed by PitchAPI's
   terms): private, non-commercial analysis only; nothing is redistributed. There are no
   publication timestamps, so availability is the moment this application observed the data.
+
+TASK 009 (verified 2026-11-02 in /v1/leagues and season lists): Champions League
+``l_0bfbkO``, Europa League ``l_38d9HA`` and Conference League ``l_2WZ2tt`` (seasons
+2021/2022–2026/2027, league or group phase and knockout rounds, no qualifying rounds). The
+list has no stage and its score COUNTS EXTRA-TIME GOALS (penalties excluded), e.g. a 3:0
+after 90 minutes and 0:2 in extra time is listed as 3:2; such a score is resolved with
+``cups.regulation_from_reported`` and otherwise marked as regulation-uncertain. The World Cup
+id (``l_1XLtP0``) is in the catalogue, but its season format was not verified, so this
+adapter does not fetch it.
 """
 
 import json
@@ -21,6 +30,7 @@ from datetime import date, datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
+from sports_edge.cups import regulation_from_reported
 from sports_edge.datasources.base import (
     FetchOutcome,
     ProviderStatus,
@@ -28,7 +38,7 @@ from sports_edge.datasources.base import (
     ResultRecord,
     http_get,
 )
-from sports_edge.datasources.competitions import COMPETITIONS
+from sports_edge.datasources.competitions import COMPETITIONS, with_source
 from sports_edge.offers.sources import SourceBlocked
 
 ENV_KEY = "PITCHAPI_KEY"
@@ -51,6 +61,12 @@ LEAGUES = {
     "be.1": "l_2L6d1F",  # First Division A 2021/22-2026/27
     "de.2": "l_3hvsne",  # 2. Bundesliga 2021/22-2026/27
     "tr.1": "l_0S1uaf",  # Super Lig 2022/23-2026/27
+    # TASK 009: European club cups from the catalogue (identifiers verified 02.11.2026)
+    **{
+        code: league
+        for code, league in with_source("pitchapi").items()
+        if COMPETITIONS[code].category == "european"
+    },
 }
 STATUS = {
     "finished": "finished",
@@ -174,21 +190,21 @@ class PitchApiProvider:
         if competition not in LEAGUES:
             raise SourceBlocked(f"Rozgrywki {competition} poza zakresem PitchAPI")
         zone = ZoneInfo(COMPETITIONS[competition].zone)
+        cup = COMPETITIONS[competition].category != "domestic"
         seasons = sorted({season_label(date_from), season_label(date_to - timedelta(days=1))})
         records, payloads = [], []
         for season in seasons:
             matches, data, url = self.season_matches(competition, season)
             payloads.append((url, data))
+            season_records = []
             for match in matches:
                 start = _instant(match.get("time_utc"))
                 local = (
                     start.astimezone(zone).date().isoformat() if start else match.get("date", "")
                 )
-                if not date_from.isoformat() <= local < date_to.isoformat():
-                    continue
                 status = STATUS.get(str(match.get("status", "")).lower(), "unknown")
                 done = status == "finished"
-                records.append(
+                season_records.append(
                     ResultRecord(
                         provider=self.family,
                         sport="football",
@@ -213,6 +229,10 @@ class PitchApiProvider:
                         license=LICENSE,
                     )
                 )
+            if cup:  # the whole season decides legs and extra time (TASK 009)
+                season_records = regulation_from_reported(season_records, competition=competition)
+            window = (date_from.isoformat(), date_to.isoformat())
+            records += [r for r in season_records if window[0] <= r.match_date < window[1]]
         return FetchOutcome(records=records, payloads=payloads, requests=len(seasons))
 
 

@@ -3,6 +3,7 @@
 import streamlit as st
 
 from sports_edge.app import common as c
+from sports_edge.app import international_ui as iui
 from sports_edge.app import ui
 from sports_edge.app.pages_offers import data_diagnostics
 from sports_edge.app.pages_settings import _local_data, _profile, _sources, _sts
@@ -53,6 +54,7 @@ def sources_page() -> None:
     # a view switch instead of tabs: only the chosen view is computed (tabs run all bodies)
     views = {
         "Źródła danych": _panel,
+        "Puchary i reprezentacje": lambda: iui.coverage_block(c.store(), c.now()),
         "Oferta STS": _sts_files,
         "Ustawienia": _sts,
         "Podatki i reguły": _profile,
