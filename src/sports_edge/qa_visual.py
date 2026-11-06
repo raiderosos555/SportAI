@@ -240,6 +240,30 @@ def _scenario_cups(page, base: str, shot: Path) -> dict:
     return found
 
 
+def _scenario_day_risk(page, base: str, shot: Path) -> dict:
+    """TASK 010: the saved DEMO coupons of tomorrow (``demo.seed_coupons``) — the badge of the
+    official coupon, the exposure of a match in two coupons and the "Ryzyko dnia" block."""
+    page.goto(f"{base}/kupon?demo=1")
+    _settle(page)
+    page.get_by_text("Jutro", exact=True).first.click()  # segmented control
+    _settle(page)
+    found = _assess(page)
+    found["day_risk_visible"] = page.get_by_text("Ryzyko dnia").count() > 0
+    found["official_visible"] = page.get_by_text("Oficjalny kupon dnia").count() > 0
+    found["exposure_visible"] = page.get_by_text("ten mecz jest też w").count() > 0
+    found["ok"] = (
+        found["ok"]
+        and found["day_risk_visible"]
+        and found["official_visible"]
+        and found["exposure_visible"]
+    )
+    _full_screenshot(page, shot)
+    return found
+
+
+# TASK 010: checked at every screen size (the other scenarios at 1366 and 390 px only)
+EVERY_VIEW = (("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),)
+
 SCENARIOS = (
     ("puchary_kategoria", "Analiza meczu: kategoria Europejskie puchary", _scenario_cups),
     ("moj_kupon_ocena", "Mój kupon: dodanie typu i ocena AI", _scenario_my_coupon),
@@ -277,23 +301,26 @@ def run(out: Path, *, home: Path | None = None, viewports=None, pages=None) -> d
                     results.append(
                         {"page": title, "path": path, "view": view, "file": name, **found}
                     )
-                if temporary and view in ("1366x768", "390x844"):
-                    for key, title, scenario in SCENARIOS:
-                        name = f"{view}_scenariusz_{key}.png"
-                        try:
-                            found = scenario(page, base, out / name)
-                        except Exception as error:  # noqa: BLE001 — a failed step is a result
-                            found = {"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}
-                        results.append(
-                            {
-                                "page": title,
-                                "path": key,
-                                "view": view,
-                                "file": name,
-                                "scenario": True,
-                                **found,
-                            }
-                        )
+                chosen = [
+                    *(EVERY_VIEW if temporary else ()),
+                    *(SCENARIOS if temporary and view in ("1366x768", "390x844") else ()),
+                ]
+                for key, title, scenario in chosen:
+                    name = f"{view}_scenariusz_{key}.png"
+                    try:
+                        found = scenario(page, base, out / name)
+                    except Exception as error:  # noqa: BLE001 — a failed step is a result
+                        found = {"ok": False, "error": f"{type(error).__name__}: {error}"[:300]}
+                    results.append(
+                        {
+                            "page": title,
+                            "path": key,
+                            "view": view,
+                            "file": name,
+                            "scenario": True,
+                            **found,
+                        }
+                    )
                 page.close()
             browser.close()
     finally:

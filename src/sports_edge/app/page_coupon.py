@@ -196,11 +196,28 @@ def _day(db, settings, rules, day, run, online) -> None:
         ids = run.coupon_ids
         alternatives = builder.alternatives
         candidates = run.candidates
+        statuses = {
+            name: {
+                **result,
+                "created_at": (db.get("coupons", result["coupon_id"]) or {}).get("created_at"),
+            }
+            for name, result in run.coupon_saves.items()
+            if "coupon_id" in result
+        }
     else:
         saved = saved_proposals(db, day)
         proposals = {name: saved.get(name) for name in rules.profiles}
         refusals, alternatives, builder = {}, {}, None
         ids = {name: v["coupon_id"] for name, v in saved.items()}
+        statuses = {
+            name: {
+                "relation": "official",
+                "official_created_at": v["created_at"],
+                "created_at": v["created_at"],
+                "newest_version": v.get("newest_version"),
+            }
+            for name, v in saved.items()
+        }
         _report, candidates = c.day_candidates(day)
         if saved:
             st.caption(
@@ -211,6 +228,8 @@ def _day(db, settings, rules, day, run, online) -> None:
         _no_coupon(explanation, day, run is not None, online)
         return
     by_odds = {x.odds_id: x for x in candidates}
+    exposure = _exposure(proposals)
+    _day_risk(proposals, exposure)
     for name in rules.profiles:  # one full-width card per profile: never squeezed
         coupon_view.card(
             name,
@@ -220,11 +239,63 @@ def _day(db, settings, rules, day, run, online) -> None:
             by_odds=by_odds,
             refusal=refusals.get(name),
             coupon_id=ids.get(name),
+            status=statuses.get(name),
+            exposure=exposure,
             alternatives=[
                 proposal_payload(a, policy_version=rules.version)
                 for a in alternatives.get(name, ())
             ],
         )
+
+
+def _exposure(proposals: dict) -> dict[str, list[tuple[str, str, tuple]]]:
+    """{event id: [(profile, label, pick), ...]} of the day's coupons."""
+    out: dict[str, list[tuple[str, str, tuple]]] = {}
+    for name, payload in proposals.items():
+        for leg in (payload or {}).get("legs", []):
+            pick = (leg.get("market_key"), leg.get("line"), leg.get("selection"))
+            out.setdefault(leg["event_id"], []).append((name, payload.get("label") or name, pick))
+    return out
+
+
+def _day_risk(proposals: dict, exposure: dict) -> None:
+    """Ryzyko dnia: matches shared by several coupons — one lost match loses them all."""
+    made = [p for p in proposals.values() if p]
+    if len(made) < 2:
+        return
+    names = {leg["event_id"]: leg["event"] for p in made for leg in p["legs"]}
+    shared = sorted(
+        ((event, profiles) for event, profiles in exposure.items() if len(profiles) > 1),
+        key=lambda item: -len(item[1]),
+    )
+    if not shared:
+        ui.explanation(
+            "Ryzyko dnia",
+            [
+                "Każdy mecz występuje tylko w jednym kuponie dnia — porażka jednego meczu "
+                "przegrywa najwyżej jeden kupon."
+            ],
+        )
+        return
+    points = []
+    for event, profiles in shared:
+        labels = ", ".join(label for _p, label, _pick in profiles)
+        losing = ins.plural(len(profiles), "kupon", "kupony", "kuponów")
+        if len({pick for _p, _label, pick in profiles}) == 1:
+            points.append(
+                f"{names[event]}: ten sam typ w kuponach {labels} — jeśli nie wejdzie, "
+                f"przegrywa {losing}"
+            )
+        else:
+            points.append(
+                f"{names[event]}: różne typy tego meczu w kuponach {labels} — wyniki "
+                f"skorelowane ({losing})"
+            )
+    points.append(
+        "Kupony z tym samym meczem są skorelowane. Opcja różnicowania (Ustawienia: „ta sama "
+        "selekcja najwyżej w N kuponach”) jest domyślnie wyłączona."
+    )
+    ui.explanation("Ryzyko dnia", points, tone="warn")
 
 
 def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool) -> None:

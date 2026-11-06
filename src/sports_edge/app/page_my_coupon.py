@@ -21,7 +21,7 @@ from sports_edge.app import cart, coupon_view, ui
 from sports_edge.app import common as c
 from sports_edge.bookmakers import load_profiles
 from sports_edge.repository import offer_days
-from sports_edge.services import probability_policy, save_my_coupon, saved_proposals
+from sports_edge.services import probability_policy, save_my_coupon_result, saved_proposals
 
 MAIN_MARKETS = (
     "1x2",
@@ -276,6 +276,11 @@ def _coupon() -> None:
             "rozpoczęcia meczów, i rozliczy się automatycznie. W statystykach jest oddzielony "
             "od kuponów zapisanych przed meczem."
         )
+    again = (real or late) and st.checkbox(
+        "Postawiłem identyczny kupon w STS jeszcze raz (zapisz drugi egzemplarz)",
+        key="mc_copy",
+        help="Bez tego zaznaczenia ponowne kliknięcie zwraca już zapisany kupon.",
+    )
     with st.container(key="row-mc-save"):
         save = st.columns(2)
     if save[0].button(
@@ -288,10 +293,18 @@ def _coupon() -> None:
         else None,
     ):
         try:
-            coupon_id = save_my_coupon(
-                c.store(), c.paths(), legs, rows, stake=stake, now=c.now(), real=real, late=late
+            result = save_my_coupon_result(
+                c.store(),
+                c.paths(),
+                legs,
+                rows,
+                stake=stake,
+                now=c.now(),
+                real=real,
+                late=late,
+                confirm_copy=bool(again),
             )
-            st.session_state[SAVED] = coupon_id
+            st.session_state[SAVED] = (result.coupon_id, result.relation)
             st.rerun()
         except ValueError as error:
             st.error(str(error))
@@ -341,9 +354,15 @@ def _leg_card(i: int, leg: dict, row) -> None:
 
 
 def _saved_note() -> None:
-    coupon_id = st.session_state.get(SAVED)
-    if coupon_id:
-        st.success(f"Kupon zapisany ({coupon_id[:10]}…). Znajdziesz go w Historii i skuteczności.")
+    saved = st.session_state.get(SAVED)
+    if saved:
+        coupon_id, relation = saved if isinstance(saved, tuple) else (saved, "user")
+        if relation == "duplicate":
+            st.info(f"Ten kupon jest już zapisany ({coupon_id[:10]}…) — nie zapisano kopii.")
+        else:
+            st.success(
+                f"Kupon zapisany ({coupon_id[:10]}…). Znajdziesz go w Historii i skuteczności."
+            )
         c.page_link("historia", "Otwórz historię kuponów")
 
 

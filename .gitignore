@@ -19,6 +19,9 @@ artifacts/
 *.parquet
 *.csv
 *.jsonl
+# TASK 010: STS offers and exports never enter the (public) repository
+*.pdf
+*.xlsx
 !tests/fixtures/**
 
 # TASK 002: local backups and Streamlit secrets never leave this computer

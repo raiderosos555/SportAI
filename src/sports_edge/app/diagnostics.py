@@ -9,7 +9,7 @@ import streamlit as st
 from sports_edge.analysis.coupon import NO_EDGE
 from sports_edge.app import common as c
 from sports_edge.bookmakers import load_profiles
-from sports_edge.paper import create_coupon
+from sports_edge.coupon_store import DUPLICATE_MESSAGE, save_manual
 from sports_edge.services import policy
 
 
@@ -142,16 +142,19 @@ def ev_analysis(db, run) -> None:
                 f"Zapisz jako wirtualny kupon: {x.event} / {x.selection}", key=f"paper_{x.key}"
             ):
                 try:
-                    create_coupon(
+                    result = save_manual(
                         db,
                         odds_ids=[x.odds_id],
                         stake=Decimal(c.settings().nominal_stake),
                         mode="paper_system",
-                        profile=profile,
+                        sts=profile,
                         now=c.now(),
                         analysis_id=run.analysis_id,
                     )
-                    st.success("Zapisano w historii (paper trading).")
+                    if result.relation == "duplicate":
+                        st.info(DUPLICATE_MESSAGE)
+                    else:
+                        st.success("Zapisano w historii (paper trading).")
                 except ValueError as error:
                     st.error(str(error))
     else:

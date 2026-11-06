@@ -163,3 +163,120 @@ def demo_document(day: date, generated: datetime) -> bytes:
         title="DEMO - DANE SYNTETYCZNE (układ jak oferta STS)",
     )
     return sts
+
+
+def seed_coupons(store, now: datetime) -> list[str]:
+    """TASK 010 (QA only): two SYNTHETIC official coupons of the DEMO offer for two profiles
+    that share one match, so Kupon dnia shows the "Ryzyko dnia" block and Historia shows
+    official coupons. Fictional teams, invented odds and probabilities — DEMO data only."""
+    import json as _json
+    from decimal import Decimal
+
+    from sports_edge.bookmakers import load_profiles
+    from sports_edge.coupon_store import save_builder
+    from sports_edge.ingestion.types import canonical, digest, iso
+    from sports_edge.qa import ROOT
+    from sports_edge.repository import offer_table
+
+    rows = offer_table(store, data_kinds=("demo",))
+    if not rows:
+        return []
+    picks = {}
+    for row in rows:
+        if row["market_key"] == "1x2" and row["offer_code"] in ("9001", "9002"):
+            picks[row["offer_code"]] = (row, "home")
+    if len(picks) < 2:
+        return []
+    day = picks["9001"][0]["offer_date"]
+    analysis = digest(["demo-analysis", day])
+    if store.get("analyses", analysis) is None:
+        store.insert(
+            "analyses",
+            id=analysis,
+            created_at=iso(now),
+            analysis_date=day,
+            policy_json=canonical({"version": "demo"}),
+            summary_json=canonical(
+                {
+                    "headline": "DEMO — dane syntetyczne",
+                    "analysed": 0,
+                    "accepted": [],
+                    "counts": {},
+                    "diagnosis": [],
+                }
+            ),
+            items_json="[]",
+        )
+    sts = load_profiles(ROOT / "config")["sts"]
+
+    def leg(code: str, p: float, low: float) -> dict:
+        row, key = picks[code]
+        quote = row["selections"][key]
+        return {
+            "event": " - ".join(row["participants"]),
+            "event_id": row["event_id"],
+            "league": row["league"],
+            "start_at": row["start_at"],
+            "market": "Mecz",
+            "market_key": "1x2",
+            "line": None,
+            "selection": key,
+            "selection_id": quote.get("selection_id"),
+            "offer_code": code,
+            "odds": str(quote["price"]),
+            "odds_id": quote["odds_id"],
+            "p_model": p,
+            "p_conservative": low,
+            "p_market": None,
+            "predictive_status": "experimental",
+            "calibration": "DEMO",
+            "model": "demo",
+            "model_version_id": None,
+            "document_at": row.get("document_at"),
+            "odds_age_hours": 0.0,
+            "freshness": "fresh",
+        }
+
+    saved = []
+    for name, label, legs in (
+        ("standard", "STANDARDOWY", [leg("9001", 0.52, 0.46)]),
+        ("higher_payout", "WYŻSZA WYPŁATA", [leg("9001", 0.52, 0.46), leg("9002", 0.55, 0.49)]),
+    ):
+        total = 1.0
+        for item in legs:
+            total *= float(item["odds"])
+        p = 1.0
+        low = 1.0
+        for item in legs:
+            p *= item["p_model"]
+            low *= item["p_conservative"]
+        payload = {
+            "profile": name,
+            "label": label,
+            "policy_version": "demo",
+            "level": "experimental",
+            "probability": {"calibrated": p, "conservative": low, "basis": "DEMO"},
+            "total_odds": f"{total:.4f}",
+            "stake": "10.00",
+            "payout": f"{10 * 0.88 * total:.2f}",
+            "net_profit": f"{10 * 0.88 * total - 10:.2f}",
+            "ev_net": "0",
+            "legs": legs,
+            "reasons": ["DEMO — dane syntetyczne, fikcyjne drużyny i kursy"],
+            "warnings": [],
+        }
+        result = save_builder(
+            store,
+            odds_ids=[item["odds_id"] for item in legs],
+            stake=Decimal("10.00"),
+            profile_name=name,
+            payload=_json.loads(_json.dumps(payload)),
+            policy_version="demo",
+            day=day,
+            analysis_id=analysis,
+            now=now,
+            sts=sts,
+            note=f"DEMO — {label}",
+        )
+        saved.append(result.coupon_id)
+    return saved

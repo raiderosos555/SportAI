@@ -13,9 +13,11 @@ policy would have built, then settled with the recorded results. No future data,
 invented prices. Results are stored as simulation runs, apart from virtual or real coupons.
 """
 
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import date, datetime, time
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -263,7 +265,15 @@ def replay_day(
     _report, candidates = analyse_day(
         store, paths, settings, day, now=decision_at, as_of=decision_at
     )
-    built = build_coupons(candidates, rules, cost=sts.cost, on_date=decision_at.date(), stake=stake)
+    built = build_coupons(
+        candidates,
+        rules,
+        cost=sts.cost,
+        on_date=decision_at.date(),
+        stake=stake,
+        # TASK 010: the same diversity setting as the analysis (None = the policy's value)
+        max_profiles_per_selection=getattr(settings, "max_profiles_per_selection", None),
+    )
     out = {
         "day": day,
         "decision_at": iso(decision_at),
@@ -325,6 +335,109 @@ def replay_day(
             },
         }
     return out
+
+
+def diversity_replay(
+    store: Store,
+    paths,
+    settings,
+    days: list[str],
+    *,
+    decision_time: time = time(10, 0),
+    limits: tuple[int, ...] = (0, 1, 2),
+    stake: Decimal = Decimal("10.00"),
+) -> dict:
+    """TASK 010 §4: the as-of replay of ``days`` with the diversity limit off (0), 1 and 2.
+
+    One analysis per day — only what was known at ``decision_time`` (Warsaw) — then the
+    builder once per limit, nothing saved. Measured: the mean conservative chance of the
+    coupons, days with at least one coupon, days where ONE lost selection loses 2+ coupons
+    (and, wider, days where one match is in 2+ coupons with any pick), and how many coupons
+    the limit removed or changed against the first limit. A measurement, not a recommendation:
+    the default of the policy stays off."""
+    from sports_edge.analysis.coupon_builder import build_coupons
+    from sports_edge.bookmakers import load_profiles
+    from sports_edge.services import analyse_day, probability_policy
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    rules = probability_policy(paths)
+    sts = load_profiles(paths.config)["sts"]
+    totals = {
+        limit: {
+            "coupons": 0,
+            "days_with_coupon": 0,
+            "days_one_loss_2plus": 0,
+            "days_shared_match": 0,
+            "removed": 0,
+            "changed": 0,
+            "profiles": Counter(),
+        }
+        for limit in limits
+    }
+    chances: dict = {limit: defaultdict(list) for limit in limits}
+    per_day = []
+    for day in days:
+        decision = datetime.combine(date.fromisoformat(day), decision_time, tzinfo=warsaw)
+        _report, candidates = analyse_day(store, paths, settings, day, now=decision, as_of=decision)
+        reference = None
+        row = {"day": day, "candidates": len(candidates), "coupons": {}}
+        for limit in limits:
+            built = build_coupons(
+                candidates,
+                rules,
+                cost=sts.cost,
+                on_date=decision.date(),
+                stake=stake,
+                max_profiles_per_selection=limit,
+            )
+            made = {name: p for name, p in built.proposals.items() if p is not None}
+            reference = made if reference is None else reference
+            picks = Counter(leg.selection_id for p in made.values() for leg in p.legs)
+            matches = Counter(e for p in made.values() for e in {leg.event_id for leg in p.legs})
+            found = totals[limit]
+            found["coupons"] += len(made)
+            found["days_with_coupon"] += bool(made)
+            found["days_one_loss_2plus"] += any(n >= 2 for n in picks.values())
+            found["days_shared_match"] += any(n >= 2 for n in matches.values())
+            found["removed"] += sum(name not in made for name in reference)
+            found["changed"] += sum(
+                name in reference
+                and [x.selection_id for x in p.legs]
+                != [x.selection_id for x in reference[name].legs]
+                for name, p in made.items()
+            )
+            found["profiles"].update(made.keys())
+            for name, p in made.items():
+                chances[limit][name].append(p.p_conservative)
+            row["coupons"][limit] = {
+                name: {
+                    "legs": len(p.legs),
+                    "odds": str(p.total_odds),
+                    "p_conservative": round(p.p_conservative, 4),
+                }
+                for name, p in made.items()
+            }
+        per_day.append(row)
+
+    def mean(values):
+        return round(sum(values) / len(values), 4) if values else None
+
+    summary = {}
+    for limit, found in totals.items():
+        every = [v for values in chances[limit].values() for v in values]
+        summary[limit] = {
+            **found,
+            "profiles": dict(found["profiles"]),
+            "mean_p_conservative": mean(every),
+            "mean_p_conservative_by_profile": {k: mean(v) for k, v in chances[limit].items()},
+            "days": len(days),
+        }
+    return {
+        "decision_time": decision_time.strftime("%H:%M"),
+        "policy_version": rules.version,
+        "limits": summary,
+        "per_day": per_day,
+    }
 
 
 def _result(store: Store, event_id: str) -> dict | None:

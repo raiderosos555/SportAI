@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -37,6 +37,7 @@ MIGRATIONS = {
     5: "sports statistics store, feature snapshots, coupon proposals",
     6: "TASK 007: model history, prediction settlements, job runs, simulations, LLM usage",
     7: "TASK 008: lineups, absences, pre-match checks, alerts, coupon reassessments, automation",
+    8: "TASK 010: coupon lineage — one official coupon per profile and day, versions linked",
 }
 
 SCHEMA = """
@@ -140,6 +141,16 @@ CREATE TABLE IF NOT EXISTS coupons (
  currency TEXT NOT NULL, cost_profile_id TEXT NOT NULL, total_odds TEXT NOT NULL,
  first_start_at TEXT NOT NULL, note TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coupon_lineage (
+ id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL UNIQUE REFERENCES coupons(id),
+ official_coupon_id TEXT NOT NULL REFERENCES coupons(id),
+ relation TEXT NOT NULL
+   CHECK(relation IN ('official','duplicate','price_update','revision','user')),
+ identity_key TEXT NOT NULL, slot_key TEXT NOT NULL, recorded_at TEXT NOT NULL,
+ reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lineage_slot ON coupon_lineage(slot_key, relation);
+CREATE INDEX IF NOT EXISTS lineage_official ON coupon_lineage(official_coupon_id);
 CREATE TABLE IF NOT EXISTS coupon_legs (
  id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id),
  odds_id TEXT NOT NULL REFERENCES odds(id), selection_id TEXT NOT NULL REFERENCES selections(id),
@@ -371,6 +382,9 @@ class Store:
         that already exist are recorded by the application (``learning.ensure_roles``).
         v7: new append-only tables only (lineups, absences, pre-match checks, alerts, coupon
         reassessments, automation settings / commands / events).
+        v8: one new append-only table (``coupon_lineage``); no existing row is touched. The
+        lineage of the coupons that already exist is recorded by the application
+        (``coupon_store.backfill_lineage``, idempotent).
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

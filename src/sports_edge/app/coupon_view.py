@@ -254,6 +254,81 @@ def simulation(payload: dict) -> None:
     c.page_link("budzet", "Otwórz Symulator budżetu")
 
 
+def _exposed(rows: list[dict], payload: dict, name: str, exposure: dict | None) -> list:
+    """Each leg says which other coupons of the day share its match (correlated risk)."""
+    if not exposure:
+        return rows
+    for row, leg in zip(rows, payload["legs"], strict=True):
+        others = [
+            label for profile, label, _pick in exposure.get(leg["event_id"], []) if profile != name
+        ]
+        if others:
+            note = f"ten mecz jest też w: {', '.join(others)}"
+            row["note"] = f"{row['note']} · {note}" if row.get("note") else note
+    return rows
+
+
+def status_html(status: dict | None, payload: dict) -> str:
+    """Official coupon of the day, a revision, a price update or "no change" (TASK 010)."""
+    if not status:
+        return ""
+    relation = status.get("relation")
+    unchanged = relation == "duplicate"
+    created = status.get("created_at")
+    if unchanged and status.get("version_relation") in ("price_update", "revision"):
+        # the analysis repeated a later version: show that version, not the official coupon
+        relation = status["version_relation"]
+        created = status.get("version_created_at") or created
+    official = status.get("official_created_at")
+    since = c.local_time(official, "%H:%M") if official else "—"
+    at = c.local_time(created, "%H:%M") if created else "—"
+    lines: list[str] = []
+    if relation == "revision":
+        badge = ui.pill(f"Rewizja z {at}", "warn")
+        if unchanged:
+            lines.append(f"Bez zmian — rewizja z {at} jest aktualna.")
+        lines.append(f"Oficjalny kupon dnia z {since} pozostaje w statystykach.")
+    elif relation == "price_update":
+        documents = [leg.get("document_at") for leg in payload["legs"] if leg.get("document_at")]
+        pdf = c.local_time(max(documents), "%H:%M") if documents else "—"
+        badge = ui.pill(f"Kursy zaktualizowane (PDF z {pdf})", "info")
+        if unchanged:
+            lines.append(f"Bez zmian — aktualizacja kursów z {at} jest aktualna.")
+        lines.append(f"Oficjalny kupon dnia z {since} pozostaje w statystykach.")
+    else:
+        badge = ui.pill("Oficjalny kupon dnia", "ok")
+        if unchanged:
+            lines.append(f"Bez zmian — kupon dnia z {since} jest aktualny.")
+    changes = status.get("changes") or {}
+    if changes.get("added"):
+        lines.append("Dodane: " + "; ".join(changes["added"]))
+    if changes.get("removed"):
+        lines.append("Usunięte: " + "; ".join(changes["removed"]))
+    for move in changes.get("prices") or []:
+        lines.append(
+            f"Kurs {move['selection']}: {ins.num(move['before'])} → {ins.num(move['after'])}"
+        )
+    if relation in ("revision", "price_update") and changes.get("total_odds"):
+        odds, payout = changes["total_odds"], changes.get("payout") or ["—", "—"]
+        lines.append(
+            f"Kurs łączny {ins.num(odds[0])} → {ins.num(odds[1])} · wypłata "
+            f"{ins.money(payout[0])} → {ins.money(payout[1])}"
+        )
+    newest = status.get("newest_version")
+    if newest:
+        label = "Rewizja" if newest["relation"] == "revision" else "Aktualizacja kursów"
+        lines.append(
+            f"Nowsza wersja: {label} z {c.local_time(newest['created_at'], '%H:%M')} — "
+            "kupon oficjalny się nie zmienia."
+        )
+    return (
+        '<div class="se-coupon-status">'
+        + badge
+        + "".join(f'<div class="sub">{ui.esc(line)}</div>' for line in lines)
+        + "</div>"
+    )
+
+
 def card(
     name: str,
     payload: dict | None,
@@ -264,8 +339,12 @@ def card(
     refusal: str | None = None,
     coupon_id: str | None = None,
     alternatives: list[dict] = (),
+    status: dict | None = None,
+    exposure: dict | None = None,
 ) -> None:
-    """The coupon of one profile for one day (or why there is none)."""
+    """The coupon of one profile for one day (or why there is none). ``status`` (TASK 010)
+    is what saving did: official coupon, no change, price update or revision; ``exposure``
+    names the other coupons of the day with the same match."""
     if payload is None:
         st.markdown(
             ui.list_row(
@@ -280,8 +359,9 @@ def card(
     with st.container(border=True, key=f"coupon-{day}-{name}{'-' + tone if tone else ''}"):
         st.markdown(
             header_html(name, payload, date_label=c.day_label(day))
+            + status_html(status, payload)
             + stats(payload)
-            + ui.legs_html(legs(payload, db)),
+            + ui.legs_html(_exposed(legs(payload, db), payload, name, exposure)),
             unsafe_allow_html=True,
         )
         rows = [by_odds.get(leg["odds_id"]) for leg in payload["legs"]]

@@ -2,7 +2,7 @@
 
 import importlib.util
 import json
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
@@ -11,11 +11,21 @@ from zoneinfo import ZoneInfo
 
 from sports_edge import learning
 from sports_edge.analysis.coupon import CouponReport, build_daily_coupon, diagnose, save_analysis
-from sports_edge.analysis.coupon_builder import BuilderReport, Proposal, build_coupons
+from sports_edge.analysis.coupon_builder import BuilderReport, build_coupons
 from sports_edge.analysis.edge_engine import Candidate, evaluate
 from sports_edge.analysis.policy import Policy, load_policy
 from sports_edge.bookmakers import load_profiles, load_rules
 from sports_edge.collection import record_job, settle_predictions
+from sports_edge.coupon_store import (  # noqa: F401 — re-exported (TASK 010 move)
+    backfill_lineage,
+    my_coupon_payload,
+    proposal_payload,
+    save_coupon_proposals,
+    save_my_coupon,
+    save_my_coupon_result,
+    save_proposals,
+    saved_proposals,
+)
 from sports_edge.datasources import openfootball
 from sports_edge.datasources.api_sports import ENV_KEY as API_SPORTS_ENV
 from sports_edge.datasources.api_sports import (
@@ -42,10 +52,8 @@ from sports_edge.offers.labels import market_label
 from sports_edge.offers.sources import STS_URLS, SourceBlocked, StsOfficialPdf
 from sports_edge.offers.text import NameNormalizer, load_normalizer
 from sports_edge.paper import (
-    create_coupon,
     import_source_results,
     latest_result,
-    latest_settlement,
     record_status_results,
     resolve,
     settle_coupon,
@@ -135,6 +143,7 @@ def open_store(paths: AppPaths) -> Store:
     store = Store(paths.database, backup_dir=paths.backups)
     ensure_reference_data(store)
     ensure_model_roles(store)
+    backfill_lineage(store, now=datetime.now(UTC))  # TASK 010: idempotent, append-only
     return store
 
 
@@ -821,6 +830,8 @@ class PipelineRun:
     coupons: BuilderReport | None = None
     coupon_ids: dict[str, str] = field(default_factory=dict)
     day: str = ""
+    # TASK 010: per profile what saving did (official, duplicate, price_update, revision)
+    coupon_saves: dict[str, dict] = field(default_factory=dict)
     offer: dict = field(default_factory=dict)  # newest STS document for the day and its age
     refresh: list[dict] = field(default_factory=list)  # what the STS download attempt did
 
@@ -1366,7 +1377,13 @@ def _analyse_one_day(
     )
 
     # 9-12. Coupon builder --------------------------------------------------------------
-    built = build_coupons(candidates, rules, cost=cost, on_date=date.fromisoformat(day))
+    built = build_coupons(
+        candidates,
+        rules,
+        cost=cost,
+        on_date=date.fromisoformat(day),
+        max_profiles_per_selection=settings.max_profiles_per_selection,
+    )
     made = {k: v for k, v in built.proposals.items() if v is not None}
     stage(
         stages,
@@ -1401,18 +1418,25 @@ def _analyse_one_day(
     # 13. Save -----------------------------------------------------------------------
     pipeline = {"stages": stages, "run_at": now.astimezone(UTC).isoformat()}
     analysis_id = save_analysis(store, report, candidates, policy(paths), pipeline=pipeline)
-    coupon_ids = (
-        save_coupon_proposals(store, paths, built, analysis_id=analysis_id, now=now, day=day)
+    saves = (
+        save_proposals(store, paths, built, analysis_id=analysis_id, now=now, day=day)
         if save_coupons
         else {}
     )
+    coupon_ids = {
+        name: result["coupon_id"] if "coupon_id" in result else f"nie zapisano: {result['error']}"
+        for name, result in saves.items()
+    }
+    relations = Counter(result.get("relation", "błąd") for result in saves.values())
     stage(
         stages,
         12,
         "ok",
-        f"analiza {analysis_id[:12]}…, propozycje kuponów: {len(coupon_ids)}",
+        f"analiza {analysis_id[:12]}…, propozycje kuponów: {len(coupon_ids)}"
+        + (f" ({', '.join(f'{k}: {v}' for k, v in sorted(relations.items()))})" if saves else ""),
         analysis_id=analysis_id,
         coupons=coupon_ids,
+        relations=dict(relations),
     )
 
     # 14. Presentation ---------------------------------------------------------------------
@@ -1424,7 +1448,9 @@ def _analyse_one_day(
         if made
         else "BRAK KUPONU SPEŁNIAJĄCEGO WARUNKI PROFILI — " + report.headline,
     )
-    return PipelineRun(report, candidates, analysis_id, stages, built, coupon_ids, day=day)
+    return PipelineRun(
+        report, candidates, analysis_id, stages, built, coupon_ids, day=day, coupon_saves=saves
+    )
 
 
 def model_quality(store: Store, scope: tuple[str, ...] = CORE_COMPETITIONS) -> dict[str, dict]:
@@ -1445,75 +1471,6 @@ def model_quality(store: Store, scope: tuple[str, ...] = CORE_COMPETITIONS) -> d
 
 def model_quality_by_scope(store: Store) -> dict[str, dict[str, dict]]:
     return {name: model_quality(store, scope) for name, scope in MODEL_SCOPES.items()}
-
-
-def proposal_payload(proposal: Proposal, *, policy_version: str) -> dict:
-    """What the coupon view shows and what is stored with a saved proposal (JSON-safe)."""
-    return {
-        "profile": proposal.profile,
-        "label": proposal.label,
-        "policy_version": policy_version,
-        "level": proposal.level,
-        "probability": {
-            "calibrated": proposal.p_calibrated,
-            "conservative": proposal.p_conservative,
-            "basis": proposal.joint_basis,
-        },
-        "total_odds": str(proposal.total_odds),
-        "stake": str(proposal.stake),
-        "payout": str(proposal.payout),
-        "net_profit": str(proposal.net_profit),
-        "ev_net": str(proposal.ev_net),
-        "legs": [
-            {
-                "event": leg.event,
-                "event_id": leg.event_id,
-                "league": leg.league,
-                "start_at": leg.start_at,
-                "market": leg.market_label,
-                "market_key": leg.market_key,
-                "line": leg.line,
-                "selection": leg.selection,
-                "offer_code": leg.offer_code,
-                "odds": str(leg.odds),
-                "odds_id": leg.odds_id,
-                "p_model": leg.p_model,
-                "p_conservative": leg.p_low,
-                "p_market": leg.p_market,
-                "predictive_status": leg.predictive_status,
-                "calibration": leg.calibration,
-                "model": leg.model,
-                "model_version_id": leg.model_version_id,
-                "document_at": leg.document_at,
-                "odds_age_hours": leg.odds_age_hours,
-                "freshness": leg.freshness,
-            }
-            for leg in proposal.legs
-        ],
-        "reasons": list(proposal.reasons),
-        "warnings": list(proposal.warnings),
-    }
-
-
-def saved_proposals(store: Store, day: str) -> dict[str, dict]:
-    """Newest saved builder coupon of each profile for an analysis day (with settlement)."""
-    out: dict[str, dict] = {}
-    for row in store.rows(
-        """SELECT c.* FROM coupons c JOIN analyses a ON a.id=c.analysis_id
-        WHERE a.analysis_date=? AND c.proposal_json IS NOT NULL ORDER BY c.created_at DESC""",
-        (day,),
-    ):
-        if row["profile"] in out:
-            continue
-        settlement = latest_settlement(store, row["id"])
-        out[row["profile"]] = {
-            **json.loads(row["proposal_json"]),
-            "coupon_id": row["id"],
-            "created_at": row["created_at"],
-            "outcome": settlement["outcome"] if settlement else None,
-            "settled_net_profit": settlement["net_profit"] if settlement else None,
-        }
-    return out
 
 
 def event_lineups(
@@ -1540,142 +1497,6 @@ def event_lineups(
         normalizer=normalizer(paths),
         aliases=alias_map(store, team_aliases(paths)),
         identities=team_identities(paths),
-    )
-
-
-def save_coupon_proposals(
-    store: Store,
-    paths: AppPaths,
-    built: BuilderReport,
-    *,
-    analysis_id: str,
-    now: datetime,
-    day: str,
-) -> dict[str, str]:
-    """Every proposal becomes a paper coupon (idempotent per day and policy)."""
-    rules = probability_policy(paths)
-    sts = load_profiles(paths.config)["sts"]
-    ids = {}
-    for name, proposal in built.proposals.items():
-        if proposal is None:
-            continue
-        odds_ids = [leg.odds_id for leg in proposal.legs]
-        payload = proposal_payload(proposal, policy_version=rules.version)
-        try:
-            ids[name] = create_coupon(
-                store,
-                odds_ids=odds_ids,
-                stake=proposal.stake,
-                mode="paper_system",
-                profile=sts,
-                now=now,
-                analysis_id=analysis_id,
-                note=f"Kreator kuponów — {proposal.label}",
-                proposal=payload,
-                key=digest(["proposal", name, sorted(odds_ids), rules.version, day]),
-            )
-        except ValueError as error:
-            ids[name] = f"nie zapisano: {error}"
-    return ids
-
-
-def my_coupon_payload(rows: list[Candidate], summary: dict, *, policy_version: str) -> dict:
-    """What is stored with a coupon built by the user (MÓJ KUPON), JSON-safe."""
-    return {
-        "profile": "my_coupon",
-        "label": "MÓJ KUPON",
-        "source": "user",
-        "policy_version": policy_version,
-        "level": "validated_predictive" if summary["validated"] else "experimental",
-        "probability": {
-            "calibrated": summary["probability"],
-            "conservative": summary["probability_low"],
-            "basis": summary["probability_note"],
-        },
-        "total_odds": str(summary["total_odds"]),
-        "stake": str(summary["stake"]),
-        "payout": str(summary.get("payout")),
-        "net_profit": str(summary.get("net_profit")),
-        "legs": [
-            {
-                "event": leg.event,
-                "event_id": leg.event_id,
-                "league": leg.league,
-                "start_at": leg.start_at,
-                "market": leg.market_label,
-                "market_key": leg.market_key,
-                "line": leg.line,
-                "selection": leg.selection,
-                "offer_code": leg.offer_code,
-                "odds": str(leg.odds),
-                "odds_id": leg.odds_id,
-                "p_model": leg.p_model,
-                "p_conservative": leg.p_low,
-                "p_market": leg.p_market,
-                "predictive_status": leg.predictive_status,
-                "calibration": leg.calibration,
-                "model": leg.model,
-                "model_version_id": leg.model_version_id,
-                "document_at": leg.document_at,
-                "odds_age_hours": leg.odds_age_hours,
-                "freshness": leg.freshness,
-            }
-            for leg in rows
-        ],
-    }
-
-
-def save_my_coupon(
-    store: Store,
-    paths: AppPaths,
-    cart: list[dict],
-    rows: list[Candidate | None],
-    *,
-    stake: Decimal,
-    now: datetime,
-    real: bool = False,
-    late: bool = False,
-) -> str:
-    """Save MÓJ KUPON as a virtual coupon (or a manually recorded real one). Refused while a
-    blocking problem remains (stale price, started event, contradiction, one match twice).
-
-    ``late``: a coupon already placed in STS, recorded after its matches started. It is a
-    real entry with prices observed before each start, kept apart from prospective coupons
-    (profile "my_coupon_after") because choosing legs after seeing results is hindsight."""
-    from sports_edge import my_coupon as mine
-
-    sts = load_profiles(paths.config)["sts"]
-    first = min((row.start_at for row in rows if row is not None and row.start_at), default=None)
-    on_date = datetime.fromisoformat(first).date() if late and first else now.date()
-    summary = mine.summary(cart, rows, stake=stake, cost=sts.cost, on_date=on_date, late=late)
-    blocking = [i.message for i in summary["issues"] if i.severity == "block"]
-    if blocking:
-        raise ValueError("Kupon nie może być zapisany: " + "; ".join(blocking))
-    present = [row for row in rows if row is not None]
-    payload = my_coupon_payload(present, summary, policy_version=probability_policy(paths).version)
-    if late:
-        payload.update(
-            profile="my_coupon_after",
-            label="MÓJ KUPON — wpis po fakcie",
-            entered_after_start=True,
-        )
-    return create_coupon(
-        store,
-        odds_ids=[row.odds_id for row in present],
-        stake=stake,
-        mode="real_manual" if real or late else "paper_manual",
-        profile=sts,
-        now=now,
-        note="Mój kupon"
-        + (
-            " — postawiony w STS, wpis po rozpoczęciu meczu"
-            if late
-            else " — postawiony w STS (wpis ręczny)"
-            if real
-            else ""
-        ),
-        proposal=payload,
-        late_entry=late,
     )
 
 

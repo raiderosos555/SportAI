@@ -419,10 +419,14 @@ def latest_settlement(store: Store, coupon_id: str) -> dict | None:
 def performance(store: Store) -> dict[str, dict]:
     """ROI = sum(net profit) / sum(stake) over settled coupons, separately for each mode.
 
-    Max drawdown is measured on the cumulative profit in settlement order.
+    Max drawdown is measured on the cumulative profit in settlement order. TASK 010: every
+    coupon is settled, but only official and user coupons count (no duplicate, price update
+    or revision — settling one of those never changes a number here).
     """
+    from sports_edge.coupon_store import counted_sql
+
     out: dict[str, dict] = {}
-    for coupon in store.rows("SELECT * FROM coupons ORDER BY created_at"):
+    for coupon in store.rows(f"SELECT * FROM coupons c WHERE {counted_sql()} ORDER BY created_at"):
         stats = out.setdefault(
             coupon["mode"],
             {

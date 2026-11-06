@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 from datetime import UTC, date, datetime
+from datetime import time as dtime
 from decimal import Decimal
 from pathlib import Path
 
@@ -189,6 +190,28 @@ def backup(include_raw: bool) -> None:
     print(create_backup(AppPaths(project_root()), now=datetime.now(), include_raw=include_raw))
 
 
+def lineage() -> None:
+    """TASK 010: record the lineage of every coupon that has none yet (idempotent)."""
+    from sports_edge.coupon_store import backfill_lineage
+
+    _paths, _settings, store = _context()
+    found = backfill_lineage(store, now=datetime.now(UTC))
+    print(json.dumps({"recorded": found, "total": sum(found.values())}, ensure_ascii=False))
+
+
+def diversity(days: str | None, at: str) -> None:
+    """TASK 010 §4: as-of replay with the diversity limit off / 1 / 2 (measurement only)."""
+    from sports_edge.repository import offer_days
+    from sports_edge.simulation import diversity_replay
+
+    paths, settings, store = _context()
+    today = datetime.now(UTC).date().isoformat()
+    chosen = days.split(",") if days else [d for d in offer_days(store) if d < today]
+    hour, minute = (int(x) for x in at.split(":"))
+    found = diversity_replay(store, paths, settings, chosen, decision_time=dtime(hour, minute))
+    print(json.dumps(found, ensure_ascii=False, indent=1, default=str))
+
+
 def learning(action: str, *, force: bool = False) -> None:
     """Model review, catch-up and status reports (automation itself runs from the web UI)."""
     from sports_edge import collection, retraining, services
@@ -277,6 +300,14 @@ def main() -> None:
     )
     lrn.add_argument("action", choices=["review", "catch-up", "status", "storage"])
     lrn.add_argument("--force", action="store_true", help="train even if conditions are unmet")
+    commands.add_parser(
+        "lineage", help="TASK 010: official coupon of the day / duplicates / versions (backfill)"
+    )
+    div = commands.add_parser(
+        "diversity", help="TASK 010: as-of replay with the diversity limit off / 1 / 2"
+    )
+    div.add_argument("--days", help="YYYY-MM-DD,YYYY-MM-DD (default: every past offer day)")
+    div.add_argument("--time", default="10:00", help="decision time, Warsaw (default 10:00)")
     args = parser.parse_args()
     if args.command == "demo":
         demo()
@@ -296,6 +327,10 @@ def main() -> None:
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
     elif args.command == "learning":
         learning(args.action, force=args.force)
+    elif args.command == "lineage":
+        lineage()
+    elif args.command == "diversity":
+        diversity(args.days, args.time)
 
 
 if __name__ == "__main__":

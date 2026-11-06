@@ -14,7 +14,7 @@ from sports_edge.export import export_csv, export_json
 from sports_edge.offers.sources import API_SOURCES
 from sports_edge.pdf.engine import ParseError
 from sports_edge.repository import archived_summary, counts, imports
-from sports_edge.services import import_pdf_bytes
+from sports_edge.services import import_pdf_bytes, probability_policy
 from sports_edge.settings import local_secret, save_settings
 
 
@@ -65,6 +65,22 @@ def _sts() -> None:
         min_value=0,
         max_value=60,
         value=settings.match_tolerance_minutes,
+    )
+    policy_limit = int(
+        probability_policy(c.paths()).builder.get("max_profiles_per_selection", 0) or 0
+    )
+    diversity = st.number_input(
+        "Ta sama selekcja najwyżej w N kuponach dnia (0 = bez limitu)",
+        min_value=0,
+        max_value=4,
+        value=int(
+            settings.max_profiles_per_selection
+            if settings.max_profiles_per_selection is not None
+            else policy_limit
+        ),
+        help="Różnicowanie kuponów dnia: profile budowane po kolei (Wysoka trafność, "
+        "Standardowy, Wyższa wypłata, Tasiemka); selekcja użyta już w N kuponach nie trafia "
+        "do następnych. Progi profili się nie zmieniają. Domyślnie wyłączone.",
     )
     st.markdown("**Źródła wyników sportowych** (bezpłatne; płatne nigdy automatycznie)")
     football_data = st.toggle(
@@ -123,6 +139,9 @@ def _sts() -> None:
         settings.football_data_enabled = football_data
         settings.openfootball_update_enabled = openfootball_updates
         settings.api_sports_enabled = api_sports
+        settings.max_profiles_per_selection = (
+            int(diversity) if int(diversity) != policy_limit else None
+        )
         save_settings(c.paths(), settings)
         st.success("Zapisano w data/settings.json")
     st.info(

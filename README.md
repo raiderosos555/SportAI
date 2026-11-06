@@ -26,11 +26,12 @@ Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy si
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
 predykcyjnie” nie oznacza przewagi nad STS; analiza EV zostaje jako diagnostyka.
 
-Kod jest w **prywatnym** repozytorium GitHub
-[raiderosos555/SportAI](https://github.com/raiderosos555/SportAI). Aplikacja i jej dane
-działają lokalnie: baza, oferty PDF, eksporty, kopie zapasowe i `.env` nie trafiają do
-repozytorium (`.gitignore`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 007](docs/task_007_report.md).
+Kod jest w repozytorium GitHub
+[raiderosos555/SportAI](https://github.com/raiderosos555/SportAI), które jest **publiczne**
+(stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
+kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
+`tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
+Stan i ograniczenia: [raport TASK 010](docs/task_010_report.md).
 
 ## Uruchomienie na Windows
 
@@ -118,6 +119,8 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge learning review             # przegląd modeli na żądanie (automatycznie: panel Automatyzacja AI)
 .\.venv\Scripts\sports-edge learning catch-up           # uzupełnienie po przerwie (rozliczenia, wyniki)
 .\.venv\Scripts\sports-edge learning status             # kompletność danych i statusy modeli
+.\.venv\Scripts\sports-edge lineage                    # TASK 010: kupon oficjalny / duplikaty / wersje (backfill)
+.\.venv\Scripts\sports-edge diversity --time 10:00      # TASK 010: replay as-of z limitem różnicowania 0 / 1 / 2
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
 .\.venv\Scripts\sports-edge demo
@@ -160,12 +163,14 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-338 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+356 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
 klubów, reprezentacje, bramka generatora, harmonogram, kategorie interfejsu; 13 z HOTFIX 009.1:
-własne pule profili generatora, wybór widocznego przycisku i diagnostyka w Playwright).
+własne pule profili generatora, wybór widocznego przycisku i diagnostyka w Playwright;
+18 z TASK 010: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów,
+statystyki i alerty liczone raz, podwójne kliknięcie, migracja v8, `.gitignore`).
 Ścieżki interfejsu: `python -m sports_edge.qa` (25 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
@@ -220,6 +225,8 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 010](docs/task_010_report.md) | Jeden kupon, jedna historia: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów, statystyki bez duplikatów, alerty raz na zmianę, ryzyko dnia |
+| [Raport HOTFIX 009.1](docs/task_009_1_report.md) | Playwright: widoczny przycisk i diagnostyka, pełny cykl workera, odbiór generatora kuponów, CI |
 | [Raport TASK 009](docs/task_009_report.md) | Przebudowa interfejsu (Sports Edge AI 3.0): system projektowy, trzy poziomy informacji, harmonogram przez WWW, testy wizualne Playwright |
 | [Raport TASK 008](docs/task_008_report.md) | Automatyzacja AI (worker), składy przed meczem, absencje, kontrola kuponów, Advanced Football Prediction Engine, QA, TASK 009 |
 | [Raport TASK 007](docs/task_007_report.md) | P0 (przedziały, protokół v2, zależność par), Mój kupon, profile, symulatory, zbieranie danych, uczenie, TASK 008 |

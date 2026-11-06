@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from sports_edge import alerts, prematch
+from sports_edge.coupon_store import counted_sql
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.repository import latest_result_status, offer_table
 from sports_edge.storage import Store
@@ -22,11 +23,12 @@ NEAR_KICKOFF = timedelta(minutes=90)
 
 
 def active_coupons(store: Store, *, now: datetime) -> list[dict]:
-    """Unsettled coupons whose matches have not all finished long ago."""
+    """Unsettled coupons whose matches have not all finished long ago — official and user
+    coupons only (TASK 010: a duplicate, a price update or a revision is never re-checked)."""
     return store.rows(
-        """SELECT c.* FROM coupons c WHERE NOT EXISTS
+        f"""SELECT c.* FROM coupons c WHERE NOT EXISTS
         (SELECT 1 FROM settlements s WHERE s.coupon_id=c.id) AND c.first_start_at>?
-        ORDER BY c.first_start_at""",
+        AND {counted_sql()} ORDER BY c.first_start_at""",
         ((now - timedelta(hours=6)).isoformat(),),
     )
 
@@ -67,15 +69,32 @@ def reassess(
     offers: dict,
     results: dict,
     trigger: str = "automation",
+    facts: list | None = None,
 ) -> dict:
-    """One coupon: returns the stored (or unchanged previous) reassessment."""
+    """One coupon: returns the stored (or unchanged previous) reassessment.
+
+    Every reason is also a FACT (kind, event, selection, change). Called by ``reassess_all``
+    the facts are collected (``facts``) and alerted once for all coupons they concern;
+    called alone, the coupon's facts are alerted at once. ``change`` is what happened in the
+    world, not on one coupon: a price move is "kurs zmienił się na 1.65" for every coupon
+    holding the selection, whatever price each of them was saved at."""
     reasons, risks, sources = [], [], set()
+    found: list[tuple] = []
     outdated = False
+
+    def fact(
+        kind: str, leg: dict, detail: str, selection: bool = False, change: str | None = None
+    ) -> None:
+        reasons.append(detail)
+        found.append(
+            (kind, leg["event_id"], leg["selection_id"] if selection else None, change or detail)
+        )
+
     for leg in _legs(store, coupon["id"]):
         name = f"{leg['home']} - {leg['away']}"
         status = results.get(leg["event_id"])
         if status in ("postponed", "cancelled", "abandoned", "void"):
-            reasons.append(f"{name}: mecz {status}")
+            fact("coupon_outdated", leg, f"{name}: mecz {status}")
             outdated = True
             continue
         start = datetime.fromisoformat(leg["start_at"]) if leg["start_at"] else None
@@ -84,13 +103,24 @@ def reassess(
         row = offers.setdefault(leg["offer_date"], _offer(store, leg["offer_date"]))
         current = row.get(leg["selection_id"])
         if current is None or current["presence"] == "withdrawn":
-            reasons.append(f"{name}: selekcji nie ma już w aktualnej ofercie STS")
+            fact(
+                "coupon_outdated",
+                leg,
+                f"{name}: selekcji nie ma już w aktualnej ofercie STS",
+                selection=True,
+            )
             outdated = True
         else:
             sources.add("oferta STS")
             old, new = Decimal(leg["price"]), current["price"]
             if old and abs(new - old) / old >= PRICE_MOVE:
-                reasons.append(f"{name}: kurs zmienił się z {old} na {new}")
+                fact(
+                    "coupon_attention",
+                    leg,
+                    f"{name}: kurs zmienił się z {old} na {new}",
+                    selection=True,
+                    change=f"{name}: kurs zmienił się na {new}",
+                )
         info = prematch.summary(store, leg["event_id"])
         if info["last_check"]:
             sources.add("PitchAPI (składy)")
@@ -100,10 +130,14 @@ def reassess(
             if info["last_check"] and info["last_check"]["executed_at"] > coupon["created_at"]
         ]
         for change in changed:
-            reasons.append(f"{name}: {change['detail']}")
+            fact("coupon_attention", leg, f"{name}: {change['detail']}")
         verified = [a for a in info["absences"] if a["match_status"] == "verified"]
         for absence in verified:
-            reasons.append(f"{name}: absencja {absence['player_name']} ({absence['reason']})")
+            fact(
+                "coupon_attention",
+                leg,
+                f"{name}: absencja {absence['player_name']} ({absence['reason']})",
+            )
             sources.add(absence["source"])
         if (
             start is not None
@@ -114,9 +148,13 @@ def reassess(
         if not verified:
             risks.append(f"{name}: brak zweryfikowanych informacji o absencjach")
     result = "nieaktualny" if outdated else "wymaga uwagi" if reasons else "bez zmian"
+    if facts is not None:
+        facts.extend((item, coupon) for item in found)
+    else:
+        alert_facts(store, [(item, coupon) for item in found], now=now)
     previous = latest(store, coupon["id"])
     if previous and previous["result"] == result and previous["reasons"] == reasons:
-        return previous  # nothing new: no duplicate record, no duplicate alert
+        return previous  # nothing new: no duplicate record
     store.insert(
         "coupon_reassessments",
         id=digest(["reassessment", coupon["id"], iso(now), canonical(reasons)]),
@@ -130,18 +168,32 @@ def reassess(
         sources_json=canonical(sorted(sources)),
         previous_id=previous["id"] if previous else None,
     )
-    if result != "bez zmian":
-        alerts.create(
+    return latest(store, coupon["id"])
+
+
+def alert_facts(store: Store, facts: list[tuple], *, now: datetime) -> int:
+    """One alert per fact (kind, event, selection, change) with the coupons it concerns:
+    one price or lineup change is one alert, never one per coupon or copy of a coupon."""
+    grouped: dict[tuple, list[dict]] = {}
+    for item, coupon in facts:
+        coupons = grouped.setdefault(item, [])
+        if all(c["id"] != coupon["id"] for c in coupons):
+            coupons.append(coupon)
+    added = 0
+    for (kind, event_id, selection_id, detail), coupons in grouped.items():
+        names = ", ".join(c["note"] or c["id"][:8] for c in coupons[:3])
+        added += alerts.create(
             store,
-            kind="coupon_outdated" if outdated else "coupon_attention",
-            message=f"Kupon {coupon['id'][:8]}… ({coupon['note'] or 'kupon'}): "
-            + "; ".join(reasons[:3]),
+            kind=kind,
+            message=f"{detail} — dotyczy kuponów: {len(coupons)} ({names})",
             source="Sports Edge AI",
             now=now,
-            coupon_id=coupon["id"],
-            fingerprint=canonical(reasons),
+            event_id=event_id,
+            coupon_id=coupons[0]["id"],
+            identity=[kind, event_id, selection_id, detail],
+            payload={"coupons": [c["id"] for c in coupons], "selection_id": selection_id},
         )
-    return latest(store, coupon["id"])
+    return added
 
 
 def _offer(store: Store, day: str | None) -> dict:
@@ -158,8 +210,12 @@ def reassess_all(store: Store, *, now: datetime, trigger: str = "automation") ->
     offers: dict = {}
     results = latest_result_status(store)
     counts = {"coupons": 0, "bez zmian": 0, "wymaga uwagi": 0, "nieaktualny": 0}
+    facts: list[tuple] = []
     for coupon in active_coupons(store, now=now):
-        found = reassess(store, coupon, now=now, offers=offers, results=results, trigger=trigger)
+        found = reassess(
+            store, coupon, now=now, offers=offers, results=results, trigger=trigger, facts=facts
+        )
         counts["coupons"] += 1
         counts[found["result"]] += 1
+    counts["alerts"] = alert_facts(store, facts, now=now)
     return counts

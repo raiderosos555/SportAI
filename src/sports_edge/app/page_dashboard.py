@@ -153,7 +153,10 @@ def _proposals(db, day: str, offer: dict) -> None:
     for name in PROFILE_ORDER:
         payload = proposals.get(name)
         if payload:
-            groups[tuple(sorted(leg["odds_id"] for leg in payload["legs"]))].append(name)
+            # TASK 010: identity = the selections (stable between STS documents), not odds
+            groups[
+                tuple(sorted(leg.get("selection_id") or leg["odds_id"] for leg in payload["legs"]))
+            ].append(name)
     rows = []
     for names in groups.values():
         payload = proposals[names[0]]

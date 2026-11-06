@@ -8,6 +8,10 @@ version = "2026-11-02.p3"
 # probability of the whole coupon ("don't build a coupon the data cannot justify").
 # p2: up to `per_event` selections of one match enter the search pool (p1: only the best one,
 # which hid better combinations); one match still gives at most one leg of a coupon.
+# TASK 010: the OFFICIAL coupon of a profile and day is the first one saved before its first
+# match ("first"). Later saves are price updates or revisions linked to it; no rule may
+# replace the official coupon after one of its matches started (hindsight).
+official_rule = "first"
 
 # A market family is "zwalidowany predykcyjnie" when, on the SELECTION window of protocol v2
 # (TASK 007: the final holdout is reported only and never decides):
@@ -72,3 +76,7 @@ long_candidates = 40           # pool of profiles with more than 4 legs (dynamic
 per_event = 3                  # alternatives of one match in the pool (one leg per match)
 same_event_combinations = false  # different markets of one match are never multiplied
 max_odds_per_leg = 4.0
+# TASK 010: a selection may appear in at most N coupons of a day (0 = off, the behaviour of
+# 2b39bed). Profiles are built in the order of this file; the setting can be overridden in
+# Ustawienia. Thresholds are never lowered.
+max_profiles_per_selection = 0

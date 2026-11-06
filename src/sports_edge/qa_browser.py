@@ -77,6 +77,9 @@ def _home() -> Path:
         source_id="fixture",
         data_kind="demo",
     )
+    from sports_edge.demo import seed_coupons
+
+    seed_coupons(store, now)  # TASK 010: official coupons of the demo day, one shared match
     store.close()
     # no internet for the whole run: the worker and the buttons never download anything
     save_settings(paths, replace(load_settings(paths), offline_mode=True))

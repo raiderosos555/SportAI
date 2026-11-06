@@ -11,12 +11,12 @@ from sports_edge import insights as ins
 from sports_edge.app import common as c
 from sports_edge.app import ui
 from sports_edge.bookmakers import load_profiles
+from sports_edge.coupon_store import DUPLICATE_MESSAGE, RELATION_LABELS, save_manual
 from sports_edge.forecast_quality import coupon_review
 from sports_edge.paper import (
     MODES,
     closing_line_value,
     coupons_table,
-    create_coupon,
     import_source_results,
     latest_result,
     performance,
@@ -26,6 +26,7 @@ from sports_edge.paper import (
 from sports_edge.performance import (
     builder_coupons,
     coupon_performance,
+    leg_outcomes,
     selection_outcomes,
     selection_summary,
 )
@@ -87,12 +88,25 @@ def history_page() -> None:
 
 def _coupons(db) -> None:
     rows = coupons_table(db)
+    relation = {
+        r["coupon_id"]: r["relation"]
+        for r in db.rows("SELECT coupon_id, relation FROM coupon_lineage")
+    }
+    hidden = sum(relation.get(r["id"]) in VERSIONED for r in rows)
+    every = hidden and st.toggle(
+        "Wersje i duplikaty",
+        key="hist_all_coupons",
+        help="Pokaż też rewizje, aktualizacje kursów i duplikaty kuponów dnia (poza statystykami).",
+    )
+    if not every:
+        rows = [r for r in rows if relation.get(r["id"]) not in VERSIONED]
     if rows:
         st.dataframe(
             pd.DataFrame(
                 [
                     {
                         "Utworzono": c.local_time(r["created_at"]),
+                        "Relacja": RELATION_LABELS.get(relation.get(r["id"]), "—"),
                         "Tryb": MODES[r["mode"]],
                         "Typ": r["kind"].upper(),
                         "Zdarzenia": " | ".join(
@@ -111,6 +125,11 @@ def _coupons(db) -> None:
             hide_index=True,
             width="stretch",
         )
+        if hidden and not every:
+            st.caption(
+                f"Ukryte wersje i duplikaty kuponów dnia (poza statystykami): {hidden} — "
+                "włącz „Wersje i duplikaty”, aby je zobaczyć."
+            )
     else:
         st.info("Brak wirtualnych kuponów.")
     with st.expander("Dodaj wirtualny kupon (wybór użytkownika — nie rekomendacja systemu)"):
@@ -146,16 +165,19 @@ def _coupons(db) -> None:
         mode = st.selectbox("Tryb", ["paper_manual", "simulation"], format_func=MODES.get)
         if st.button("Zapisz kupon", disabled=not chosen):
             try:
-                create_coupon(
+                result = save_manual(
                     db,
                     odds_ids=chosen,
                     stake=Decimal(f"{stake:.2f}"),
                     mode=mode,
-                    profile=load_profiles(c.paths().config)["sts"],
+                    sts=load_profiles(c.paths().config)["sts"],
                     now=c.now(),
                     note="wybór użytkownika",
                 )
-                st.success("Zapisano.")
+                if result.relation == "duplicate":
+                    st.info(DUPLICATE_MESSAGE)
+                else:
+                    st.success("Zapisano.")
             except ValueError as error:
                 st.error(str(error))
 
@@ -335,11 +357,38 @@ def newest_variants(db, coupons: list[dict]) -> set[str]:
     return {x["id"] for x in newest.values()}
 
 
+VERSIONED = ("revision", "price_update", "duplicate")
+
+
+def _grouped(coupons: list[dict]) -> list[dict]:
+    """Every coupon in start order, each version right after its official coupon."""
+    by_official: dict[str, list[dict]] = {}
+    heads = []
+    for x in coupons:
+        if x.get("relation") in VERSIONED:
+            by_official.setdefault(x["official_coupon_id"], []).append(x)
+        else:
+            heads.append(x)
+    out = []
+    for head in heads:
+        out.append(head)
+        out.extend(sorted(by_official.pop(head["id"], []), key=lambda v: v["created_at"]))
+    for orphans in by_official.values():
+        out.extend(orphans)
+    return out
+
+
 def kind_label(coupon: dict, now, newest: set[str] | None = None) -> tuple[str, str]:
     """Which kind of saved coupon this is: settled, real, current candidate, saved virtual
-    or a historical variant of a proposal."""
+    or a historical variant of a proposal. TASK 010: the relation of ``coupon_lineage``
+    (official coupon of the day, revision, price update, duplicate) comes first."""
+    relation = coupon.get("relation")
+    if relation in ("revision", "price_update", "duplicate"):
+        return RELATION_LABELS[relation] + " (poza statystykami)", "neutral"
     if coupon["outcome"]:
         return "Kupon rozliczony", "neutral"
+    if relation == "official" and datetime.fromisoformat(coupon["first_start_at"]) > now:
+        return "Oficjalny kupon dnia", "info"
     if coupon["mode"] == "real_manual":
         if (coupon.get("proposal") or {}).get("entered_after_start"):
             return "Rzeczywisty — wpis po fakcie", "info"
@@ -347,7 +396,7 @@ def kind_label(coupon: dict, now, newest: set[str] | None = None) -> tuple[str, 
     builder = coupon["mode"] != "paper_manual"
     if builder and coupon.get("profile") in LEGACY_PROFILES:
         return "Historyczny wariant propozycji", "neutral"  # a profile the builder no longer uses
-    if builder and newest is not None and coupon["id"] not in newest:
+    if builder and relation is None and newest is not None and coupon["id"] not in newest:
         return "Historyczny wariant propozycji", "neutral"
     if datetime.fromisoformat(coupon["first_start_at"]) > now:
         return ("Bieżący kandydat", "info") if builder else ("Zapisany wirtualny kupon", "info")
@@ -357,8 +406,18 @@ def kind_label(coupon: dict, now, newest: set[str] | None = None) -> tuple[str, 
 def _coupon_list(db, coupons: list[dict]) -> None:
     ui.section("Kupony", "filtry · zaznacz wiersz, aby zobaczyć szczegóły")
     now = c.now()
+    versions = st.toggle(
+        "Wersje",
+        key="hist_versions",
+        help="Pokaż też rewizje, aktualizacje kursów i duplikaty — pod kuponem oficjalnym. "
+        "Domyślnie widać kupony oficjalne i kupony użytkownika (te liczą się w statystykach).",
+    )
+    if versions:
+        coupons = _grouped(builder_coupons(db, everything=True))
     newest = newest_variants(db, coupons)
     rows = [{**x, "kind": kind_label(x, now, newest)} for x in reversed(coupons)]
+    if versions:
+        rows.reverse()  # official first, its versions right below
     dates = [datetime.fromisoformat(x["first_start_at"]).date() for x in rows]
     with st.container(key="row-history"):
         cols = st.columns([1.5, 1, 1, 1])
@@ -390,7 +449,8 @@ def _coupon_list(db, coupons: list[dict]) -> None:
         [
             {
                 "Data": c.local_time(x["first_start_at"], "%d.%m.%Y %H:%M"),
-                "Profil": x["proposal"].get("label") or x["profile"],
+                "Profil": ("↳ " if x.get("relation") in VERSIONED else "")
+                + (x["proposal"].get("label") or x["profile"]),
                 "Typ": x["kind"][0],
                 "Mecze": ", ".join(leg["event"] for leg in x["proposal"]["legs"][:2])
                 + (
@@ -432,7 +492,7 @@ def _coupon_list(db, coupons: list[dict]) -> None:
 
 def _coupon_details(db, coupon: dict) -> None:
     payload = coupon["proposal"]
-    outcomes = {r["odds_id"]: r["outcome"] for r in selection_outcomes(db)}
+    outcomes = leg_outcomes(db, coupon["id"])  # this coupon's legs, also for a version
     legs = payload["legs"]
     with st.container(border=True):
         st.markdown(
@@ -469,7 +529,8 @@ def _coupon_details(db, coupon: dict) -> None:
                         "odds": ins.num(leg["odds"]),
                         "chance": f"szansa {ins.pct(leg.get('p_model'))}",
                         "detail": {"win": "trafiony", "loss": "nietrafiony"}.get(
-                            outcomes.get(leg["odds_id"]) or "", "czeka na wynik"
+                            outcomes.get(leg.get("selection_id") or leg["odds_id"]) or "",
+                            "czeka na wynik",
                         ),
                     }
                     for leg in legs
@@ -482,7 +543,10 @@ def _coupon_details(db, coupon: dict) -> None:
                 **coupon,
                 "proposal": {
                     **payload,
-                    "legs": [{**leg, "outcome": outcomes.get(leg["odds_id"])} for leg in legs],
+                    "legs": [
+                        {**leg, "outcome": outcomes.get(leg.get("selection_id") or leg["odds_id"])}
+                        for leg in legs
+                    ],
                 },
             }
             ui.explanation("Analiza wyniku", coupon_review(judged)[:6])
@@ -540,6 +604,30 @@ def _builder_performance(db) -> None:
         "Trafność porównujemy ze średnią przewidywaną szansą rozliczonych kuponów; przedział 95% "
         "(Wilson) pokazuje, jak mało mówi kilka rozliczeń. ROI po współczynniku 0,88 i podatku."
     )
+    versions = coupon_performance(db, versions=True)
+    if versions:
+        with st.expander("Rewizje i aktualizacje kursów — tylko diagnostyka"):
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        {
+                            "Profil": s["label"],
+                            "Wersje": s["coupons"],
+                            "Rozliczone": s["settled"],
+                            "Wygrane": s["wins"],
+                            "Trafność": _pct(s["hit_rate"]),
+                            "ROI": _pct(s["roi"], 1),
+                        }
+                        for s in versions.values()
+                    ]
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+            st.caption(
+                "Późniejsze wersje kuponu dnia (inne nogi albo nowe kursy z nowszego PDF). "
+                "Nie wchodzą do statystyk powyżej — liczy się kupon oficjalny."
+            )
     rows = selection_outcomes(db)
     decided = [r for r in rows if r["outcome"] in {"win", "loss"}]
     st.subheader("Selekcje kreatora")

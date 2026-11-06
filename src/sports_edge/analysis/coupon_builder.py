@@ -101,9 +101,20 @@ def build_coupons(
     cost: CostProfile,
     on_date: date,
     stake: Decimal | None = None,
+    max_profiles_per_selection: int | None = None,
 ) -> BuilderReport:
+    """``max_profiles_per_selection`` (TASK 010; None = the policy's [builder] value, 0 =
+    off): the profiles are built one after another in the order of the policy file
+    (WYSOKA TRAFNOŚĆ, STANDARDOWY, WYŻSZA WYPŁATA, TASIEMKA) and a selection already used by
+    that many coupons is not offered to the next profiles. Thresholds never change."""
     builder = policy.builder
     stake = stake or Decimal(builder["stake"])
+    limit = (
+        int(builder.get("max_profiles_per_selection", 0) or 0)
+        if max_profiles_per_selection is None
+        else int(max_profiles_per_selection)
+    )
+    used: dict[str, int] = {}
     excluded: dict[str, int] = {}
     eligible: list[Candidate] = []
     for candidate in candidates:
@@ -123,7 +134,8 @@ def build_coupons(
         allowed = [
             c
             for c in likely
-            if not profile["require_predictive_validation"] or c.predictive_status == VALIDATED
+            if (not profile["require_predictive_validation"] or c.predictive_status == VALIDATED)
+            and (not limit or used.get(c.selection_id, 0) < limit)
         ]
         size = int(builder["candidates"])
         if int(profile["max_legs"]) > 4:
@@ -164,6 +176,8 @@ def build_coupons(
         ]
         proposals[name] = built[0]
         alternatives[name] = tuple(built[1:])
+        for leg in built[0].legs:  # the diversity limit counts the proposals only
+            used[leg.selection_id] = used.get(leg.selection_id, 0) + 1
     return BuilderReport(proposals, refusals, pool, excluded, codes, alternatives)
 
 

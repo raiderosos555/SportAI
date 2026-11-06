@@ -56,6 +56,7 @@ class ProbabilityPolicy:
     validation: dict
     profiles: dict
     builder: dict
+    official_rule: str = "first"  # TASK 010: which saved coupon is the official one of a day
 
 
 def load_probability_policy(path: Path) -> ProbabilityPolicy:
@@ -65,6 +66,7 @@ def load_probability_policy(path: Path) -> ProbabilityPolicy:
         validation=data["validation"],
         profiles=data["profiles"],
         builder=data["builder"],
+        official_rule=data["policy"].get("official_rule", "first"),
     )
 
 

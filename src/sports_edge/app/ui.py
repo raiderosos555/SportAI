@@ -138,6 +138,8 @@ CSS = Template(
 .se-leg .no { color: var(--se-muted); font-weight: 700; font-variant-numeric: tabular-nums; }
 .se-leg .ev { font-weight: 700; line-height: 1.3; }
 .se-leg .sub { color: var(--se-muted); font-size: .8rem; }
+.se-coupon-status { margin: .35rem 0 .45rem; }
+.se-coupon-status .sub { color: var(--se-muted); font-size: .85rem; margin-top: .2rem; }
 .se-leg .pick { margin-top: .15rem; }
 .se-leg .odds { text-align: right; font-weight: 760; white-space: nowrap;
   font-variant-numeric: tabular-nums; }
@@ -252,6 +254,8 @@ CSS = Template(
 [class*="st-key-row"] div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; row-gap: .75rem; }
 [class*="st-key-row"] div[data-testid="stColumn"] { min-width: min(210px, 100%); }
 [class*="st-key-row-controls"] div[data-testid="stColumn"] { min-width: min(250px, 100%); }
+/* coupon card actions: "DODAJ DO MOJEGO KUPONU" with its icon never cut (TASK 010, 768 px) */
+[class*="st-key-row-actions"] div[data-testid="stColumn"] { min-width: min(290px, 100%); }
 /* two-panel pages: side by side on wide screens, stacked when a panel would be narrow */
 [class*="st-key-split"] div[data-testid="stHorizontalBlock"] { flex-wrap: wrap; row-gap: 1rem; }
 [class*="st-key-split"] div[data-testid="stColumn"] { min-width: min(360px, 100%); }

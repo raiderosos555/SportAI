@@ -53,9 +53,17 @@ def create(
     fingerprint: str = "",
     priority: str | None = None,
     payload: dict | None = None,
+    identity: list | None = None,
 ) -> bool:
-    """Add an alert unless the same fact was already reported (returns True when added)."""
-    alert_id = digest(["alert", kind, event_id, coupon_id, fingerprint or message])
+    """Add an alert unless the same fact was already reported (returns True when added).
+
+    ``identity`` (TASK 010) replaces the default identity of the alert: a fact shared by
+    several coupons (one price or lineup change) is one alert listing those coupons."""
+    alert_id = digest(
+        ["alert", *identity]
+        if identity
+        else ["alert", kind, event_id, coupon_id, fingerprint or message]
+    )
     if store.get("prematch_alerts", alert_id) is not None:
         return False
     store.insert(
