@@ -20,7 +20,10 @@ Funkcje:
 - protokół walidacji v2 (holdout nie decyduje), rozliczanie każdej prognozy, panel
   **Uczenie AI** (champion–challenger, tryb cienia, aktywacja tylko przez użytkownika);
 - analiza meczu prostym językiem: tryb przedmeczowy i pomeczowy;
-- paper trading, automatyczne rozliczenia i panel skuteczności.
+- paper trading, automatyczne rozliczenia i panel skuteczności;
+- ocena prospektywna (TASK 011): kalibracja strefy kuponów (szansa ≥ 60%) liczona na meczach,
+  porównanie z kursami STS sprzed meczu bez marży, panel decyzji champion–challenger,
+  liczbowe „Ryzyko dnia”.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
@@ -31,7 +34,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 010](docs/task_010_report.md).
+Stan i ograniczenia: [raport TASK 011](docs/task_011_report.md).
 
 ## Uruchomienie na Windows
 
@@ -85,7 +88,9 @@ PitchAPI (zalecane): darmowy klucz z pitchapi.dev jako `PITCHAPI_KEY=…` w `.en
   redystrybucji.
 - Limit to 60 zapytań o statystyki na jedno generowanie kuponów (Ustawienia).
 
-Profile kuponów i progi walidacji: `config/probability_policy.toml` (wersjonowane).
+Profile kuponów i progi walidacji: `config/probability_policy.toml` (wersjonowane). Ocena
+prospektywna (próg 30 meczów dla flag, 300 meczów dla werdyktu, wygasanie challengerów po 14
+dniach): `config/prospective_policy.toml` — nie zmienia progów profili ani statusów.
 
 Lokalny model AI do objaśnień kuponu (opcjonalnie, bezpłatnie): zainstaluj Ollamę z
 [ollama.com](https://ollama.com/download/windows), pobierz model jednym poleceniem i włącz go w
@@ -121,6 +126,8 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge learning status             # kompletność danych i statusy modeli
 .\.venv\Scripts\sports-edge lineage                    # TASK 010: kupon oficjalny / duplikaty / wersje (backfill)
 .\.venv\Scripts\sports-edge diversity --time 10:00      # TASK 010: replay as-of z limitem różnicowania 0 / 1 / 2
+.\.venv\Scripts\sports-edge calibration --scope core    # TASK 011: kalibracja strefy kuponów na meczach (JSON)
+.\.venv\Scripts\sports-edge market-benchmark            # TASK 011: zapis porównania z rynkiem STS (append-only)
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
 .\.venv\Scripts\sports-edge demo
@@ -163,15 +170,18 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-356 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+371 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
 klubów, reprezentacje, bramka generatora, harmonogram, kategorie interfejsu; 13 z HOTFIX 009.1:
 własne pule profili generatora, wybór widocznego przycisku i diagnostyka w Playwright;
 18 z TASK 010: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów,
-statystyki i alerty liczone raz, podwójne kliknięcie, migracja v8, `.gitignore`).
-Ścieżki interfejsu: `python -m sports_edge.qa` (25 ścieżek). Zrzuty ekranu:
+statystyki i alerty liczone raz, podwójne kliknięcie, migracja v8, `.gitignore`; 15 z TASK 011:
+kalibracja na meczach i flagi, kurs STS sprzed meczu i usuwanie marży, stany porównania bez
+wartości domyślnych, wygasanie challengerów i statusy Elo, brak treningu na tych samych danych,
+Ryzyko dnia, migracja v9, panel Modeli).
+Ścieżki interfejsu: `python -m sports_edge.qa` (26 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
 768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,
@@ -201,7 +211,7 @@ src/sports_edge/
                   page_models, page_sources, diagnostics (analiza EV), common (cache, formaty),
                   page_my_coupon + cart (Mój kupon), page_generator, page_simulators,
                   page_learning (Uczenie AI)
-  storage.py      SQLite tylko-dopisywanie, migracje do v6 z kopią;  repository.py  importy i widoki
+  storage.py      SQLite tylko-dopisywanie, migracje do v9 z kopią;  repository.py  importy i widoki
   my_coupon.py, advisor.py, explainer.py, llm.py   Mój kupon, ocena AI, pytania, lokalny model (Ollama)
   analysis/generator.py  kupon na kurs;  simulation.py  symulator budżetu i historyczny
   learning.py, retraining.py, ablation.py   historia modeli, przegląd, champion–challenger, ablacja
@@ -214,6 +224,8 @@ src/sports_edge/
   probability_lab.py  Dixon–Coles walk-forward, kalibracja, walidacja predykcyjna, prognozy
   sports_intel.py statystyki meczowe, składy, cechy przedmeczowe as-of (migawki)
   performance.py  skuteczność kuponów i selekcji kreatora
+  prospective_eval.py  TASK 011: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS,
+                  dowody champion–challenger
   insights.py     warstwa prostego języka: wiarygodność, grupy typów A/B/C, powody braku kuponu
   coverage.py     audyt pokrycia oferty STS (wydarzenia, rynki, selekcje, powody braku prognozy)
   provenance.py   stan kodu i snapshot danych;  bookmakers.py  profil STS i reguły rynków
@@ -225,6 +237,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 011](docs/task_011_report.md) | Wiarygodność prognoz: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS, wykonalność szybszego zbierania dowodów, proces challengerów, Ryzyko dnia jako liczba |
 | [Raport TASK 010](docs/task_010_report.md) | Jeden kupon, jedna historia: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów, statystyki bez duplikatów, alerty raz na zmianę, ryzyko dnia |
 | [Raport HOTFIX 009.1](docs/task_009_1_report.md) | Playwright: widoczny przycisk i diagnostyka, pełny cykl workera, odbiór generatora kuponów, CI |
 | [Raport TASK 009](docs/task_009_report.md) | Przebudowa interfejsu (Sports Edge AI 3.0): system projektowy, trzy poziomy informacji, harmonogram przez WWW, testy wizualne Playwright |

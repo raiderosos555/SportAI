@@ -1,0 +1,27 @@
+# TASK 011: prospective evaluation of SETTLED forecasts saved before the match.
+# Separate from probability_policy.toml on purpose: nothing here changes a coupon profile, a
+# validation threshold, a model status or a stored forecast. Flags and comparisons are shown to
+# the user only; promoting a model stays the user's decision.
+[policy]
+version = "2026-11-06.e1"
+
+# Reliability in the coupon zone. The unit is a MATCH: several markets of one match ("home
+# team scores" and "home team over 0.5 goals") are one dependent observation, never two.
+[calibration]
+zone = 0.60                  # the coupon zone: forecast chance >= 60%
+bins = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+min_matches = 30             # N: a range with fewer matches is "za mało meczów" (no flag)
+z = 1.96                     # Wilson interval on matches (95%)
+
+# STS market benchmark (ex post only: an STS price is never a model feature).
+[market]
+min_matches = 300            # common settled matches before a verdict (model better / worse)
+devig = "power"              # margin removal: "power" (primary) or "proportional"
+resamples = 1000             # bootstrap over matches of the log loss difference
+seed = 7
+
+# Champion vs challenger (shadow mode).
+[challengers]
+decision_matches = 300       # common settled matches before the evidence is sufficient
+expiry_days = 14             # a challenger without any common settled match after this many
+                             # days stops blocking the weekly review ("wygasły (brak dowodów)")

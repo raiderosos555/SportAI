@@ -61,9 +61,16 @@ def stats(payload: dict) -> str:
     )
 
 
+def _notes(*parts: str | None) -> str:
+    return " · ".join(p for p in parts if p)
+
+
 def legs(payload: dict, db) -> list[dict]:
     out = []
     for leg in payload["legs"]:
+        lineup = prematch_ui.leg_status(
+            db, leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"])
+        )
         out.append(
             {
                 "event": leg["event"].replace(" - ", " – "),
@@ -84,9 +91,7 @@ def legs(payload: dict, db) -> list[dict]:
                     if leg["predictive_status"] == "validated_predictive"
                     else "eksperymentalny"
                 ),
-                "note": prematch_ui.leg_status(
-                    db, leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"])
-                ),
+                "note": _notes(lineup, c.calibration_note(leg)),  # TASK 011 §2.3
             }
         )
     return out

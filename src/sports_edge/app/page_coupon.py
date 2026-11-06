@@ -258,6 +258,34 @@ def _exposure(proposals: dict) -> dict[str, list[tuple[str, str, tuple]]]:
     return out
 
 
+def risk_numbers(proposals: dict) -> list[str]:
+    """TASK 011 §6: the chance that two or more coupons of the day lose, as a number."""
+    found = ins.day_risk(proposals)
+    if found is None:
+        return []
+    points = [
+        f"Szansa, że przegrają co najmniej dwa kupony dnia: "
+        f"{ins.pct(found['p_two_or_more_lose'])} (na szansach ostrożnych; wspólna selekcja "
+        f"liczona raz). Oczekiwana liczba przegranych kuponów: "
+        f"{ins.num(found['expected_losing'], 2)} z {found['coupons']}.",
+    ]
+    if found["shared_selections"]:
+        points.append(
+            "Gdyby kupony nie miały wspólnych selekcji (były niezależne), ta szansa wynosiłaby "
+            f"{ins.pct(found['independent_two_or_more_lose'])} — wspólne typy zmieniają ryzyko."
+        )
+    basis = "Założenie: różne mecze są niezależne"
+    if found["same_match_pairs"]:
+        basis += (
+            "; różne typy tego samego meczu też liczone jak niezależne — to przybliżenie "
+            "(są skorelowane)"
+        )
+    if found["model_fallback"]:
+        basis += f"; bez szansy ostrożnej (użyto szansy modelu): {found['model_fallback']}"
+    points.append(basis + ". To opis ryzyka, nie rekomendacja stawek.")
+    return points
+
+
 def _day_risk(proposals: dict, exposure: dict) -> None:
     """Ryzyko dnia: matches shared by several coupons — one lost match loses them all."""
     made = [p for p in proposals.values() if p]
@@ -268,16 +296,18 @@ def _day_risk(proposals: dict, exposure: dict) -> None:
         ((event, profiles) for event, profiles in exposure.items() if len(profiles) > 1),
         key=lambda item: -len(item[1]),
     )
+    numbers = risk_numbers(proposals)
     if not shared:
         ui.explanation(
             "Ryzyko dnia",
             [
+                *numbers,
                 "Każdy mecz występuje tylko w jednym kuponie dnia — porażka jednego meczu "
-                "przegrywa najwyżej jeden kupon."
+                "przegrywa najwyżej jeden kupon.",
             ],
         )
         return
-    points = []
+    points = [*numbers]
     for event, profiles in shared:
         labels = ", ".join(label for _p, label, _pick in profiles)
         losing = ins.plural(len(profiles), "kupon", "kupony", "kuponów")

@@ -503,9 +503,9 @@ def test_migration_to_v8_backs_up_and_keeps_every_row(tmp_path):
     raw.commit()
     raw.close()
     migrated = Store(path, backup_dir=tmp_path / "backups")
-    assert SCHEMA_VERSION == 8
+    assert SCHEMA_VERSION >= 8  # TASK 011: v9 adds market_benchmarks on top of v8
     assert migrated.migration_backup is not None and migrated.migration_backup.exists()
-    assert migrated.migration_backup.name.startswith("pre-migration-v8_")
+    assert migrated.migration_backup.name.startswith(f"pre-migration-v{SCHEMA_VERSION}_")
     for table, n in counts.items():
         if table == "schema_migrations":
             continue

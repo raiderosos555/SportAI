@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -38,6 +38,7 @@ MIGRATIONS = {
     6: "TASK 007: model history, prediction settlements, job runs, simulations, LLM usage",
     7: "TASK 008: lineups, absences, pre-match checks, alerts, coupon reassessments, automation",
     8: "TASK 010: coupon lineage — one official coupon per profile and day, versions linked",
+    9: "TASK 011: prospective STS market benchmark of the models (append-only snapshots)",
 }
 
 SCHEMA = """
@@ -302,6 +303,15 @@ CREATE TABLE IF NOT EXISTS automation_events (
  id TEXT PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL, worker_id TEXT,
  detail TEXT NOT NULL DEFAULT '', payload_json TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS market_benchmarks (
+ id TEXT PRIMARY KEY, computed_at TEXT NOT NULL, scope TEXT NOT NULL, family TEXT NOT NULL,
+ market TEXT NOT NULL, matches INTEGER NOT NULL, forecasts INTEGER NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('unknown','insufficient','model_better','model_worse',
+   'no_difference')),
+ policy_version TEXT NOT NULL, data_snapshot TEXT NOT NULL, payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS benchmark_group
+ ON market_benchmarks(scope, family, market, computed_at);
 CREATE INDEX IF NOT EXISTS fixture_event ON provider_fixtures(event_id, provider);
 CREATE INDEX IF NOT EXISTS lineup_event ON lineup_observations(event_id, side, observed_at);
 CREATE INDEX IF NOT EXISTS absence_event ON player_absence_observations(event_id, team_name);
@@ -385,6 +395,9 @@ class Store:
         v8: one new append-only table (``coupon_lineage``); no existing row is touched. The
         lineage of the coupons that already exist is recorded by the application
         (``coupon_store.backfill_lineage``, idempotent).
+        v9: one new append-only table (``market_benchmarks``: prospective comparison of the
+        models with the de-margined STS prices of the same matches); no existing row is
+        touched and ``validation_json`` of the model versions stays as it was.
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

@@ -11,6 +11,7 @@ from collections import Counter
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
+from math import prod
 
 from sports_edge.analysis.coupon_builder import VALIDATED, eligibility
 from sports_edge.analysis.edge_engine import Candidate
@@ -379,3 +380,68 @@ def form_points(team: dict | None) -> list[str]:
             f"{plural(team.get('matches_last_14', 0), 'mecz', 'mecze', 'meczów')} w 14 dni"
         )
     return out
+
+
+# ---------------------------------------------------------------- TASK 011: risk of the day
+
+
+def day_risk(proposals: dict) -> dict | None:
+    """Chance that at least two coupons of the day lose, on CONSERVATIVE leg chances.
+
+    A selection shared by several coupons is ONE event (it wins or loses for all of them);
+    different selections are treated as independent — explicitly an assumption, exact for
+    different matches under the model's independence, an approximation for two different
+    selections of one match (counted in ``same_match_pairs``). Exact by inclusion–exclusion
+    over the coupons: P(a set of coupons all win) is the product over the UNION of their
+    selections. A leg without a conservative chance uses the model chance (counted in
+    ``model_fallback``). No stake is recommended."""
+    coupons = []
+    chances: dict[tuple, float] = {}
+    fallback = 0
+    for name, payload in proposals.items():
+        if not payload or not payload.get("legs"):
+            continue
+        keys = []
+        for leg in payload["legs"]:
+            key = (leg.get("event_id"), leg.get("market_key"), leg.get("line"), leg["selection"])
+            q = leg.get("p_conservative")
+            if q is None:
+                q = leg.get("p_model")
+                fallback += key not in chances
+            if q is None:
+                return None  # a leg without any estimate: the risk cannot be stated
+            chances.setdefault(key, float(q))
+            keys.append(key)
+        coupons.append((name, payload.get("label") or name, frozenset(keys)))
+    m = len(coupons)
+    if m < 2:
+        return None
+
+    def all_win(indices) -> float:
+        union = frozenset().union(*(coupons[i][2] for i in indices))
+        product = 1.0
+        for key in union:
+            product *= chances[key]
+        return product
+
+    everyone = all_win(range(m))
+    exactly_one = sum(all_win([i for i in range(m) if i != j]) - everyone for j in range(m))
+    win = [all_win([i]) for i in range(m)]
+    independent_none = prod(win)
+    independent_one = sum((1 - win[j]) * prod(win[i] for i in range(m) if i != j) for j in range(m))
+    events = Counter(key[0] for key in chances)
+    same_match_pairs = sum(n * (n - 1) // 2 for n in events.values() if n > 1)
+    shared = [key for key in chances if sum(key in c[2] for c in coupons) > 1]
+    return {
+        "coupons": m,
+        "selections": len(chances),
+        "shared_selections": len(shared),
+        "same_match_pairs": same_match_pairs,
+        "model_fallback": fallback,
+        "p_all_win": everyone,
+        "p_two_or_more_lose": max(0.0, 1.0 - everyone - exactly_one),
+        "expected_losing": sum(1 - p for p in win),
+        "independent_two_or_more_lose": max(0.0, 1.0 - independent_none - independent_one),
+        "basis": "szanse ostrożne; wspólna selekcja = jedno zdarzenie; różne selekcje "
+        "niezależne (założenie)",
+    }

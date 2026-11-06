@@ -70,7 +70,7 @@ def fetch_sts(day: str) -> None:
     _print({"duplicate": outcome.duplicate, **outcome.summary})
 
 
-def research(step: str, scope: str = "core") -> None:
+def research(step: str, scope: str = "core", *, force: bool = False) -> None:
     """Independent data and the first experiment; downloads respect the offline setting."""
     from sports_edge import services
     from sports_edge.datasources import openfootball
@@ -105,7 +105,9 @@ def research(step: str, scope: str = "core") -> None:
     elif step == "ablation":
         _print(services.run_ablation(store, paths, now=now, scope=scope))
     elif step == "protocol-v2":
-        found = services.run_protocol_v2(store, paths, now=now, scope=scope, progress=print)
+        found = services.run_protocol_v2(
+            store, paths, now=now, scope=scope, progress=print, force=force
+        )
         _print(
             {
                 "elo_version_id": found["elo"]["version_id"],
@@ -212,6 +214,48 @@ def diversity(days: str | None, at: str) -> None:
     print(json.dumps(found, ensure_ascii=False, indent=1, default=str))
 
 
+def calibration(scope: str | None, min_prob: float, *, market: bool = False) -> None:
+    """TASK 011 §2.4: reliability of the coupon zone counted on MATCHES (JSON, read-only)."""
+    from sports_edge import prospective_eval as pe
+
+    paths, _settings, store = _context()
+    policy = pe.load_policy(paths.config)
+    rows = pe.market_forecasts(store)
+    found = pe.calibration_report(store, policy=policy, scope=scope, min_prob=min_prob, rows=rows)
+    if market:
+        found["market"] = [
+            r
+            for r in pe.market_comparison(store, policy=policy, rows=rows)
+            if scope is None or r["scope"] == scope
+        ]
+    _print(found)
+
+
+def market_benchmark() -> None:
+    """TASK 011 §3: record the prospective STS market benchmark (append-only, idempotent)."""
+    from sports_edge import prospective_eval as pe
+
+    paths, _settings, store = _context()
+    policy = pe.load_policy(paths.config)
+    recorded = pe.record_market_benchmarks(store, now=datetime.now(UTC), policy=policy)
+    rows = pe.market_comparison(store, policy=policy)
+    _print({**recorded, "groups": [{k: r[k] for k in BENCHMARK_FIELDS} for r in rows]})
+
+
+BENCHMARK_FIELDS = (
+    "scope",
+    "family",
+    "market",
+    "matches",
+    "state",
+    "state_label",
+    "model_log_loss",
+    "market_log_loss",
+    "difference",
+    "ci95",
+)
+
+
 def learning(action: str, *, force: bool = False) -> None:
     """Model review, catch-up and status reports (automation itself runs from the web UI)."""
     from sports_edge import collection, retraining, services
@@ -289,6 +333,11 @@ def main() -> None:
     res.add_argument(
         "--scope", choices=["core", "extended"], default="core", help="model scope (leagues)"
     )
+    res.add_argument(
+        "--force",
+        action="store_true",
+        help="protocol-v2: train even without new matches since the champion (marked)",
+    )
     ana = commands.add_parser(
         "analyse", help="GENERUJ KUPONY DNIA without the interface (14 stages, saved proposals)"
     )
@@ -308,6 +357,15 @@ def main() -> None:
     )
     div.add_argument("--days", help="YYYY-MM-DD,YYYY-MM-DD (default: every past offer day)")
     div.add_argument("--time", default="10:00", help="decision time, Warsaw (default 10:00)")
+    cal = commands.add_parser(
+        "calibration", help="TASK 011: coupon-zone reliability counted on matches (JSON)"
+    )
+    cal.add_argument("--scope", choices=["core", "extended"], help="model scope (default: all)")
+    cal.add_argument("--min-prob", type=float, default=0.6, help="lowest range (default 0.6)")
+    cal.add_argument("--market", action="store_true", help="add the STS market benchmark")
+    commands.add_parser(
+        "market-benchmark", help="TASK 011: record the prospective STS market benchmark"
+    )
     args = parser.parse_args()
     if args.command == "demo":
         demo()
@@ -322,7 +380,7 @@ def main() -> None:
     elif args.command == "check":
         sys.exit(check())
     elif args.command == "research":
-        research(args.step, args.scope)
+        research(args.step, args.scope, force=args.force)
     elif args.command == "analyse":
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
     elif args.command == "learning":
@@ -331,6 +389,10 @@ def main() -> None:
         lineage()
     elif args.command == "diversity":
         diversity(args.days, args.time)
+    elif args.command == "calibration":
+        calibration(args.scope, args.min_prob, market=args.market)
+    elif args.command == "market-benchmark":
+        market_benchmark()
 
 
 if __name__ == "__main__":

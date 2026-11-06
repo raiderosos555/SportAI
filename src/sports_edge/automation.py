@@ -606,9 +606,12 @@ def job_coupon_reassessment(store, paths, *, now, settings) -> JobOutcome:
 
 def job_quality(store, paths, *, now, settings) -> JobOutcome:
     from sports_edge import forecast_quality as fq
+    from sports_edge import prospective_eval as pe
 
     rows = fq.items(store)
     markets = fq.by_market(rows)
+    # TASK 011: the prospective STS market benchmark, appended once per data state
+    benchmark = pe.record_market_benchmarks(store, now=now, policy=pe.load_policy(paths.config))
     return JobOutcome(
         "ok",
         "",
@@ -618,6 +621,7 @@ def job_quality(store, paths, *, now, settings) -> JobOutcome:
                 k: {"matches": v["matches"], "log_loss": v["log_loss"], "ece": v["ece"]}
                 for k, v in markets.items()
             },
+            "market_benchmark": benchmark,
         },
     )
 

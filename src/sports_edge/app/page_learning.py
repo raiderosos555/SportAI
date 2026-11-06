@@ -12,6 +12,7 @@ import streamlit as st
 from sports_edge import forecast_quality as fq
 from sports_edge import insights as ins
 from sports_edge import learning, retraining
+from sports_edge import prospective_eval as pe
 from sports_edge.app import advanced_ui, ui
 from sports_edge.app import common as c
 from sports_edge.collection import completeness
@@ -39,6 +40,8 @@ STATUS_TONE = {
     "Aktywowany": "ok",
     "Przywrócono starszą wersję": "info",
 }
+EVIDENCE_TONE = {"none": "neutral", "identical": "warn", "waiting": "info", "sufficient": "ok"}
+FLAG_TONE = {"optimistic": "bad", "cautious": "warn", "ok": "ok", "insufficient": "neutral"}
 FAMILY_LABEL = {"elo": "Elo (1X2, podwójna szansa)", "goals": "Dixon–Coles (gole i rynki)"}
 
 
@@ -65,6 +68,8 @@ def learning_panel() -> None:
     for scope in MODEL_SCOPES:
         _scope(db, scope, now)
     _review(db, now)
+    zone_panel()
+    market_panel()
     _quality(db, now)
     _coupons(db)
     advanced_ui.engine_panel()
@@ -81,7 +86,8 @@ def _scope(db, scope: str, now) -> None:
     status = retraining.scope_status(db, scope, now=now)
     ui.section(SCOPE_LABELS[scope].capitalize(), "champion i challenger")
     ui.pills([(status, STATUS_TONE.get(status, "neutral"))])
-    compared = retraining.comparison(db, scope)
+    compared = retraining.comparison(db, scope, now=now)
+    _decision_table(compared)
     cards = []
     for key, entry in compared.items():
         champion, challenger = entry["champion"], entry["challenger"]
@@ -209,6 +215,12 @@ def _versions(db, scope: str) -> None:
 
 def _train(scope: str) -> None:
     """Training on demand: new versions become challengers; activation stays with the user."""
+    force = st.checkbox(
+        "Wymuś trening także bez nowych meczów (challenger zostanie oznaczony jako wymuszony)",
+        key=f"learn_force_{scope}",
+        help="Bez nowych meczów od treningu aktywnej wersji challenger miałby te same dane — "
+        "domyślnie trening jest wtedy odrzucany (TASK 011).",
+    )
     if st.button(
         f"Trenuj teraz — {SCOPE_LABELS[scope]}",
         key=f"learn_train_{scope}",
@@ -218,7 +230,14 @@ def _train(scope: str) -> None:
     ):
         with st.status("Trening w toku…", expanded=True) as box:
             try:
-                train_now(c.store(), c.paths(), now=c.now(), scope=scope, progress=box.write)
+                train_now(
+                    c.store(),
+                    c.paths(),
+                    now=c.now(),
+                    scope=scope,
+                    progress=box.write,
+                    force=force,
+                )
             except ValueError as error:
                 box.update(label="Trening nieudany", state="error")
                 st.error(str(error))
@@ -226,6 +245,215 @@ def _train(scope: str) -> None:
             box.update(label="Walidacja zakończona — challengery gotowe", state="complete")
         st.cache_data.clear()
         st.rerun()
+
+
+def _statuses(entry: dict) -> str:
+    if not entry:
+        return "—"
+    statuses = entry.get("statuses") or {}
+    if not statuses:
+        return "brak pomiaru statusów"
+    validated = sorted(k for k, v in statuses.items() if v == "validated_predictive")
+    other = sorted(k for k, v in statuses.items() if v != "validated_predictive")
+    return (
+        "zwalidowane: "
+        + (", ".join(validated) or "—")
+        + " · eksperymentalne: "
+        + (", ".join(other) or "—")
+    )
+
+
+def _window(entry: dict) -> str:
+    decision = entry.get("decision") or {}
+    if not decision:
+        return "—" if not entry else f"protokół {entry.get('protocol')} (bez okna selekcji)"
+    return (
+        f"n={decision.get('n')} · log loss {ins.num(decision.get('log_loss'), 5)} · "
+        f"ECE {ins.num(decision.get('ece'), 4)}"
+    )
+
+
+def _holdout(entry: dict) -> str:
+    holdout = entry.get("holdout") or {}
+    if not holdout:
+        return "—"
+    return f"n={holdout.get('n')} · log loss {ins.num(holdout.get('log_loss'), 4)}"
+
+
+def _difference(pro: dict) -> str:
+    ci = pro.get("ci95")
+    if not ci:
+        return "—"
+    return f"{ins.num(pro['difference'], 4)} ({ins.num(ci[0], 4)}…{ins.num(ci[1], 4)})"
+
+
+def _decision_table(compared: dict) -> None:
+    """TASK 011 §5.1: champion and challenger side by side with the state of the evidence."""
+    rows = []
+    for key, entry in compared.items():
+        champion, challenger = entry["champion"], entry["challenger"]
+        pro = entry.get("prospective") or {}
+        for role, version in (("aktywna", champion), ("challenger", challenger)):
+            if role == "challenger" and not version:
+                continue
+            rows.append(
+                {
+                    "Model": FAMILY_LABEL[key],
+                    "Rola": role,
+                    "Wersja": (version or {}).get("version", "—"),
+                    "Okno selekcji": _window(version or {}),
+                    "Holdout (tylko raport)": _holdout(version or {}),
+                    "Statusy rynków": _statuses(version or {}),
+                    "Wspólne rozliczone mecze": str(pro.get("matches", 0)) if challenger else "—",
+                    "Różnica log loss (95%)": _difference(pro) if role == "challenger" else "—",
+                    "Stan": entry["state_label"],
+                }
+            )
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    ui.pills(
+        [
+            (f"{FAMILY_LABEL[key]}: {entry['state_label']}", EVIDENCE_TONE[entry["state"]])
+            for key, entry in compared.items()
+        ]
+    )
+    st.caption(
+        "Różnica: log loss challengera minus aktywnej wersji na tych samych meczach (ujemna = "
+        "challenger lepszy); przedział z bootstrapu po meczach. Aktywacja zawsze należy do "
+        "Ciebie — system nigdy nie aktywuje modelu sam. Challenger bez wspólnych rozliczonych "
+        "meczów po 14 dniach albo zastąpiony nowszym wygasa przy przeglądzie i przestaje "
+        "blokować trening."
+    )
+
+
+def _zone_frame(rows: list[dict], minimum: int) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Model": pe.FAMILY_LABELS.get(r["family"], r["family"]),
+                "Rynek": pe.market_label(r["market"]),
+                "Przedział szansy": r["range"],
+                "Mecze (n)": r["matches"],
+                "Selekcje": r["selections"],
+                "Średnia szansa": ins.pct(r["mean_p"]),
+                "Trafność": ins.pct(r["freq"]),
+                "95% (na meczach)": f"{ins.pct(r['ci95'][0])}–{ins.pct(r['ci95'][1])}",
+                "Ocena": r["flag_label"]
+                if r["flag"] != "insufficient"
+                else f"za mało meczów (n < {minimum})",
+            }
+            for r in rows
+        ]
+    )
+
+
+def zone_panel() -> None:
+    """TASK 011 §2.3: reliability of the coupon zone (chance ≥ 60%) counted on MATCHES."""
+    evaluation = c.evaluation()
+    found, policy = evaluation["calibration"], evaluation["policy"]
+    ui.section(
+        "Strefa kuponów — kalibracja prospektywna",
+        f"szansa ≥ {ins.pct(policy['zone'], 0)}, liczone na meczach (nie na selekcjach)",
+    )
+    if not found["rows"]:
+        ui.empty_state(
+            "Brak rozliczonych prognoz w strefie kuponów",
+            "Tabela pojawi się po wynikach meczów z prognozą zapisaną przed meczem.",
+        )
+        return
+    cols = st.columns(2)
+    scope = cols[0].selectbox(
+        "Zakres lig",
+        ["all", "core", "extended"],
+        format_func=lambda k: pe.SCOPE_LABELS[k],
+        key="zone_scope",
+    )
+    role = cols[1].selectbox(
+        "Wersje", ["active", "shadow"], format_func=lambda k: pe.ROLE_LABELS[k], key="zone_role"
+    )
+    chosen = [
+        r
+        for r in found["rows"]
+        if r["scope"] == scope and r["role"] == role and (r["in_zone"] or r["zone_total"])
+    ]
+    minimum = found["min_matches"]
+    coupon = [r for r in chosen if r["coupon_market"]]
+    if coupon:
+        st.dataframe(_zone_frame(coupon, minimum), hide_index=True, width="stretch")
+    else:
+        st.caption("Brak rozliczonych selekcji tej grupy w strefie kuponów.")
+    flagged = [r for r in coupon if r["flag"] in ("optimistic", "cautious") and not r["zone_total"]]
+    ui.pills(
+        [
+            (
+                f"{pe.market_label(r['market'])} {r['range']}: {r['flag_label']}",
+                FLAG_TONE[r["flag"]],
+            )
+            for r in flagged
+        ]
+        or [("Brak flag w strefie kuponów", "ok")]
+    )
+    other = [r for r in chosen if not r["coupon_market"]]
+    if other:
+        with st.expander("Pozostałe rynki (bez przedziału ostrożnego — nie trafiają do kuponów)"):
+            st.dataframe(_zone_frame(other, minimum), hide_index=True, width="stretch")
+    st.caption(
+        "Jednostka to mecz: kilka rynków jednego meczu (np. „gospodarz strzeli” i „gospodarz "
+        "powyżej 0,5”) to jedna zależna obserwacja — w przedziale mecz wnosi średnią szansę i "
+        "średni wynik swoich selekcji. Przedział Wilsona 95% liczony na meczach (konserwatywny). "
+        f"Flaga „zbyt optymistyczna” wymaga co najmniej {minimum} meczów i górnej granicy "
+        "poniżej średniej szansy; flaga niczego nie zmienia w prognozach, progach ani statusach "
+        "— jest informacją przy typach."
+    )
+
+
+def _market_frame(rows: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "Model": pe.FAMILY_LABELS.get(r["family"], r["family"]),
+                "Rynek": pe.market_label(r["market"]),
+                "Wspólne mecze": r["matches"],
+                "Log loss modelu": r["model_log_loss"],
+                "Log loss rynku STS": r["market_log_loss"],
+                "Różnica (95%)": _difference(r),
+                "Brier model / rynek": f"{ins.num(r['model_brier'], 4)} / "
+                f"{ins.num(r['market_brier'], 4)}"
+                if r["model_brier"] is not None
+                else "—",
+                "Stan": r["state_label"],
+            }
+            for r in rows
+        ]
+    )
+
+
+def market_panel() -> None:
+    """TASK 011 §3: the model against the de-margined STS price of the same matches."""
+    rows = c.evaluation()["market"]
+    ui.section(
+        "Porównanie z rynkiem STS",
+        "prospektywnie: te same rozliczone mecze, kurs z ostatniego dokumentu STS przed meczem",
+    )
+    scope = st.selectbox(
+        "Zakres lig",
+        ["all", "core", "extended"],
+        format_func=lambda k: pe.SCOPE_LABELS[k],
+        key="market_scope",
+    )
+    chosen = [
+        r
+        for r in rows
+        if r["scope"] == scope
+        and (r["market"] == pe.POOLED or r["market"] in pe.COUPON_MARKETS.get(r["family"], ()))
+    ]
+    st.dataframe(_market_frame(chosen), hide_index=True, width="stretch")
+    st.caption(
+        "Marża usunięta metodą „power” (p = (1/kurs)^k, suma 1) — ostrzejszy wzorzec niż "
+        "proporcjonalny w strefie faworytów; wynik metody proporcjonalnej jest zapisany jako "
+        "kontrola. Różnica = log loss modelu − rynku (ujemna: model lepszy). Werdykt dopiero "
+        "od 300 wspólnych meczów; brak wspólnych meczów to „nieznane”, nigdy „false”. Kurs "
+        "służy wyłącznie do oceny po fakcie — nigdy nie jest cechą modelu."
+    )
 
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=8)
@@ -319,8 +547,21 @@ def _quality(db, now) -> None:
         )
     left, right = st.columns(2, gap="large")
     with left:
-        st.markdown("**Kalibracja wg przedziału szansy (wszystkie rynki)**")
-        st.dataframe(pd.DataFrame(fq.calibration(rows)), hide_index=True, width="stretch")
+        st.markdown("**Kalibracja wg przedziału szansy (wszystkie rynki, na selekcjach)**")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {k: v for k, v in r.items() if k != "flag"}  # TASK 011: flags on matches only
+                    for r in fq.calibration(rows)
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            "Liczone na selekcjach: rynki jednego meczu nie są niezależne, więc przedziały są "
+            "tu zbyt wąskie. Ocenę i flagi daje sekcja „Strefa kuponów” — liczona na meczach."
+        )
     with right:
         st.markdown("**Kupony: SOLO, AKO i profile**")
         split = fq.coupon_split(builder_coupons(db))

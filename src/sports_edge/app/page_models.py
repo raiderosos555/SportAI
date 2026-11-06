@@ -8,6 +8,7 @@ import streamlit as st
 
 from sports_edge import insights as ins
 from sports_edge import learning
+from sports_edge import prospective_eval as pe
 from sports_edge.app import common as c
 from sports_edge.app import international_ui as iui
 from sports_edge.app import ui
@@ -17,6 +18,7 @@ from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.models.registry import model_overview
 from sports_edge.services import (
     ELO_FAMILY,
+    GOALS_FAMILY,
     MODEL_SCOPES,
     SCOPE_LABELS,
     active_versions,
@@ -62,6 +64,7 @@ def _basic() -> None:
         ui.empty_state("Brak modeli", "Uruchom analizę albo eksperyment w trybie zaawansowanym.")
         return
     waiting = challenger_versions(db)
+    benchmark = {(r["scope"], r["family"], r["market"]): r for r in c.evaluation()["market"]}
     st.caption(
         "„Zwalidowany” oznacza potwierdzoną trafność i kalibrację na nowych meczach (okno "
         "selekcji protokołu v2). To nie jest gwarancja trafienia ani zysku."
@@ -93,6 +96,13 @@ def _basic() -> None:
             validated = info.get("status") == "validated_predictive" and not suspended
             skill = info.get("skill_vs_baseline")
             challenger = (waiting.get(name) or {}).get("elo" if model == "elo" else "goals")
+            versus = benchmark.get(
+                (
+                    name,
+                    ELO_FAMILY if model == "elo" else GOALS_FAMILY,
+                    family.replace("total_", "total "),
+                )
+            )
             rows.append(
                 [
                     label,
@@ -102,6 +112,7 @@ def _basic() -> None:
                     f"{skill * 100:+.1f}%".replace(".", ",") if skill is not None else None,
                     ins.num(cal.get("ece"), 3) if cal.get("ece") is not None else None,
                     "czeka na decyzję" if challenger else "—",
+                    versus["state_label"] if versus else pe.state_label("unknown"),
                 ]
             )
             if skill is not None:
@@ -123,6 +134,7 @@ def _basic() -> None:
                     "Przewaga nad częstością",
                     "Kalibracja (ECE)",
                     "Challenger",
+                    "Porównanie z rynkiem STS",
                 ],
                 rows,
                 numeric=(3, 4, 5),
@@ -131,6 +143,12 @@ def _basic() -> None:
         )
         if chart:
             _skill_chart(chart)
+        st.caption(
+            "Porównanie z rynkiem STS: prospektywnie, na tych samych rozliczonych meczach, z "
+            "kursem sprzed meczu bez marży (szczegóły: widok Uczenie AI). Raporty walidacji "
+            "historycznej nie mają takiego pomiaru (brak legalnych historycznych kursów), więc "
+            "ich „beats_market: false” to wartość domyślna, a nie wynik."
+        )
         with ui.details(f"Szczegółowe miary i kalibracja — {SCOPE_LABELS[name]}"):
             _details(details)
     ui.section("Dyscypliny")

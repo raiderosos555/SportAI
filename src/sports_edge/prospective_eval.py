@@ -1,0 +1,810 @@
+"""Prospective reliability, STS market benchmark and challenger evidence (TASK 011).
+
+Everything here is computed from SETTLED PROSPECTIVE forecasts — saved before the match and
+settled from recorded results — and changes nothing: no forecast, threshold, model status or
+coupon. The only write is ``record_market_benchmarks`` (new append-only rows).
+
+THE UNIT IS A MATCH. Markets of one match are one dependent observation ("home team scores"
+and "home team over 0.5 goals" are the same event), so every sample size below counts
+matches, not selections:
+
+* RELIABILITY (coupon zone, chance >= 60%): selections are grouped by role (served version
+  or challenger in shadow mode), scope of leagues, model family, market with its line and a
+  10-point range of the forecast. Inside a group each match contributes ONE pair: the mean
+  forecast and the mean outcome of its selections in that range. ``n`` is the number of
+  matches; the 95% Wilson interval uses the matches as trials and the sum of the per-match
+  means as successes. When the selections of a match are perfectly correlated the per-match
+  mean is 0 or 1 and the interval is exact; when they are less correlated the true variance
+  is smaller, so the interval is conservative (wider). A range with at least ``min_matches``
+  matches whose upper bound is below the mean forecast is "zbyt optymistyczna" (the reverse
+  "zbyt ostrożna"); fewer matches: "za mało meczów". A flag is information only.
+* STS MARKET BENCHMARK: for a settled forecast the STS price of the same match and market is
+  taken from the LAST STS document generated before the kick-off (``quote_sets.valid_at`` —
+  the time printed in the document — strictly before ``events.start_at``; only rows with
+  status ``ok``; a document from after the start is never used). The margin is removed with
+  the POWER method (p_i = (1/o_i)^k, k such that the sum is 1): unlike the proportional
+  method it does not hand the favourites a proportional share of the margin, which would
+  make the market look worse exactly in the coupon zone (favourite–longshot bias), so it is
+  the stricter benchmark for the model; the proportional result is kept as a sensitivity
+  check. Log loss and Brier of the model and of the market on the SAME forecasts, the
+  difference per match and its 95% bootstrap interval over matches. No common match is
+  "nieznane", fewer than ``min_matches`` matches "za mało" — never a default "false".
+  The price is a benchmark ex post only and never a model feature (leakage_prevention.md).
+* CHAMPION vs CHALLENGER: the same comparison between two versions on common matches.
+
+Double chance follows from the 1X2 forecast of the same version, so pooled log loss
+comparisons ("all markets", champion vs challenger) count it once, through 1X2.
+"""
+
+import json
+import math
+import random
+import tomllib
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+
+from sports_edge import collection, learning
+from sports_edge.ingestion.types import canonical, digest, iso
+from sports_edge.models.calibration import wilson_interval
+from sports_edge.storage import Store
+
+POLICY_FILE = "prospective_policy.toml"
+ELO = "elo_ordered_draw"
+GOALS = "dixon_coles_goals"
+FAMILY_LABELS = {ELO: "Elo", GOALS: "Dixon–Coles"}
+ROLE_LABELS = {"active": "aktywna wersja", "shadow": "challenger (tryb cienia)"}
+SCOPE_LABELS = {"all": "wszystkie ligi", "core": "5 czołowych lig", "extended": "7 lig"}
+MARKET_LABELS = {
+    "1x2": "1X2",
+    "double_chance": "Podwójna szansa",
+    "total": "Gole",
+    "btts": "Obie strzelą",
+    "home_to_score": "Gospodarz strzeli",
+    "away_to_score": "Gość strzeli",
+    "team_total_home": "Gole gospodarza",
+    "team_total_away": "Gole gościa",
+}
+POOLED = "*"  # all markets of a family together (still one observation per match)
+# Markets whose selections can enter a coupon (they have a calibrated interval, i.e. a
+# conservative estimate). Other markets are evaluated too, but shown apart.
+COUPON_MARKETS = {
+    ELO: ("1x2", "double_chance"),
+    GOALS: ("1x2", "double_chance", "total 1.5", "total 2.5", "total 3.5", "btts"),
+}
+FLAG_LABELS = {
+    "optimistic": "zbyt optymistyczna",
+    "cautious": "zbyt ostrożna",
+    "ok": "zgodna z prognozą",
+    "insufficient": "za mało meczów",
+}
+STATES = ("unknown", "insufficient", "model_better", "model_worse", "no_difference")
+EPS = 1e-6
+DC_PARTS = {
+    "home_draw": ("home", "draw"),
+    "draw_away": ("draw", "away"),
+    "home_away": ("home", "away"),
+}
+
+
+@dataclass(frozen=True)
+class EvalPolicy:
+    version: str = "2026-11-06.e1"
+    zone: float = 0.60
+    bins: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
+    min_matches: int = 30
+    z: float = 1.96
+    market_min_matches: int = 300
+    devig: str = "power"
+    resamples: int = 1000
+    seed: int = 7
+    decision_matches: int = 300
+    expiry_days: int = 14
+
+
+def load_policy(config: Path | None = None) -> EvalPolicy:
+    """The policy file of the project (``config/prospective_policy.toml``); the defaults
+    above when it is missing (a home created before TASK 011)."""
+    if config is None:
+        from sports_edge.settings import AppPaths, project_root
+
+        config = AppPaths(project_root()).config
+    path = Path(config) / POLICY_FILE
+    if not path.is_file():
+        return EvalPolicy()
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    cal, market, chal = data["calibration"], data["market"], data["challengers"]
+    return EvalPolicy(
+        version=data["policy"]["version"],
+        zone=float(cal["zone"]),
+        bins=tuple(float(b) for b in cal["bins"]),
+        min_matches=int(cal["min_matches"]),
+        z=float(cal["z"]),
+        market_min_matches=int(market["min_matches"]),
+        devig=str(market["devig"]),
+        resamples=int(market["resamples"]),
+        seed=int(market["seed"]),
+        decision_matches=int(chal["decision_matches"]),
+        expiry_days=int(chal["expiry_days"]),
+    )
+
+
+# ---------------------------------------------------------------- forecasts
+
+
+def scope_of(competition: str | None) -> str | None:
+    from sports_edge.services import MODEL_SCOPES
+
+    return next((name for name, codes in MODEL_SCOPES.items() if competition in codes), None)
+
+
+def market_name(market_key: str, line: str | None) -> str:
+    return f"{market_key} {line}" if line else market_key
+
+
+def market_label(market: str) -> str:
+    if market == POOLED:
+        return "Wszystkie rynki razem"
+    key, _, line = market.partition(" ")
+    label = MARKET_LABELS.get(key, key)
+    return f"{label} {line.replace('.', ',')}" if line else label
+
+
+def _families(store: Store) -> dict[str, str]:
+    return {
+        r["id"]: r["family"]
+        for r in store.rows(
+            "SELECT v.id, m.family FROM model_versions v JOIN models m ON m.id=v.model_id"
+        )
+    }
+
+
+def _elo_double_chance(probabilities: dict, outcomes: dict) -> tuple[dict, dict] | None:
+    if not all(k in probabilities for k in ("home", "draw", "away")):
+        return None
+    known = all(outcomes.get(k) is not None for k in ("home", "draw", "away"))
+    return (
+        {sel: probabilities[a] + probabilities[b] for sel, (a, b) in DC_PARTS.items()},
+        {
+            sel: (int(bool(outcomes[a] or outcomes[b])) if known else None)
+            for sel, (a, b) in DC_PARTS.items()
+        },
+    )
+
+
+def market_forecasts(store: Store) -> list[dict]:
+    """One row per settled prospective MARKET forecast of a version: the latest forecast
+    made before the start of each (version, match, market, line). Double chance is a market
+    of its own (shipped by Dixon–Coles, derived from the same 1X2 for Elo).
+
+    ``role``: "active" — the version was served when the forecast was made; "shadow" — a
+    challenger that was not served (shadow mode). Versions with neither role (e.g. a
+    research experiment spanning several scopes) are left out."""
+    served = learning.served_check(store)
+    challengers = {
+        e["model_version_id"] for e in learning.events(store) if e["kind"] == "challenger_ready"
+    }
+    families = _families(store)
+    latest: dict[tuple, dict] = {}
+    for row in collection.settled_forecasts(store):
+        if row["status"] != "settled":
+            continue
+        predicted = datetime.fromisoformat(row["predicted_at"])
+        if row["start_at"] is None or predicted >= datetime.fromisoformat(row["start_at"]):
+            continue
+        version = row["model_version_id"]
+        role = (
+            "active" if served(version, predicted) else "shadow" if version in challengers else None
+        )
+        if role is None:
+            continue
+        family = families.get(version)
+        competition = row["inputs"].get("competition")
+        outcomes = row["outcome"].get("selections") or {}
+        groups = [(row["market_key"], row["line"], row["probabilities"], outcomes)]
+        for key, value in (row["uncertainty"].get("derived") or {}).items():
+            groups.append(
+                (
+                    key,
+                    None,
+                    value.get("calibrated") or {},
+                    (row["outcome"].get("derived") or {}).get(key) or {},
+                )
+            )
+        if row["market_key"] == "1x2" and "double_chance" not in {g[0] for g in groups}:
+            found = _elo_double_chance(row["probabilities"], outcomes)
+            if found:
+                groups.append(("double_chance", None, *found))
+        for market_key, line, probabilities, result in groups:
+            key = (version, row["event_id"], market_key, line)
+            current = latest.get(key)
+            if current is not None and current["predicted_at"] >= row["predicted_at"]:
+                continue
+            latest[key] = {
+                "prediction_id": row["prediction_id"],
+                "version": version,
+                "role": role,
+                "family": family,
+                "match": row["event_id"],
+                "competition": competition,
+                "scope": scope_of(competition),
+                "league": row["league"],
+                "market_key": market_key,
+                "line": line,
+                "market": market_name(market_key, line),
+                "probabilities": {k: float(v) for k, v in probabilities.items() if v is not None},
+                "outcomes": dict(result),
+                "predicted_at": row["predicted_at"],
+                "start_at": row["start_at"],
+            }
+    return list(latest.values())
+
+
+def _role_forecasts(rows: list[dict], role: str) -> list[dict]:
+    """Forecasts of one role, one per (family, match, market): the newest version wins."""
+    best: dict[tuple, dict] = {}
+    for row in rows:
+        if row["role"] != role:
+            continue
+        key = (row["family"], row["match"], row["market"])
+        if key not in best or best[key]["predicted_at"] < row["predicted_at"]:
+            best[key] = row
+    return list(best.values())
+
+
+# ---------------------------------------------------------------- reliability
+
+
+def _bin(p: float, bins: tuple[float, ...]) -> tuple[float, float] | None:
+    for lo, hi in zip(bins, bins[1:], strict=False):
+        if lo <= p < hi or (hi == bins[-1] and p == hi):
+            return lo, hi
+    return None
+
+
+def _range_label(lo: float, hi: float) -> str:
+    return f"{lo * 100:.0f}–{hi * 100:.0f}%"
+
+
+def selections(rows: list[dict], policy: EvalPolicy) -> list[dict]:
+    """Settled selections with a forecast in the reported ranges (>= the first bin)."""
+    out = []
+    for row in rows:
+        for sel, p in row["probabilities"].items():
+            y = row["outcomes"].get(sel)
+            if y is None or p < policy.bins[0]:
+                continue
+            out.append(
+                {
+                    **{k: row[k] for k in ("role", "family", "scope", "market", "match")},
+                    "selection": sel,
+                    "p": p,
+                    "y": int(y),
+                }
+            )
+    return out
+
+
+def _cell(part: list[dict], policy: EvalPolicy) -> dict:
+    """Match-level reliability of a group of selections (see the module docstring)."""
+    by_match: dict[str, list[dict]] = defaultdict(list)
+    for item in part:
+        by_match[item["match"]].append(item)
+    means = [
+        (sum(i["p"] for i in items) / len(items), sum(i["y"] for i in items) / len(items))
+        for items in by_match.values()
+    ]
+    n = len(means)
+    mean_p = sum(p for p, _ in means) / n
+    freq = sum(y for _, y in means) / n
+    low, high = wilson_interval(sum(y for _, y in means), n, z=policy.z)
+    if n < policy.min_matches:
+        flag = "insufficient"
+    elif high < mean_p:
+        flag = "optimistic"
+    elif low > mean_p:
+        flag = "cautious"
+    else:
+        flag = "ok"
+    return {
+        "matches": n,
+        "selections": len(part),
+        "mean_p": round(mean_p, 4),
+        "freq": round(freq, 4),
+        "ci95": [round(low, 4), round(high, 4)],
+        "gap": round(freq - mean_p, 4),
+        "flag": flag,
+        "flag_label": FLAG_LABELS[flag],
+    }
+
+
+def reliability(items: list[dict], policy: EvalPolicy) -> list[dict]:
+    """Rows per (role, scope, family, market, range) plus the whole zone (>= ``zone``) of
+    every group; ``scope`` "all" pools both scopes and ``market`` "*" all markets."""
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for item in items:
+        for scope in ("all", item["scope"]):
+            for market in (item["market"], POOLED):
+                groups[(item["role"], scope, item["family"], market)].append(item)
+    out = []
+    for (role, scope, family, market), part in sorted(groups.items(), key=lambda kv: kv[0]):
+        if scope is None:
+            continue
+        ranges: dict[tuple, list[dict]] = defaultdict(list)
+        for item in part:
+            found = _bin(item["p"], policy.bins)
+            if found:
+                ranges[found].append(item)
+        cells = [(lo, hi, _range_label(lo, hi), ranges[(lo, hi)]) for lo, hi in sorted(ranges)]
+        zone = [i for i in part if i["p"] >= policy.zone]
+        if zone:
+            cells.append((policy.zone, 1.0, f"strefa kuponów ≥ {policy.zone * 100:.0f}%", zone))
+        for lo, hi, label, cell in cells:
+            out.append(
+                {
+                    "role": role,
+                    "scope": scope,
+                    "family": family,
+                    "market": market,
+                    "range": label,
+                    "low": lo,
+                    "high": hi,
+                    "zone_total": label.startswith("strefa"),
+                    "in_zone": lo >= policy.zone,
+                    "coupon_market": market == POOLED or market in COUPON_MARKETS.get(family, ()),
+                    **_cell(cell, policy),
+                }
+            )
+    return out
+
+
+def calibration_report(
+    store: Store,
+    *,
+    policy: EvalPolicy | None = None,
+    scope: str | None = None,
+    min_prob: float | None = None,
+    rows: list[dict] | None = None,
+) -> dict:
+    """Reliability of the coupon zone (CLI ``sports-edge calibration`` and the panels)."""
+    policy = policy or load_policy()
+    rows = market_forecasts(store) if rows is None else rows
+    items = []
+    for role in ("active", "shadow"):
+        items += selections(_role_forecasts(rows, role), policy)
+    table = reliability(items, policy)
+    if scope:
+        table = [r for r in table if r["scope"] == scope]
+    if min_prob is not None:
+        table = [r for r in table if r["low"] >= min_prob - 1e-9 or r["zone_total"]]
+    flagged = [r for r in table if r["flag"] in ("optimistic", "cautious") and not r["zone_total"]]
+    return {
+        "policy_version": policy.version,
+        "unit": "mecz (rynki jednego meczu = jedna obserwacja zależna)",
+        "interval": f"Wilson {policy.z} na meczach: sukcesy = suma średnich wyników meczów",
+        "min_matches": policy.min_matches,
+        "zone": policy.zone,
+        "matches": len({r["match"] for r in rows}),
+        "forecasts": len(rows),
+        "rows": table,
+        "flags": flagged,
+    }
+
+
+def leg_flag(
+    table: list[dict],
+    *,
+    family: str | None,
+    market_key: str | None,
+    line: str | None,
+    scope: str | None,
+    p: float | None,
+) -> dict | None:
+    """The flagged range (served versions) that a coupon leg falls into, if any."""
+    if not (family and market_key and scope and p is not None):
+        return None
+    market = market_name(market_key, line)
+    for row in table:
+        if (
+            row["role"] == "active"
+            and row["scope"] == scope
+            and row["family"] == family
+            and row["market"] == market
+            and not row["zone_total"]
+            and row["flag"] in ("optimistic", "cautious")
+            and (row["low"] <= p < row["high"] or (row["high"] == 1.0 and p == 1.0))
+        ):
+            return row
+    return None
+
+
+def leg_note(row: dict | None) -> str | None:
+    if row is None:
+        return None
+    side = "rzadziej" if row["flag"] == "optimistic" else "częściej"
+    return (
+        f"prospektywnie ten rynek w tym przedziale trafia {side} niż przewiduje model "
+        f"(n={row['matches']} meczów)"
+    )
+
+
+def family_of_model(model: str | None) -> str | None:
+    """Family of a candidate's ``model`` text ("<family> <version>")."""
+    return model.split()[0] if model else None
+
+
+def note_for_leg(table: list[dict], leg: dict) -> str | None:
+    """Short note for a coupon leg (payload dict of a proposal or of Mój kupon)."""
+    from sports_edge.services import league_code
+
+    league = leg.get("league") or ""
+    competition = league_code(league, "football") if league else None
+    return leg_note(
+        leg_flag(
+            table,
+            family=leg.get("family") or family_of_model(leg.get("model")),
+            market_key=leg.get("market_key"),
+            line=leg.get("line"),
+            scope=scope_of(competition),
+            p=leg.get("p_model"),
+        )
+    )
+
+
+# ---------------------------------------------------------------- scoring and margin
+
+
+def power_devig(prices: dict[str, float]) -> dict[str, float]:
+    """Power method: p_i = (1/o_i)^k with k such that the probabilities sum to one."""
+    raw = {k: 1.0 / float(v) for k, v in prices.items()}
+    total = sum(raw.values())
+    if abs(total - 1.0) < 1e-12:
+        return raw
+    lo, hi = (1.0, 64.0) if total > 1 else (1e-4, 1.0)
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if sum(r**mid for r in raw.values()) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    k = (lo + hi) / 2
+    found = {s: r**k for s, r in raw.items()}
+    norm = sum(found.values())
+    return {s: v / norm for s, v in found.items()}
+
+
+def proportional_devig(prices: dict[str, float]) -> dict[str, float]:
+    raw = {k: 1.0 / float(v) for k, v in prices.items()}
+    total = sum(raw.values())
+    return {k: v / total for k, v in raw.items()}
+
+
+def devig(prices: dict[str, float], method: str = "power") -> dict[str, float]:
+    return power_devig(prices) if method == "power" else proportional_devig(prices)
+
+
+def score(probabilities: dict, outcomes: dict, market_key: str) -> tuple[float, float] | None:
+    """(log loss, Brier) of one market forecast. Exclusive markets: −ln p(observed outcome)
+    and the sum of squared errors over the outcomes; double chance (not exclusive): the mean
+    of the binary scores of its selections. None when an outcome is unknown."""
+    keys = list(probabilities)
+    if not keys or any(outcomes.get(k) is None for k in keys):
+        return None
+    if market_key == "double_chance":
+        losses = [
+            -math.log(max(EPS, probabilities[k] if outcomes[k] else 1 - probabilities[k]))
+            for k in keys
+        ]
+        briers = [(probabilities[k] - outcomes[k]) ** 2 for k in keys]
+        return sum(losses) / len(keys), sum(briers) / len(keys)
+    winners = [k for k in keys if outcomes[k] == 1]
+    if len(winners) != 1:
+        return None
+    loss = -math.log(max(EPS, probabilities[winners[0]]))
+    return loss, sum((probabilities[k] - outcomes[k]) ** 2 for k in keys)
+
+
+# ---------------------------------------------------------------- STS prices before the start
+
+
+def pre_match_quotes(store: Store, event_ids: set[str]) -> dict[tuple, dict]:
+    """(event, market_key, line) → the last STS quote set generated BEFORE the start:
+    {"quote_set_id", "valid_at", "prices": {selection: price}} (status ``ok`` only)."""
+    if not event_ids:
+        return {}
+    out: dict[tuple, dict] = {}
+    ids = sorted(event_ids)
+    for chunk in range(0, len(ids), 400):
+        part = ids[chunk : chunk + 400]
+        marks = ",".join("?" for _ in part)
+        rows = store.rows(
+            f"""SELECT q.id quote_set_id, COALESCE(q.valid_at, q.ingested_at) observed_at,
+            e.id event_id, e.start_at, m.market_key, m.line, s.key, o.price
+            FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id
+            JOIN selections s ON s.id=o.selection_id JOIN markets m ON m.id=q.market_id
+            JOIN events e ON e.id=m.event_id JOIN imports i ON i.id=q.import_id
+            WHERE e.id IN ({marks}) AND q.status='ok' AND m.period='FT'
+            AND i.bookmaker_id='sts' AND i.data_kind IN ('prospective','archive')
+            AND e.start_at IS NOT NULL""",
+            tuple(part),
+        )
+        sets: dict[str, dict] = {}
+        for r in rows:
+            if datetime.fromisoformat(r["observed_at"]) >= datetime.fromisoformat(r["start_at"]):
+                continue  # a document from after the kick-off is never a pre-match price
+            entry = sets.setdefault(
+                r["quote_set_id"],
+                {
+                    "quote_set_id": r["quote_set_id"],
+                    "valid_at": r["observed_at"],
+                    "start_at": r["start_at"],
+                    "key": (r["event_id"], r["market_key"], r["line"]),
+                    "prices": {},
+                },
+            )
+            entry["prices"][r["key"]] = float(r["price"])
+        for entry in sets.values():
+            current = out.get(entry["key"])
+            if current is None or (current["valid_at"], current["quote_set_id"]) < (
+                entry["valid_at"],
+                entry["quote_set_id"],
+            ):
+                out[entry["key"]] = entry
+    return out
+
+
+def _market_probabilities(row: dict, quotes: dict, method: str) -> tuple[dict, dict] | None:
+    """(de-margined probabilities over the forecast's selections, quote) or None."""
+    if row["market_key"] == "double_chance":
+        quote = quotes.get((row["match"], "1x2", None))
+        if quote is None or set(quote["prices"]) != {"home", "draw", "away"}:
+            return None
+        base = devig(quote["prices"], method)
+        found = {sel: base[a] + base[b] for sel, (a, b) in DC_PARTS.items()}
+    else:
+        quote = quotes.get((row["match"], row["market_key"], row["line"]))
+        if quote is None or set(quote["prices"]) != set(row["probabilities"]):
+            return None
+        found = devig(quote["prices"], method)
+    if set(found) != set(row["probabilities"]):
+        return None
+    return found, quote
+
+
+def _bootstrap(diffs: list[float], *, resamples: int, seed: int) -> list[float]:
+    rng = random.Random(seed)
+    draws = sorted(sum(rng.choices(diffs, k=len(diffs))) / len(diffs) for _ in range(resamples))
+    return [round(draws[int(0.025 * resamples)], 5), round(draws[int(0.975 * resamples) - 1], 5)]
+
+
+def _state(n: int, ci: list[float] | None, minimum: int) -> str:
+    if n == 0:
+        return "unknown"
+    if n < minimum:
+        return "insufficient"
+    if ci[1] < 0:
+        return "model_better"
+    if ci[0] > 0:
+        return "model_worse"
+    return "no_difference"
+
+
+def matches_text(n: int) -> str:
+    """Polish count: 1 mecz, 2 mecze, 5 meczów (12–14 → meczów)."""
+    if n == 1:
+        return "1 mecz"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} mecze"
+    return f"{n} meczów"
+
+
+def state_label(state: str, matches: int = 0, minimum: int = 300) -> str:
+    return {
+        "unknown": "nieznane (brak wspólnych meczów)",
+        "insufficient": f"za mało ({matches_text(matches)} < {minimum})",
+        "model_better": "model lepszy",
+        "model_worse": "model gorszy",
+        "no_difference": "brak istotnej różnicy",
+    }[state]
+
+
+def market_comparison(
+    store: Store, *, policy: EvalPolicy | None = None, rows: list[dict] | None = None
+) -> list[dict]:
+    """Model (served versions) vs the de-margined STS price on the same settled forecasts,
+    per scope ("all", "core", "extended"), family and market — plus "*" (all markets of a
+    family). Groups expected in the coupon zone appear even without data ("unknown")."""
+    policy = policy or load_policy()
+    rows = _role_forecasts(market_forecasts(store) if rows is None else rows, "active")
+    quotes = pre_match_quotes(store, {r["match"] for r in rows})
+    instances = []
+    for row in rows:
+        found = _market_probabilities(row, quotes, policy.devig)
+        model = score(row["probabilities"], row["outcomes"], row["market_key"])
+        if found is None or model is None:
+            continue
+        market_p, quote = found
+        market = score(market_p, row["outcomes"], row["market_key"])
+        other = _market_probabilities(
+            row, quotes, "proportional" if policy.devig == "power" else "power"
+        )
+        sensitivity = score(other[0], row["outcomes"], row["market_key"]) if other else None
+        lead = (
+            datetime.fromisoformat(row["start_at"]) - datetime.fromisoformat(quote["valid_at"])
+        ).total_seconds() / 3600
+        instances.append(
+            {
+                **{k: row[k] for k in ("match", "scope", "family", "market", "prediction_id")},
+                "quote_set_id": quote["quote_set_id"],
+                "model_log_loss": model[0],
+                "model_brier": model[1],
+                "market_log_loss": market[0],
+                "market_brier": market[1],
+                "market_log_loss_other": sensitivity[0] if sensitivity else None,
+                "lead_hours": lead,
+            }
+        )
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for item in instances:
+        pooled = () if item["market"] == "double_chance" else (POOLED,)
+        for scope in ("all", item["scope"]):
+            for market in (item["market"], *pooled):
+                groups[(scope, item["family"], market)].append(item)
+    for scope in ("all", "core", "extended"):
+        for family, markets in COUPON_MARKETS.items():
+            for market in (*markets, POOLED):
+                groups.setdefault((scope, family, market), [])
+    out = []
+    for (scope, family, market), part in sorted(groups.items(), key=lambda kv: kv[0]):
+        if scope is None:
+            continue
+        out.append(_comparison_row(scope, family, market, part, policy=policy, instances=part))
+    return out
+
+
+def _comparison_row(scope, family, market, part, *, policy: EvalPolicy, instances) -> dict:
+    by_match: dict[str, list[dict]] = defaultdict(list)
+    for item in part:
+        by_match[item["match"]].append(item)
+
+    def mean(key, items):
+        values = [i[key] for i in items if i[key] is not None]
+        return sum(values) / len(values) if values else None
+
+    diffs = [
+        mean("model_log_loss", items) - mean("market_log_loss", items)
+        for items in by_match.values()
+    ]
+    n = len(diffs)
+    ci = _bootstrap(diffs, resamples=policy.resamples, seed=policy.seed) if n else None
+    state = _state(n, ci, policy.market_min_matches)
+    snapshot = digest(
+        sorted([i["prediction_id"], i["quote_set_id"], i["market"]] for i in instances)
+    )
+    leads = sorted(i["lead_hours"] for i in part)
+    return {
+        "scope": scope,
+        "family": family,
+        "market": market,
+        "matches": n,
+        "forecasts": len(part),
+        "state": state,
+        "state_label": state_label(state, n, policy.market_min_matches),
+        "model_log_loss": _round(mean("model_log_loss", part)),
+        "market_log_loss": _round(mean("market_log_loss", part)),
+        "market_log_loss_other_devig": _round(mean("market_log_loss_other", part)),
+        "model_brier": _round(mean("model_brier", part)),
+        "market_brier": _round(mean("market_brier", part)),
+        "difference": _round(sum(diffs) / n) if n else None,  # model − market (< 0: model better)
+        "ci95": ci,
+        "median_lead_hours": round(leads[len(leads) // 2], 2) if leads else None,
+        "devig": policy.devig,
+        "min_matches": policy.market_min_matches,
+        "data_snapshot": snapshot,
+    }
+
+
+def _round(value: float | None, digits: int = 5) -> float | None:
+    return None if value is None else round(value, digits)
+
+
+def record_market_benchmarks(
+    store: Store, *, now: datetime, policy: EvalPolicy | None = None
+) -> dict:
+    """Append the comparison to ``market_benchmarks`` (idempotent: the same data and policy
+    give the same id, so a repeated run adds nothing). ``validation_json`` is never touched."""
+    policy = policy or load_policy()
+    added = 0
+    rows = market_comparison(store, policy=policy)
+    for row in rows:
+        key = digest(
+            [
+                "market_benchmark",
+                row["scope"],
+                row["family"],
+                row["market"],
+                policy.version,
+                row["data_snapshot"],
+            ]
+        )
+        if store.get("market_benchmarks", key) is not None:
+            continue
+        store.insert(
+            "market_benchmarks",
+            id=key,
+            computed_at=iso(now),
+            scope=row["scope"],
+            family=row["family"],
+            market=row["market"],
+            matches=row["matches"],
+            forecasts=row["forecasts"],
+            state=row["state"],
+            policy_version=policy.version,
+            data_snapshot=row["data_snapshot"],
+            payload_json=canonical(row),
+        )
+        added += 1
+    return {"groups": len(rows), "recorded": added}
+
+
+def latest_benchmarks(store: Store) -> dict[tuple, dict]:
+    """(scope, family, market) → the newest stored benchmark row with its payload."""
+    out: dict[tuple, dict] = {}
+    for row in store.rows("SELECT * FROM market_benchmarks ORDER BY computed_at, id"):
+        out[(row["scope"], row["family"], row["market"])] = {
+            **row,
+            "payload": json.loads(row["payload_json"]),
+        }
+    return out
+
+
+# ---------------------------------------------------------------- champion vs challenger
+
+
+def paired_matches(
+    store: Store,
+    champion: str,
+    challenger: str,
+    *,
+    policy: EvalPolicy | None = None,
+    rows: list[dict] | None = None,
+) -> dict:
+    """Log loss of two versions on the SAME settled forecasts (match, market, line); the
+    difference (challenger − champion) is averaged per match and its interval resamples
+    matches. ``enough``: at least ``decision_matches`` common matches."""
+    policy = policy or load_policy()
+    rows = market_forecasts(store) if rows is None else rows
+    by_key: dict[tuple, dict[str, dict]] = defaultdict(dict)
+    for row in rows:
+        # double chance is a function of the same 1X2 forecast: counted once, through 1X2
+        if row["version"] in (champion, challenger) and row["market_key"] != "double_chance":
+            by_key[(row["match"], row["market"])][row["version"]] = row
+    per_match: dict[str, list[float]] = defaultdict(list)
+    for (match, _market), pair in by_key.items():
+        if champion not in pair or challenger not in pair:
+            continue
+        a = score(
+            pair[champion]["probabilities"],
+            pair[champion]["outcomes"],
+            pair[champion]["market_key"],
+        )
+        b = score(
+            pair[challenger]["probabilities"],
+            pair[challenger]["outcomes"],
+            pair[challenger]["market_key"],
+        )
+        if a is None or b is None:
+            continue
+        per_match[match].append(b[0] - a[0])
+    diffs = [sum(v) / len(v) for v in per_match.values()]
+    if not diffs:
+        return {"matches": 0, "forecasts": 0, "enough": False, "needed": policy.decision_matches}
+    return {
+        "matches": len(diffs),
+        "forecasts": sum(len(v) for v in per_match.values()),
+        "difference": round(sum(diffs) / len(diffs), 5),
+        "ci95": _bootstrap(diffs, resamples=policy.resamples, seed=policy.seed),
+        "enough": len(diffs) >= policy.decision_matches,
+        "needed": policy.decision_matches,
+    }

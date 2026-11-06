@@ -6,23 +6,33 @@ challenger already waiting, enough days since the last training — and otherwis
 why it skipped. A challenger is trained under protocol v2 (decisions on the selection
 window, the final holdout reported only), runs in shadow mode and is promoted only by the
 user (AKTYWUJ NOWY MODEL / POZOSTAW POPRZEDNI MODEL). Automatic promotion does not exist.
+
+TASK 011: a waiting challenger no longer blocks the review for ever. At the review a
+challenger EXPIRES (new ``model_events`` row "expired", the old rows stay) when a newer
+challenger of its scope and family replaced it (it gets no shadow forecasts any more) or when
+it is older than ``expiry_days`` without a single settled match in common with the champion.
+Expiry never activates anything. The evidence of a challenger is counted in MATCHES
+(``prospective_eval.paired_matches``) and the decision panel says plainly whether it waits
+for evidence (n/300), whether the evidence is sufficient (the decision is the user's) or
+whether it is identical to the champion in the selection window.
 """
 
 import json
-import math
-import random
-from collections import defaultdict
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 from sports_edge import learning
-from sports_edge.collection import last_run, record_job, settled_forecasts
+from sports_edge import prospective_eval as pe
+from sports_edge.collection import last_run, record_job
 from sports_edge.ingestion.types import iso
 from sports_edge.storage import Store
 
 EVERY_DAYS = 7
 MIN_NEW_RESULTS = 150
 MIN_DAYS_BETWEEN_TRAININGS = 7
-MIN_PAIRED = 100  # settled forecasts of the same events before a prospective verdict
+# TASK 011: the prospective verdict needs settled MATCHES in common (policy file, default
+# 300 — prospective_policy.toml [challengers]); MIN_PAIRED is kept for older callers only.
+MIN_PAIRED = 100
 STATUSES = (
     "Oczekuje na nowe dane",
     "Dane wystarczające",
@@ -71,7 +81,8 @@ def conditions(
     new = new_matches(store, competitions, since=since, now=now, identities=identities)
     if new < MIN_NEW_RESULTS:
         reasons.append(f"nowych unikalnych meczów od treningu: {new} < {MIN_NEW_RESULTS}")
-    if learning.challengers(store, scope, ELO_FAMILY):
+    leaving = {vid for _family, vid, _why in expiring(store, scope, now=now)}
+    if [v for v in learning.challengers(store, scope, ELO_FAMILY) if v not in leaving]:
         reasons.append("challenger tego zakresu czeka już na decyzję (tryb cienia)")
     last = [e for e in learning.events(store, scope=scope) if e["kind"] == "challenger_ready"]
     if last and now - datetime.fromisoformat(last[-1]["created_at"]) < timedelta(
@@ -95,9 +106,13 @@ def review(
     """One weekly review of every scope. ``train`` (scope → report) defaults to protocol v2."""
     from sports_edge.services import MODEL_SCOPES, run_protocol_v2
 
-    train = train or (lambda scope: run_protocol_v2(store, paths, now=now, scope=scope))
+    train = train or (
+        lambda scope: run_protocol_v2(store, paths, now=now, scope=scope, force=force)
+    )
     out = {}
+    expired: dict[str, list[dict]] = {}
     for scope in scopes or tuple(MODEL_SCOPES):
+        expired[scope] = expire_challengers(store, scope, now=now)
         ready, reasons = conditions(store, scope, MODEL_SCOPES[scope], now=now)
         if not ready and not force:
             out[scope] = {"status": "skipped", "reasons": reasons}
@@ -129,6 +144,9 @@ def review(
             out[scope] = {"status": "trained", "summary": report.get("summary")}
         except ValueError as error:
             out[scope] = {"status": "failed", "reasons": [str(error)]}
+    for scope, found in expired.items():
+        if found:  # TASK 011: challengers that stopped blocking at this review
+            out[scope]["expired"] = found
     statuses = {v["status"] for v in out.values()}
     record_job(
         store,
@@ -154,61 +172,87 @@ def review(
 # ---------------------------------------------------------------- champion vs challenger
 
 
-def _decision(row: dict | None) -> dict:
+def elo_reports(store: Store) -> dict[str, dict]:
+    """Elo version id → report of the Dixon–Coles experiment that measured it. The Elo
+    report of protocol v2 has no statuses of its own (no ``predictive`` key): the goals
+    experiment of its scope measures them (``elo_predictive``) for one Elo version."""
+    from sports_edge.models.registry import model_overview
+    from sports_edge.services import GOALS_FAMILY
+
+    out: dict[str, dict] = {}
+    for row in model_overview(store):  # newest first: the newest measurement wins
+        if row["family"] != GOALS_FAMILY:
+            continue
+        report = json.loads(row["validation_json"])
+        if report.get("elo_version_id"):
+            out.setdefault(report["elo_version_id"], report)
+    return out
+
+
+def _decision(row: dict | None, measured: dict[str, dict] | None = None) -> dict:
+    """What the panel shows about one version: selection window, holdout and the status of
+    every market. Elo statuses come from ``measured`` (``elo_reports``) — TASK 011 fix: they
+    were read from a ``predictive`` key that an Elo report never has, so none were shown."""
     if row is None:
         return {}
     report = json.loads(row["validation_json"])
+    if report.get("predictive") is not None:
+        statuses = {k: v.get("status") for k, v in report["predictive"].items()}
+    else:
+        found = (measured or {}).get(row["version_id"]) or {}
+        statuses = {k: v.get("status") for k, v in (found.get("elo_predictive") or {}).items()}
     return {
         "version_id": row["version_id"],
         "version": row["version"],
         "protocol": report.get("protocol", "v1"),
         "decision": report.get("decision") if report.get("protocol") == "v2" else None,
         "holdout": report.get("holdout"),
-        "statuses": {k: v.get("status") for k, v in (report.get("predictive") or {}).items()},
+        "statuses": statuses,
+        "hyperparameters": report.get("hyperparameters"),
         "created_at": row["created_at"],
+        "trained_through": row.get("trained_through"),
     }
+
+
+SAME_FIELDS = ("n", "log_loss", "brier", "ece", "accuracy")
+
+
+def identical_in_selection(champion: dict, challenger: dict) -> bool:
+    """Both versions under protocol v2 with the same selection-window metrics and the same
+    hyperparameters: the challenger brings nothing new to compare."""
+    old, new = champion.get("decision") or {}, challenger.get("decision") or {}
+    if not old or not new:
+        return False
+    same = all(old.get(k) == new.get(k) for k in SAME_FIELDS)
+    return same and champion.get("hyperparameters") == challenger.get("hyperparameters")
 
 
 def paired(
     store: Store, champion: str, challenger: str, *, seed: int = 7, markets: set | None = None
 ) -> dict:
-    """Log loss of both versions on the SAME settled selections (prospective, shadow mode);
-    the interval of the difference resamples events. ``markets`` limits the market keys."""
-    by_key: dict[tuple, dict[str, list]] = defaultdict(dict)
-    for row in settled_forecasts(store):
-        if row["status"] != "settled" or row["model_version_id"] not in (champion, challenger):
-            continue
-        if markets is not None and row["market_key"] not in markets:
-            continue
-        key = (row["event_id"], row["market_key"], row["line"])
-        by_key[key][row["model_version_id"]] = [
-            (row["probabilities"][sel], y)
-            for sel, y in (row["outcome"].get("selections") or {}).items()
-            if y is not None and sel in row["probabilities"]
-        ]
-    pairs = [
-        (v[champion], v[challenger]) for v in by_key.values() if champion in v and challenger in v
-    ]
-    if not pairs:
-        return {"n": 0}
-
-    def loss(items):
-        return sum(-math.log(max(1e-6, p if y else 1 - p)) for p, y in items) / max(1, len(items))
-
-    diffs = [loss(b) - loss(a) for a, b in pairs]
-    rng = random.Random(seed)
-    draws = sorted(sum(rng.choices(diffs, k=len(diffs))) / len(diffs) for _ in range(500))
-    mean = sum(diffs) / len(diffs)
-    return {
-        "n": len(pairs),
-        "difference": round(mean, 4),  # challenger − champion (negative: challenger better)
-        "ci95": [round(draws[12], 4), round(draws[487], 4)],
-        "enough": len(pairs) >= MIN_PAIRED,
-    }
+    """Both versions on the SAME settled forecasts, counted in MATCHES (TASK 011; see
+    ``prospective_eval.paired_matches``). ``markets`` limits the market keys."""
+    rows = pe.market_forecasts(store)
+    if markets is not None:
+        rows = [r for r in rows if r["market_key"] in markets]
+    policy = replace(pe.load_policy(), seed=seed)
+    found = pe.paired_matches(store, champion, challenger, policy=policy, rows=rows)
+    return {**found, "n": found["matches"]}
 
 
-def comparison(store: Store, scope: str) -> dict:
-    """Champion and the waiting challenger of a scope with a plain conclusion."""
+EVIDENCE_STATES = {
+    "none": "brak challengera",
+    "identical": "identyczny z championem w oknie selekcji",
+    "waiting": "czeka na dowody",
+    "sufficient": "dowody wystarczające — decyzja należy do Ciebie",
+}
+
+
+def comparison(
+    store: Store, scope: str, *, rows: list[dict] | None = None, now: datetime | None = None
+) -> dict:
+    """Champion and the waiting challenger of a scope with a plain conclusion and the state
+    of the evidence (TASK 011 §5.1). Nothing here activates a model."""
     from sports_edge.services import (
         ELO_FAMILY,
         GOALS_FAMILY,
@@ -217,17 +261,60 @@ def comparison(store: Store, scope: str) -> dict:
         scope_version,
     )
 
+    policy = pe.load_policy()
+    measured = elo_reports(store)
     out = {}
     waiting = challenger_versions(store).get(scope, {})
     for key, family in (("elo", ELO_FAMILY), ("goals", GOALS_FAMILY)):
         champion = scope_version(store, MODEL_SCOPES[scope], family)
         challenger = waiting.get(key)
-        entry = {"champion": _decision(champion), "challenger": _decision(challenger)}
+        entry = {
+            "family": family,
+            "champion": _decision(champion, measured),
+            "challenger": _decision(challenger, measured),
+        }
         if champion and challenger:
-            entry["prospective"] = paired(store, champion["version_id"], challenger["version_id"])
+            if rows is None:
+                rows = pe.market_forecasts(store)
+            entry["prospective"] = pe.paired_matches(
+                store, champion["version_id"], challenger["version_id"], policy=policy, rows=rows
+            )
+            entry["age_days"] = _age_days(
+                store, scope, family, challenger["version_id"], now or datetime.now(UTC)
+            )
+        entry["state"], entry["state_label"] = evidence_state(entry, policy)
         entry["conclusion"] = conclusion(entry)
         out[key] = entry
     return out
+
+
+def _age_days(store: Store, scope: str, family: str, version_id: str, now: datetime):
+    ready = _ready_at(store, scope, family, version_id)
+    return None if ready is None else round((now - ready).total_seconds() / 86400, 1)
+
+
+def evidence_state(entry: dict, policy: pe.EvalPolicy | None = None) -> tuple[str, str]:
+    """(code, label): none / identical / waiting (n/300) / sufficient."""
+    if not entry.get("challenger"):
+        return "none", EVIDENCE_STATES["none"]
+    pro = entry.get("prospective") or {}
+    n = pro.get("matches", 0)
+    needed = pro.get("needed") or (policy or pe.load_policy()).decision_matches
+    if identical_in_selection(entry["champion"], entry["challenger"]):
+        return "identical", f"{EVIDENCE_STATES['identical']} (wspólne mecze: {n})"
+    if not pro.get("enough"):
+        return "waiting", f"{EVIDENCE_STATES['waiting']} ({n}/{needed})"
+    return "sufficient", EVIDENCE_STATES["sufficient"]
+
+
+def verdict(pro: dict) -> str | None:
+    if not pro.get("matches"):
+        return None
+    if pro["ci95"][1] < 0:
+        return "challenger lepszy"
+    if pro["ci95"][0] > 0:
+        return "challenger gorszy"
+    return "brak istotnej różnicy"
 
 
 def conclusion(entry: dict) -> str:
@@ -247,6 +334,11 @@ def conclusion(entry: dict) -> str:
             f"W oknie selekcji challenger ma log loss {new['log_loss']} wobec {old['log_loss']} "
             + ("(lepiej)." if delta < 0 else "(gorzej)." if delta > 0 else "(tak samo).")
         )
+        if identical_in_selection(champion, challenger):
+            parts.append(
+                "Te same hiperparametry i miary okna selekcji co aktywna wersja — w oknie "
+                "selekcji challenger jest identyczny z championem."
+            )
     elif new:
         parts.append(
             f"Challenger: okno selekcji n={new.get('n')}, log loss {new.get('log_loss')}, "
@@ -258,22 +350,85 @@ def conclusion(entry: dict) -> str:
     if validated:
         parts.append("Rynki zwalidowane w oknie selekcji: " + ", ".join(validated) + ".")
     pro = entry.get("prospective") or {}
-    if pro.get("n"):
-        verdict = (
-            "challenger lepszy"
-            if pro["ci95"][1] < 0
-            else "challenger gorszy"
-            if pro["ci95"][0] > 0
-            else "brak istotnej różnicy"
-        )
+    if pro.get("matches"):
+        short = f" — za mało wspólnych meczów na decyzję ({pro['matches']}/{pro['needed']})"
         parts.append(
-            f"Prospektywnie (te same mecze, n={pro['n']}): {verdict}"
-            + ("" if pro["enough"] else " — za mało rozliczonych prognoz na decyzję")
+            f"Prospektywnie (te same mecze, n={pro['matches']}): {verdict(pro)}"
+            + ("" if pro["enough"] else short)
             + "."
         )
     else:
-        parts.append("Prospektywnie: brak jeszcze wspólnych rozliczonych prognoz (tryb cienia).")
+        parts.append("Prospektywnie: brak jeszcze wspólnych rozliczonych meczów (tryb cienia).")
     return " ".join(parts)
+
+
+def _ready_at(store: Store, scope: str, family: str, version_id: str) -> datetime | None:
+    found = [
+        e["created_at"]
+        for e in learning.events(store, scope=scope, family=family)
+        if e["kind"] == "challenger_ready" and e["model_version_id"] == version_id
+    ]
+    return datetime.fromisoformat(found[0]) if found else None
+
+
+def expiring(
+    store: Store, scope: str, *, now: datetime, rows: list[dict] | None = None
+) -> list[tuple[str, str, str]]:
+    """(family, version id, reason) of the waiting challengers that stop blocking the review:
+    replaced by a newer challenger of the same scope and family, or older than
+    ``expiry_days`` without any settled match in common with the champion."""
+    from sports_edge.services import ELO_FAMILY, GOALS_FAMILY, MODEL_SCOPES, scope_version
+
+    policy = pe.load_policy()
+    out = []
+    for family in (ELO_FAMILY, GOALS_FAMILY):
+        waiting = learning.challengers(store, scope, family)
+        for i, version_id in enumerate(waiting):
+            if i < len(waiting) - 1:
+                why = (
+                    "zastąpiony nowszym challengerem tego zakresu — nie dostaje już prognoz cienia"
+                )
+                out.append((family, version_id, why))
+                continue
+            ready = _ready_at(store, scope, family, version_id)
+            if ready is None or now - ready < timedelta(days=policy.expiry_days):
+                continue
+            champion = scope_version(store, MODEL_SCOPES[scope], family)
+            if champion is None:
+                continue
+            if rows is None:
+                rows = pe.market_forecasts(store)
+            found = pe.paired_matches(
+                store, champion["version_id"], version_id, policy=policy, rows=rows
+            )
+            if found["matches"] == 0:
+                why = (
+                    "brak wspólnych rozliczonych meczów z aktywną wersją po "
+                    f"{policy.expiry_days} dniach"
+                )
+                out.append((family, version_id, why))
+    return out
+
+
+def expire_challengers(store: Store, scope: str, *, now: datetime) -> list[dict]:
+    """Record the expiry of every challenger returned by ``expiring`` (idempotent). The old
+    rows stay as they were; an expired challenger is never activated."""
+    out = []
+    for family, version_id, why in expiring(store, scope, now=now):
+        learning.record(
+            store,
+            kind="expired",
+            actor="system",
+            reason="Wygasły (brak dowodów): " + why,
+            now=now,
+            version_id=version_id,
+            scope=scope,
+            family=family,
+            payload={"reason": why},
+            key=["expired", scope, family, version_id],
+        )
+        out.append({"family": family, "version_id": version_id, "reason": why})
+    return out
 
 
 def scope_status(store: Store, scope: str, *, now: datetime, running: str | None = None) -> str:
@@ -282,18 +437,17 @@ def scope_status(store: Store, scope: str, *, now: datetime, running: str | None
 
     if running in ("Trening w toku", "Walidacja w toku"):
         return running
+    if learning.challengers(store, scope, ELO_FAMILY):
+        return "Challenger gotowy"
     found = learning.events(store, scope=scope, family=ELO_FAMILY)
     last = next(
         (
             e
             for e in reversed(found)
-            if e["kind"]
-            in {"challenger_ready", "activated", "rejected", "kept_previous", "rolled_back"}
+            if e["kind"] in {"activated", "rejected", "kept_previous", "rolled_back"}
         ),
         None,
     )
-    if last is not None and last["kind"] == "challenger_ready":
-        return "Challenger gotowy"
     if last is not None and last["kind"] == "rolled_back":
         return "Przywrócono starszą wersję"
     if last is not None and last["kind"] in {"rejected", "kept_previous"}:

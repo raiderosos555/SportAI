@@ -431,10 +431,17 @@ def _candidate(
         validation = prediction["validation"]
         v2 = validation.get("protocol") == "v2"
         sample = (validation.get("decision") if v2 else validation.get("holdout")) or {}
+        # TASK 011: without a benchmark on the same matches the comparison is unknown, never a
+        # default "False" (the prospective comparison lives in prospective_eval)
+        market_text = (
+            "nieznane (brak porównania na tych samych meczach)"
+            if validation.get("market_benchmark") is None
+            else ("model lepszy" if validation.get("beats_market") else "model nie lepszy")
+        )
         validation_text = (
             f"{'okno selekcji' if v2 else 'holdout'} n={sample.get('n')}, "
             f"log loss={sample.get('log_loss')}, ECE={sample.get('ece')}, "
-            f"rynek: {validation.get('beats_market')}"
+            f"rynek: {market_text}"
         )
         if policy.require_validated_model and model_status != "validated":
             unproven.append("Model bez zatwierdzonej walidacji — dodatnie EV nie jest przewagą")

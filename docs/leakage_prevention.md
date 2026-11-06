@@ -76,3 +76,12 @@ Wyniki: [raport TASK 003, sekcja C](task_003_report.md).
 | Ten sam mecz liczony dwa razy | `effective_results`: jeden mecz na fixture, hierarchia źródeł | `test_second_source_confirms_or_conflicts_and_the_hierarchy_decides` |
 | Prognoza ponownie zapisana bez nowych danych | Ta sama wersja i ten sam snapshot danych — prognoza zostaje | `test_stale_elo_history_blocks_forecasts_until_the_gap_is_filled` |
 | Prognoza całego meczu przypisana połowie | Klucz prognozy obejmuje rynek i okres | `test_match_halves_and_ht_or_ft_never_share_the_full_time_forecast` |
+
+## TASK 011 — porównanie z rynkiem STS i ocena prospektywna
+
+| Ryzyko | Zabezpieczenie | Test |
+|---|---|---|
+| Kurs po rozpoczęciu meczu (na żywo) jako benchmark | Tylko ostatni dokument STS z czasem dokumentu ściśle przed startem, status `ok` | `test_market_benchmark_uses_only_the_price_published_before_the_kick_off`, `test_a_forecast_with_only_a_price_from_after_the_start_is_not_compared` |
+| Kurs STS jako cecha modelu | Kurs czyta wyłącznie `prospective_eval` (ocena po fakcie); modele i prognozy go nie znają | `test_flags_and_comparisons_change_no_forecast_threshold_or_status` |
+| Brak pomiaru pokazany jako „model nie lepszy” | Stany „nieznane” / „za mało (n < 300)” zamiast domyślnego `false` | `test_market_benchmark_uses_only_the_price_published_before_the_kick_off` |
+| Rynki jednego meczu jako niezależne dowody | Jednostką kalibracji i porównań jest mecz | `test_reliability_counts_matches_not_selections` |

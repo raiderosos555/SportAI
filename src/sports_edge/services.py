@@ -1887,13 +1887,42 @@ def prediction_preference(store: Store) -> dict:
 
 
 def run_protocol_v2(
-    store: Store, paths: AppPaths, *, now: datetime, scope: str, progress=None
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    scope: str,
+    progress=None,
+    force: bool = False,
 ) -> dict:
     """TASK 007 §4.2: Elo and Dixon–Coles of one scope under protocol v2, registered as
-    challengers (shadow mode). The champion is changed only by the user."""
+    challengers (shadow mode). The champion is changed only by the user.
+
+    TASK 011 §5.3: no challenger is trained on the same data as a protocol v2 champion (no
+    new match since its training) unless the user forces it (force) — such a challenger
+    is then marked as forced, with 0 new matches, in its event."""
+    from sports_edge.retraining import new_matches
+
     competitions = MODEL_SCOPES[scope]
     split = PROTOCOLS[scope]
     ensure_model_roles(store, now=now)
+    champion = scope_version(store, competitions, ELO_FAMILY)
+    v2_champion = (
+        champion is not None and json.loads(champion["validation_json"]).get("protocol") == "v2"
+    )
+    fresh = new_matches(
+        store,
+        competitions,
+        since=champion["trained_through"] if champion else None,
+        now=now,
+        identities=team_identities(paths),
+    )
+    if v2_champion and fresh == 0 and not force:
+        raise ValueError(
+            "Brak nowych meczów od treningu aktywnej wersji — challenger miałby te same dane co "
+            "champion. Trening możliwy tylko jako wymuszony (zostanie wyraźnie oznaczony)."
+        )
+    forced = bool(force and v2_champion and fresh == 0)
     if progress:
         progress(f"Elo ({SCOPE_LABELS[scope]}): okna v2")
     elo = run_elo_experiment(
@@ -1932,14 +1961,22 @@ def run_protocol_v2(
         "statuses": {k: v["status"] for k, v in goals["predictive"].items()},
         "elo_statuses": {k: v["status"] for k, v in goals["elo_predictive"].items()},
         "markets_served": goals["markets_served"],
+        "new_matches": fresh,
+        "forced": forced,
     }
+    reason = "Protokół v2: wybór i statusy na oknie selekcji, holdout tylko raportowany"
+    if forced:
+        reason = (
+            "WYMUSZONY TRENING (użytkownik): 0 nowych meczów — te same dane co aktywna wersja. "
+            + reason
+        )
     for family, report in ((ELO_FAMILY, elo), (GOALS_FAMILY, goals)):
         first = learning.champion_id(store, scope, family) is None
         learning.record(
             store,
             kind="challenger_ready",
             actor="system",
-            reason="Protokół v2: wybór i statusy na oknie selekcji, holdout tylko raportowany",
+            reason=reason,
             now=now,
             version_id=report["version_id"],
             scope=scope,
@@ -1964,6 +2001,7 @@ ROLE_LABELS = {
     "active": "aktywna",
     "challenger": "challenger (tryb cienia)",
     "rejected": "odrzucona",
+    "expired": "wygasła (brak dowodów)",
     "previous": "poprzednio aktywna",
     "unused": "nieużywana",
 }
@@ -1971,6 +2009,9 @@ ROLE_LABELS = {
 
 def model_versions_of(store: Store, scope: str) -> list[dict]:
     """Every version of both models of a scope with its role (for choosing what to serve)."""
+    from sports_edge.retraining import elo_reports
+
+    measured = elo_reports(store)
     out = []
     for family in (ELO_FAMILY, GOALS_FAMILY):
         champion = scope_version(store, MODEL_SCOPES[scope], family)
@@ -1979,6 +2020,7 @@ def model_versions_of(store: Store, scope: str) -> list[dict]:
         rejected = {
             e["model_version_id"] for e in events if e["kind"] in ("rejected", "kept_previous")
         }
+        expired = {e["model_version_id"] for e in events if e["kind"] == "expired"}
         served = {e["model_version_id"] for e in events if e["kind"] in learning.ROLE_KINDS}
         for row in model_overview(store):
             competitions = version_competitions(row)
@@ -1995,15 +2037,20 @@ def model_versions_of(store: Store, scope: str) -> list[dict]:
                 if vid in waiting
                 else "rejected"
                 if vid in rejected
+                else "expired"
+                if vid in expired
                 else "previous"
                 if vid in served
                 else "unused"
             )
             decision = report.get("decision") if report.get("protocol") == "v2" else None
+            statuses = (
+                report.get("predictive")
+                or (measured.get(vid) or {}).get("elo_predictive")  # TASK 011: Elo statuses
+                or {}
+            )
             validated = [
-                k
-                for k, v in (report.get("predictive") or report.get("elo_predictive") or {}).items()
-                if v.get("status") == "validated_predictive"
+                k for k, v in statuses.items() if v.get("status") == "validated_predictive"
             ]
             out.append(
                 {
@@ -2041,10 +2088,19 @@ def switch_models(
     return out
 
 
-def train_now(store: Store, paths: AppPaths, *, now: datetime, scope: str, progress=None) -> dict:
+def train_now(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    scope: str,
+    progress=None,
+    force: bool = False,
+) -> dict:
     """Training on demand (button in Uczenie AI): new versions under protocol v2 become
-    challengers in shadow mode at once; activating them stays the user's decision."""
-    found = run_protocol_v2(store, paths, now=now, scope=scope, progress=progress)
+    challengers in shadow mode at once; activating them stays the user's decision. Without
+    new matches since the champion's training it refuses unless force (TASK 011)."""
+    found = run_protocol_v2(store, paths, now=now, scope=scope, progress=progress, force=force)
     if progress:
         progress("Prognozy challengerów (tryb cienia)")
     try:

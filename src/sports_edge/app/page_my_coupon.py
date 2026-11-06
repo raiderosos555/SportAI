@@ -351,6 +351,9 @@ def _leg_card(i: int, leg: dict, row) -> None:
                 else ("eksperymentalny", "warn")
             )
         ui.pills(badges)
+        note = c.calibration_note(c.candidate_leg(row)) if mine.modelled(row) else None
+        if note:  # TASK 011 §2.3: the market and range are flagged prospectively
+            st.caption("⚠ " + note)
 
 
 def _saved_note() -> None:

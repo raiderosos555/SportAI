@@ -213,6 +213,7 @@ def _result(found: dict, day_of: dict) -> None:
                                 if leg.predictive_status == "validated_predictive"
                                 else "eksperymentalny"
                             ),
+                            "note": c.calibration_note(c.candidate_leg(leg)),  # TASK 011
                         }
                         for leg in option.legs
                     ]

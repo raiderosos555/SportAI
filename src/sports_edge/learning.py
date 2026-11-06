@@ -23,9 +23,12 @@ KINDS = {
     "kept_previous": "Pozostawiono poprzedni model",
     "rolled_back": "Przywrócono starszą wersję",
     "review": "Przegląd modelu",
+    # TASK 011: a challenger that stopped blocking the review (no evidence, or superseded by
+    # a newer challenger of its scope); it is never activated by this, nothing is deleted
+    "expired": "Wygasły (brak dowodów)",
 }
 ROLE_KINDS = ("activated", "rolled_back")
-CLOSING_KINDS = ("activated", "rolled_back", "rejected", "kept_previous")
+CLOSING_KINDS = ("activated", "rolled_back", "rejected", "kept_previous", "expired")
 HOLDOUT_NOTE = (
     "Holdout od 2024-07-01 był w TASK 005–006 używany do wyboru modeli i statusów, więc "
     "nie jest czystym testem. Status tej wersji jest zawieszony (eksperymentalny) do czasu "

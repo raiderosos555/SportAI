@@ -208,6 +208,11 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         models.session_state["models_view"] = "Puchary i reprezentacje"
         models.run()
         check("modele: puchary i reprezentacje", models, ["Brak eksperymentu międzynarodowego"])
+        # ------------------------------------------------ TASK 011: coupon zone and STS market
+        zone = _app(_page("modele"))
+        zone.session_state["models_view"] = "Uczenie AI"
+        zone.run()
+        check("modele: strefa kuponów i rynek STS", zone, ["nieznane (brak wspólnych meczów)"])
     finally:
         if previous is None:
             os.environ.pop("SPORTS_EDGE_HOME", None)

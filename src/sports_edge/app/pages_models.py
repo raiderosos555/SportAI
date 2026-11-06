@@ -358,7 +358,9 @@ def _models() -> None:
         + (
             json.dumps(validation["market_benchmark"], ensure_ascii=False)
             if validation.get("market_benchmark")
-            else "brak — nie ma legalnych historycznych kursów tych samych meczów; status „validated” jest niemożliwy."
+            else "historycznie nieznane — nie ma legalnych historycznych kursów tych samych "
+            "meczów (pole beats_market = false jest wartością domyślną, nie pomiarem); "
+            "prospektywne porównanie z kursami STS: Modele → Uczenie AI → Porównanie z rynkiem STS."
         )
     )
     reliability = [r for r in holdout.get("reliability", []) if r["n"]]

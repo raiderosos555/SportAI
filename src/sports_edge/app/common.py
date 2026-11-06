@@ -186,6 +186,59 @@ def cached_coverage(_db: Store, version: tuple, days: tuple[str, ...], at: datet
     return coverage_report(_db, paths(), settings(), list(days), now=at, data_kinds=data_kinds())
 
 
+def evaluation_version(db: Store) -> tuple:
+    """data_version plus what changes the prospective evaluation (TASK 011)."""
+    return data_version(db) + tuple(
+        db.scalar(sql) or ""
+        for sql in (
+            "SELECT COUNT(*) FROM prediction_settlements",
+            "SELECT COUNT(*) FROM model_events",
+            "SELECT COUNT(*) FROM quote_sets",
+        )
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=8)
+def cached_evaluation(_db: Store, version: tuple) -> dict:
+    """Coupon-zone reliability and the STS market benchmark (read-only, TASK 011)."""
+    from sports_edge import prospective_eval as pe
+
+    policy = pe.load_policy(paths().config)
+    rows = pe.market_forecasts(_db)
+    return {
+        "calibration": pe.calibration_report(_db, policy=policy, rows=rows),
+        "market": pe.market_comparison(_db, policy=policy, rows=rows),
+        "policy": dict(policy.__dict__),
+    }
+
+
+def evaluation() -> dict:
+    db = store()
+    return cached_evaluation(db, evaluation_version(db))
+
+
+def calibration_note(leg: dict) -> str | None:
+    """TASK 011 §2.3: a short note when the leg's market and range are flagged."""
+    from sports_edge import prospective_eval as pe
+
+    try:
+        table = evaluation()["calibration"]["rows"]
+    except Exception:  # noqa: BLE001 — a note must never break a coupon card
+        return None
+    return pe.note_for_leg(table, leg)
+
+
+def candidate_leg(row) -> dict:
+    """What the calibration note needs from an offer row (Candidate)."""
+    return {
+        "league": row.league,
+        "model": row.model,
+        "market_key": row.market_key,
+        "line": row.line,
+        "p_model": row.p_model,
+    }
+
+
 def day_candidates(day: str):
     """(report, candidates) of an offer day — cached per minute and database state."""
     db = store()
