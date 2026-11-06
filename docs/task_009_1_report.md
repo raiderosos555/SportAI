@@ -127,13 +127,28 @@ Bez zmian, `config/probability_policy.toml` jest identyczny z wersją z `2b39bed
 
 ## 4. Odbiór
 
-| Kontrola | Windows (lokalnie, Python 3.12) | Ubuntu (GitHub Actions) |
+| Kontrola | Windows (lokalnie, Python 3.12) | GitHub Actions, przebieg #13 (`fdd509c`) |
 |---|---|---|
-| Ruff check i format | bez uwag (163 pliki) | po pushu |
-| pytest | 338 zaliczonych | po pushu |
-| Ścieżki interfejsu (`sports_edge.qa`) | 25/25 | po pushu |
-| Playwright (`sports_edge.qa_browser`) | 22/22, pełny cykl workera | po pushu |
-| Testy wizualne (`sports_edge.qa_visual`) | 78/78 | po pushu |
+| Ruff check i format | bez uwag (163 pliki) | sukces |
+| pytest | 338 zaliczonych | sukces |
+| Ścieżki interfejsu (`sports_edge.qa`) | 25/25 | sukces |
+| Playwright (`sports_edge.qa_browser`) | 22/22, pełny cykl workera | sukces |
+| Testy wizualne (`sports_edge.qa_visual`) | 78/78 | sukces |
+
+**GitHub Actions, przebieg #13** (https://github.com/raiderosos555/SportAI/actions/runs/42195557580),
+06.11.2026 09:30–09:42 UTC: **wszystkie 4 konfiguracje zakończone sukcesem**.
+
+| Konfiguracja | Wynik |
+|---|---|
+| ubuntu-latest, Python 3.12 (z Playwright i testami wizualnymi) | sukces |
+| windows-latest, Python 3.12 (z Playwright i testami wizualnymi) | sukces |
+| ubuntu-latest, Python 3.13 | sukces |
+| windows-latest, Python 3.13 | sukces |
+
+* **Artefakty:** `qa-report-Linux` (22,6 MB) i `qa-report-Windows` (13,9 MB).
+* **Wcześniejsze przebiegi:** #9–#12 (od TASK 008) kończyły się błędem wyłącznie w kroku
+  `qa_browser`, na obu systemach.
+* **Ostatni zielony przebieg:** wcześniej był to #8 (TASK 007).
 
 **Artefakty QA** są w `artifacts/qa/` (lokalnie; katalog jest w `.gitignore`):
 * `junit.xml`;
@@ -146,11 +161,8 @@ Bez zmian, `config/probability_policy.toml` jest identyczny z wersją z `2b39bed
 W CI te same pliki trafiają do artefaktów `qa-report-Windows` i `qa-report-Linux`. Nie zawierają
 bazy, kluczy ani prywatnych plików (sprawdza to samo QA).
 
-**Ubuntu i CI.** Konfiguracji Ubuntu nie da się uruchomić na tym komputerze: brak WSL (jest
-tylko instalator) i brak Dockera. Wymóg „wszystkie konfiguracje CI zakończone sukcesem” —
-macierz Windows/Ubuntu × Python 3.12/3.13, Playwright i testy wizualne na 3.12 — zostanie
-potwierdzony dopiero przez GitHub Actions po commicie i pushu tej poprawki. Na chwilę pisania
-raportu CI dla tych zmian **nie zostało uruchomione**.
+**Ubuntu.** Konfiguracji Ubuntu nie da się uruchomić na tym komputerze: brak WSL (jest tylko
+instalator) i brak Dockera. Dlatego Ubuntu sprawdzono w GitHub Actions — wynik powyżej.
 
 ## 5. Zmienione pliki
 
