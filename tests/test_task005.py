@@ -192,6 +192,22 @@ def test_probability_policy_file_has_its_profiles_and_its_own_version():
     assert rules.profiles["higher_payout"]["require_predictive_validation"] is False
 
 
+def test_validated_legs_are_not_crowded_out_by_stronger_experimental_ones():
+    """06.11.2026: 25 experimental selections led the ranking, the shared pool cut the
+    validated ones off and the profiles that require validation proposed nothing."""
+    experimental = [
+        cand(f"E{i}", "1.20", 0.92, 0.88 - i * 0.002, predictive_status="experimental")
+        for i in range(30)
+    ]
+    v1, v2 = cand("V1", "1.32", 0.74, 0.70), cand("V2", "1.38", 0.76, 0.72)
+    report = build([*experimental, v1, v2])
+    balanced = report.proposals["balanced"]
+    assert balanced is not None
+    assert {leg.odds_id for leg in balanced.legs} == {v1.odds_id, v2.odds_id}
+    assert all(leg.predictive_status == VALIDATED for leg in balanced.legs)
+    assert len(report.pool) == 25  # the reported pool keeps its size and ranking
+
+
 def test_safe_profile_takes_the_most_likely_single_that_still_pays():
     a, b = cand("A", "1.30", 0.83, 0.80), cand("B", "1.35", 0.81, 0.78)
     safe = build([a, b]).proposals["safe"]

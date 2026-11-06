@@ -105,33 +105,30 @@ def build_coupons(
     builder = policy.builder
     stake = stake or Decimal(builder["stake"])
     excluded: dict[str, int] = {}
-    per_event: dict[str, list[Candidate]] = {}
+    eligible: list[Candidate] = []
     for candidate in candidates:
         why = eligibility(candidate, float(builder["max_odds_per_leg"]))
         if why:
             excluded[why] = excluded.get(why, 0) + 1
             continue
-        per_event.setdefault(candidate.event_id, []).append(candidate)
-    # A few alternatives per match: a slightly less likely selection with higher odds can make
-    # a better coupon. The search still takes at most one leg from one match.
-    alternatives = [
-        c
-        for items in per_event.values()
-        for c in sorted(items, key=_strength, reverse=True)[: int(builder.get("per_event", 1))]
-    ]
-    pool = tuple(sorted(alternatives, key=_strength, reverse=True)[: int(builder["candidates"])])
+        eligible.append(candidate)
+    per_event = int(builder.get("per_event", 1))
+    pool = _strongest(eligible, per_event, int(builder["candidates"]))
     proposals, refusals, codes, alternatives = {}, {}, {}, {}
-    wide = tuple(
-        sorted(alternatives, key=_strength, reverse=True)[: int(builder.get("long_candidates", 0))]
-    )
     for name, profile in policy.profiles.items():
-        source = wide if int(profile["max_legs"]) > 4 and wide else pool
-        likely = [c for c in source if c.p_low >= float(profile["min_leg_probability"])]
-        legs = [
+        # Every profile searches ITS OWN pool, cut only after its own requirements: when
+        # experimental selections lead the ranking, a shared pool left the validated ones out
+        # and the profiles that require validation found nothing (fixed 06.11.2026).
+        likely = [c for c in eligible if c.p_low >= float(profile["min_leg_probability"])]
+        allowed = [
             c
             for c in likely
             if not profile["require_predictive_validation"] or c.predictive_status == VALIDATED
         ]
+        size = int(builder["candidates"])
+        if int(profile["max_legs"]) > 4:
+            size = int(builder.get("long_candidates", 0)) or size
+        legs = list(_strongest(allowed, per_event, size))
         ranked = _optimise(legs, profile, cost=cost, on_date=on_date, stake=stake)
         if not ranked:
             proposals[name] = None
@@ -172,6 +169,21 @@ def build_coupons(
 
 def _strength(candidate: Candidate) -> tuple[float, float]:
     return candidate.p_low, candidate.p_model
+
+
+def _strongest(items: list[Candidate], per_event: int, limit: int) -> tuple[Candidate, ...]:
+    """A few alternatives per match (a slightly less likely selection with higher odds can make
+    a better coupon), then the strongest ``limit`` selections. The search still takes at most
+    one leg from one match."""
+    by_event: dict[str, list[Candidate]] = {}
+    for candidate in items:
+        by_event.setdefault(candidate.event_id, []).append(candidate)
+    chosen = [
+        c
+        for group in by_event.values()
+        for c in sorted(group, key=_strength, reverse=True)[:per_event]
+    ]
+    return tuple(sorted(chosen, key=_strength, reverse=True)[:limit])
 
 
 EXHAUSTIVE_LIMIT = 200_000  # combinations; beyond this the search is dynamic programming
