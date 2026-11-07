@@ -390,5 +390,24 @@ def coupon_review(coupon: dict) -> list[str]:
             )
             + ". Jeden kupon nie świadczy o jakości modelu; oceniamy setki rozliczonych prognoz."
         )
+    lines.append(forecast_source(proposal["legs"]))
     lines.append("Aplikacja nie zna przyczyn (składy, kontuzje, sędziowanie) — nie są zgadywane.")
     return lines
+
+
+def forecast_source(legs: list[dict]) -> str:
+    """TASK 013 §4.2: which forecast the leg chances of a coupon review come from — the
+    forecast stored with every leg, or (legs saved before the id was stored) the chance
+    written in the saved proposal, marked as a fallback."""
+    with_id = sum(bool(leg.get("prediction_id")) for leg in legs)
+    if legs and with_id == len(legs):
+        return "Źródło szans: prognoza zapisana przy każdej nodze kuponu."
+    if with_id:
+        return (
+            f"Źródło szans: prognoza nogi dla {with_id} z {len(legs)} selekcji; pozostałe to "
+            "FALLBACK — szansa z zapisu propozycji (stara noga bez identyfikatora prognozy)."
+        )
+    return (
+        "Źródło szans: FALLBACK — szansa z zapisu propozycji (stare nogi bez identyfikatora "
+        "prognozy)."
+    )

@@ -230,6 +230,33 @@ CASES = {
 }
 
 
+def closest_text(candidates: list[Candidate], profile: dict, *, max_odds: float) -> str:
+    """TASK 013 §5.3: one line for a profile without a proposal — "najbliżej: …" (match,
+    pick, price, conservative chance, status) or "brak kandydatów w przedziale kursu"."""
+    from sports_edge.analysis.coupon_builder import VALIDATED, closest
+
+    found, excluded = closest(candidates, profile, max_odds=max_odds)
+    if found is None:
+        text = "najbliżej: brak kandydatów w przedziale kursu"
+        if excluded:
+            reason, n = excluded.most_common(1)[0]
+            text += (
+                f" (w przedziale {plural(sum(excluded.values()), 'typ', 'typy', 'typów')} "
+                f"wykluczonych, najczęściej: {reason} — {n})"
+            )
+        return text
+    status = (
+        "zwalidowany predykcyjnie"
+        if found.predictive_status == VALIDATED
+        else "eksperymentalny (bez walidacji predykcyjnej)"
+    )
+    pick = pick_label(found.market_key, found.line, found.selection, found.event)
+    return (
+        f"najbliżej: {found.event} — {pick} @ {num(found.odds, 2)}, ostrożnie "
+        f"{pct(found.p_low)} (próg nogi {pct(float(profile['min_leg_probability']))}), {status}"
+    )
+
+
 def explain_no_coupon(
     candidates: list[Candidate],
     builder,
@@ -389,6 +416,18 @@ JOINT_METHODS = {
     "matrix": "łączna szansa z macierzy wyników Dixon–Coles (λ, μ, ρ zapisane w prognozie)",
     "independent": "założenie niezależności (przybliżenie — typy jednego meczu są skorelowane)",
 }
+# TASK 013 §4.2: where λ, μ, ρ come from — the forecast of the leg itself, or (old legs saved
+# without a forecast id) the newest forecast of the same version for the match
+PARAMETER_SOURCES = {
+    "leg": "prognoza nogi kuponu",
+    "fallback": "FALLBACK: najnowsza prognoza tej wersji dla meczu (stara noga bez "
+    "identyfikatora prognozy)",
+}
+
+
+def prediction_key(prediction_id: str) -> tuple[str, str]:
+    """Key of the score-matrix parameters of ONE forecast in ``matrix_rates``."""
+    return ("prediction", prediction_id)
 
 
 def match_of(leg: dict) -> str:
@@ -406,15 +445,21 @@ def day_risk(proposals: dict, rates: dict | None = None) -> dict | None:
     win). Different matches are independent (the model's assumption).
 
     Several different selections of ONE match (TASK 012 §5): when all of them come from the
-    same Dixon–Coles forecast whose score-matrix parameters were saved (``rates``: (event id,
-    model version id) → {"lambda", "mu", "rho"}) and every market follows from the matrix,
+    same Dixon–Coles forecast whose score-matrix parameters were saved and every market
+    follows from the matrix,
     their joint chance is read from the score matrix: P = Σ matrix · Π masks, shrunk like the
     single chances (× Π q_i / r_i, q: conservative chance, r: the matrix's own chance) — for
     independent selections this is exactly the product of the conservative chances — and
     kept between the Fréchet bounds (max(0, Σ q − (n − 1)) … min q). Otherwise (an old
     forecast without the parameters, Elo 1X2, two models) the selections stay independent
     and ``joint`` says which method each match used. A leg without a conservative chance
-    uses the model chance (``model_fallback``). No stake is recommended."""
+    uses the model chance (``model_fallback``). No stake is recommended.
+
+    TASK 013 §4.2: the parameters are those of the forecast the leg was built from
+    (``rates[prediction_key(leg["prediction_id"])]``; legs of one match must share the same
+    λ, μ, ρ — one fit). A leg saved before the forecast id was stored falls back to the newest
+    forecast of its version for the match (``rates[(event id, model version id)]``), marked
+    ``source = "fallback"`` in ``joint``."""
     from sports_edge.models.goals import outcome_mask, score_matrix
 
     rates = rates or {}
@@ -450,22 +495,43 @@ def day_risk(proposals: dict, rates: dict | None = None) -> dict | None:
         if len(keys) < 2:
             continue
         versions = {legs[k].get("model_version_id") for k in keys}
-        params = rates.get((event, next(iter(versions)))) if len(versions) == 1 else None
+        ids = [legs[k].get("prediction_id") for k in keys]
+        source = "leg" if all(ids) else "fallback"
+        differ = False
+        if len(versions) > 1:
+            params = None
+        elif source == "leg":
+            found = [rates.get(prediction_key(i)) for i in ids]
+            params = found[0] if all(found) else None
+            differ = params is not None and any(
+                {k: float(v[k]) for k in ("lambda", "mu", "rho")}
+                != {k: float(params[k]) for k in ("lambda", "mu", "rho")}
+                for v in found
+            )
+        else:
+            params = rates.get((event, next(iter(versions))))
         masks = {k: outcome_mask(k[1], k[2], k[3]) for k in keys}
-        if params and all(mask is not None for mask in masks.values()):
+        if params and not differ and all(mask is not None for mask in masks.values()):
             matrices[event] = (
                 score_matrix(float(params["lambda"]), float(params["mu"]), float(params["rho"])),
                 masks,
             )
-            joint[event] = {"method": "matrix", "selections": len(keys)}
+            joint[event] = {"method": "matrix", "selections": len(keys), "source": source}
         else:
             if len(versions) > 1:
                 why = "typy z różnych modeli"
+            elif differ:
+                why = "typy z różnych prognoz (inne parametry macierzy)"
             elif params:
                 why = "rynek spoza macierzy wyników (np. Elo 1X2)"
             else:
                 why = "prognoza bez zapisanych parametrów macierzy (starszy zapis)"
-            joint[event] = {"method": "independent", "selections": len(keys), "reason": why}
+            joint[event] = {
+                "method": "independent",
+                "selections": len(keys),
+                "reason": why,
+                "source": source,
+            }
     cache: dict[frozenset, float] = {}
 
     def together(keys: frozenset) -> float:
@@ -505,6 +571,7 @@ def day_risk(proposals: dict, rates: dict | None = None) -> dict | None:
         info["product"] = prod(chances[k] for k in keys)
         info["event"] = legs[next(iter(keys))].get("event") or event
     methods = Counter(info["method"] for info in joint.values())
+    fallbacks = sum(info.get("source") == "fallback" for info in joint.values())
     if methods:
         same_match = "typy jednego meczu: " + "; ".join(
             f"{JOINT_METHODS[k]} — {plural(v, 'mecz', 'mecze', 'meczów')}"
@@ -525,31 +592,45 @@ def day_risk(proposals: dict, rates: dict | None = None) -> dict | None:
         "joint": joint,
         "matrix_matches": methods.get("matrix", 0),
         "independent_matches": methods.get("independent", 0),
+        "fallback_matches": fallbacks,
         "basis": "szanse ostrożne; wspólna selekcja = jedno zdarzenie; różne mecze niezależne; "
         + same_match,
     }
 
 
 def matrix_rates(store, proposals: dict) -> dict[tuple, dict]:
-    """(event id, model version id) → the score-matrix parameters saved with the newest
-    prospective forecast of that version for the match (TASK 012 §5.1); only for matches
-    with several different selections in the day's coupons. Old forecasts have none."""
+    """The score-matrix parameters of the day's coupon legs, only for matches with several
+    different selections in the day's coupons (TASK 012 §5.1). Old forecasts have none.
+
+    TASK 013 §4.2: a leg with its forecast id → ``prediction_key(id)``: the parameters of
+    THAT forecast (the one the coupon was built from, even when a newer forecast of the match
+    exists). A leg saved without the id (older code) → (event id, model version id): the
+    newest prospective forecast of that version for the match — the fallback."""
     import json
 
     seen: dict[str, set] = {}
     versions: dict[str, set] = {}
+    forecasts: dict[str, set] = {}
     for payload in proposals.values():
         for leg in (payload or {}).get("legs", []):
             pick = (leg.get("market_key"), leg.get("line"), leg.get("selection"))
             if not leg.get("event_id"):
                 continue  # an old leg without the event id: no stored forecast to read
             seen.setdefault(leg["event_id"], set()).add(pick)
-            versions.setdefault(leg["event_id"], set()).add(leg.get("model_version_id"))
+            if leg.get("prediction_id"):
+                forecasts.setdefault(leg["event_id"], set()).add(leg["prediction_id"])
+            else:
+                versions.setdefault(leg["event_id"], set()).add(leg.get("model_version_id"))
     out: dict[tuple, dict] = {}
     for event, picks in seen.items():
         if len(picks) < 2:
             continue
-        for version in versions[event]:
+        for prediction_id in sorted(forecasts.get(event, ())):
+            row = store.get("predictions", prediction_id)
+            found = json.loads((row or {}).get("inputs_json") or "{}").get("score_matrix")
+            if found:
+                out[prediction_key(prediction_id)] = found
+        for version in versions.get(event, ()):
             for row in store.rows(
                 """SELECT inputs_json FROM predictions WHERE event_id=? AND model_version_id=?
                 AND kind='prospective' ORDER BY created_at DESC, id""",

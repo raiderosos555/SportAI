@@ -11,7 +11,12 @@ from sports_edge import insights as ins
 from sports_edge.app import common as c
 from sports_edge.app import ui
 from sports_edge.bookmakers import load_profiles
-from sports_edge.coupon_store import DUPLICATE_MESSAGE, RELATION_LABELS, save_manual
+from sports_edge.coupon_store import (
+    DUPLICATE_MESSAGE,
+    RELATION_LABELS,
+    prediction_ids_of,
+    save_manual,
+)
 from sports_edge.forecast_quality import coupon_review
 from sports_edge.paper import (
     MODES,
@@ -164,6 +169,10 @@ def _coupons(db) -> None:
         stake = st.number_input("Stawka (PLN)", min_value=1.0, value=10.0, step=1.0)
         mode = st.selectbox("Tryb", ["paper_manual", "simulation"], format_func=MODES.get)
         if st.button("Zapisz kupon", disabled=not chosen):
+            # TASK 013 §4: every leg keeps the forecast its chance comes from (the day's
+            # candidates, as in Kupon dnia); a leg without a forecast keeps an empty id
+            _report, candidates = c.day_candidates(day)
+            wanted = set(chosen)
             try:
                 result = save_manual(
                     db,
@@ -173,6 +182,9 @@ def _coupons(db) -> None:
                     sts=load_profiles(c.paths().config)["sts"],
                     now=c.now(),
                     note="wybór użytkownika",
+                    prediction_ids=prediction_ids_of(
+                        [x for x in candidates if x.odds_id in wanted]
+                    ),
                 )
                 if result.relation == "duplicate":
                     st.info(DUPLICATE_MESSAGE)

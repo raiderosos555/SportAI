@@ -3,7 +3,7 @@
 # coupon profile, a validation threshold or a served model. A v3 version is always trained as a
 # CHALLENGER (shadow mode); activation stays the user's decision.
 [policy]
-version = "2026-11-06.v3a"
+version = "2026-11-07.v3b"   # TASK 013: half-life rule, 24-month calibration for the 5 top leagues
 
 # Windows of one scope (months before T, each "from" inclusive):
 #   fit (team strengths, as-of)   everything before T − (calibration + selection)
@@ -25,11 +25,38 @@ min_fit_matches = 300        # matches before the calibration window (warm-up of
 calibration_months = 6
 selection_months = 6
 
+# TASK 013 §3: the 5 top leagues calibrate on 24 months [T − 36 mies., T − 12 mies.). In the
+# walk-forward (07.2024–11.2026, 3910 matches, the same matches as TASK 012) every half-life
+# rule with 12-month calibration maps was significantly worse than the frozen v2 champion in
+# O/U 1.5 / O/U 2.5 / BTTS (even the fixed v2 half-life: the 12-month maps were the cause);
+# with 24-month maps no market group is significantly worse (all markets −0.0004, 95%
+# −0.0023…+0.0017). The 7 leagues keep 12 months (shorter history; v3 better there).
+# Found in this measurement — the activation gate (shadow mode, 300 matches) still decides.
+[windows.scopes.core]
+calibration_months = 24
+
 # Activation gate of v3 (there is no untouched historical holdout any more): the prospective
 # comparison with the champion in shadow mode (TASK 011, common settled MATCHES). The selection
 # window result is information only.
 [decision]
 shadow_matches = 300
+
+# TASK 013 §3: how the Dixon–Coles half-life is chosen at a retraining (rolling.HALF_LIFE_RULES):
+#   select12  the lowest score on the 12-month selection window (TASK 012; jumped between 120,
+#             240 and 480 days from month to month in the 5 top leagues)
+#   select24  the lowest score on 24 months (two 12-month blocks, each scored out of sample)
+#   sticky12  keep the previous choice (the newest v3 version, else the champion) unless the
+#             best half-life is better per match: upper bound of the bootstrap 95% < 0
+#   sticky24  the same on 24 months
+#   fixed     the champion's (v2) half-life; only the calibration maps move
+# Chosen: sticky12 — not significantly worse than v2 in any scope or market group (with the
+# 24-month calibration of the 5 top leagues), the best "all markets" result in the 7 leagues
+# (−0.0062, 95% −0.0100…−0.0030) and the most stable choice (1 change in 24 months, core).
+[dixon_coles]
+half_life_rule = "sticky12"
+half_life_months = 24        # select24 / sticky24 only
+change_resamples = 1000      # sticky rules: bootstrap over the matches of the choice window
+change_seed = 7
 
 # Walk-forward proof on history (sports-edge research walk-forward-v3): a v3 retraining at the
 # first day of every month from first_month on; only the matches of that month are forecast.

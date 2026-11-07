@@ -12,7 +12,7 @@ from sports_edge import prospective_eval as pe
 from sports_edge.app import common as c
 from sports_edge.app import international_ui as iui
 from sports_edge.app import ui
-from sports_edge.app.page_learning import learning_panel
+from sports_edge.app.page_learning import gate_text, learning_panel
 from sports_edge.app.pages_models import _data, _forecasts, _models, _results
 from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.models.registry import model_overview
@@ -60,6 +60,8 @@ def _basic() -> None:
     db = c.store()
     served = active_versions(db)
     preference = prediction_preference(db)
+    gate_label, gate_tone = gate_text(db)  # TASK 013 §6: the state of the v3 gate
+    ui.pills([(gate_label, gate_tone)])
     if not any(pair["elo"] or pair["goals"] for pair in served.values()):
         ui.empty_state("Brak modeli", "Uruchom analizę albo eksperyment w trybie zaawansowanym.")
         return
@@ -69,6 +71,7 @@ def _basic() -> None:
         "„Zwalidowany” oznacza potwierdzoną trafność i kalibrację na nowych meczach (okno "
         "selekcji protokołu v2). To nie jest gwarancja trafienia ani zysku."
     )
+    st.caption("Decyzję o bramce v3 zapisujesz w widoku „Uczenie AI” (sekcja Bramka protokołu v3).")
     for name, scope in MODEL_SCOPES.items():
         pair = served[name]
         if not (pair["elo"] or pair["goals"]):

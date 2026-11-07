@@ -42,7 +42,7 @@ import random
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 
 from sports_edge import collection, learning
@@ -828,8 +828,185 @@ def latest_benchmarks(store: Store) -> dict[tuple, dict]:
 VERDICT_STATES = ("model_better", "model_worse", "no_difference")
 
 
+# ---------------------------------------------------------------- TASK 013: odds age
+
+ODDS_AGE_MIN_DAYS = 3  # days with match-day downloads before the numbers count as measured
+ODDS_AGE_DAYS = 7
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _age_summary(ages: list[float]) -> dict:
+    return {
+        "matches": len(ages),
+        "median_hours": round(_median(ages), 2) if ages else None,
+        "within_3h": round(sum(a <= 3 for a in ages) / len(ages), 4) if ages else None,
+    }
+
+
+def odds_age_report(
+    store: Store,
+    *,
+    now: datetime,
+    days: int = ODDS_AGE_DAYS,
+    since: str | None = None,
+    settings: dict | None = None,
+    min_days: int = ODDS_AGE_MIN_DAYS,
+) -> dict:
+    """TASK 013 §7: how old the STS price was at the kick-off, measured on REAL downloads.
+
+    Matches of the 12 supported leagues that started in [first day 00:00 Warsaw, ``now``)
+    (the last ``days`` days, or from ``since``); a match is one row even when STS listed it
+    on several offer days. Age = kick-off − the time printed in the LAST STS document with a
+    price of that match before the start (``valid_at``, else the import time). Per day: STS
+    downloads of the automation (all and in the match-day mode), STS documents imported,
+    the match-day plan with and without the daily cap (``cap_cut``: the cap removed slots).
+    Fewer than ``min_days`` days with match-day downloads: "za mało danych" with the count of
+    days — the numbers are still shown, never guessed or filled in."""
+    from zoneinfo import ZoneInfo
+
+    from sports_edge import automation
+    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    today = now.astimezone(warsaw).date()
+    first = date.fromisoformat(since) if since else today - timedelta(days=days)
+    start = datetime.combine(first, time.min, tzinfo=warsaw).astimezone(UTC)
+    cfg = automation.matchday_config(settings or {})
+    cap = int(cfg.get("daily_cap") or 0)
+    events = [
+        e
+        for e in store.rows(
+            "SELECT id, league, sport, home, away, start_at FROM events WHERE bookmaker_id='sts' "
+            "AND start_at IS NOT NULL AND start_at>=? AND start_at<?",
+            (iso(start - timedelta(days=1)), iso(now + timedelta(days=1))),
+        )
+        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+        and start <= datetime.fromisoformat(e["start_at"]) < now
+    ]
+    observed: dict[str, list[datetime]] = defaultdict(list)
+    ids = sorted({e["id"] for e in events})
+    for chunk in range(0, len(ids), 400):
+        part = ids[chunk : chunk + 400]
+        marks = ",".join("?" for _ in part)
+        for r in store.rows(
+            f"""SELECT DISTINCT m.event_id, COALESCE(q.valid_at, q.ingested_at) observed_at
+            FROM quote_sets q JOIN markets m ON m.id=q.market_id JOIN imports i ON i.id=q.import_id
+            WHERE m.event_id IN ({marks}) AND q.status='ok' AND i.bookmaker_id='sts'""",
+            tuple(part),
+        ):
+            observed[r["event_id"]].append(datetime.fromisoformat(r["observed_at"]))
+    matches: dict[tuple, dict] = {}
+    for e in events:
+        kickoff = datetime.fromisoformat(e["start_at"])
+        before = [t for t in observed.get(e["id"], ()) if t < kickoff]
+        key = (league_code(e["league"], e["sport"]), e["home"], e["away"], e["start_at"])
+        entry = matches.setdefault(
+            key, {"day": kickoff.astimezone(warsaw).date().isoformat(), "last": None}
+        )
+        if before and (entry["last"] is None or max(before) > entry["last"]):
+            entry["last"] = max(before)
+        entry["start"] = kickoff
+    runs: dict[str, dict] = defaultdict(lambda: {"downloads": 0, "matchday_downloads": 0})
+    for r in store.rows(
+        "SELECT finished_at, payload_json FROM job_runs WHERE job=? AND finished_at>=? "
+        "AND finished_at<? AND status IN ('ok','partial')",
+        (automation._job_name("sts_offer"), iso(start), iso(now)),
+    ):
+        day = datetime.fromisoformat(r["finished_at"]).astimezone(warsaw).date().isoformat()
+        runs[day]["downloads"] += 1
+        runs[day]["matchday_downloads"] += bool(
+            json.loads(r["payload_json"] or "{}").get("matchday")
+        )
+    documents: dict[str, int] = defaultdict(int)
+    for r in store.rows(
+        "SELECT ingested_at FROM imports WHERE bookmaker_id='sts' AND ingested_at>=? "
+        "AND ingested_at<? AND data_kind IN ('prospective','archive')",
+        (iso(start), iso(now)),
+    ):
+        documents[
+            datetime.fromisoformat(r["ingested_at"]).astimezone(warsaw).date().isoformat()
+        ] += 1
+    uncapped = {
+        "jobs": {"sts_offer": {"matchday": {**cfg, "daily_cap": 10**6}}},
+    }
+    per_day, ages_by_mode = [], {"matchday": [], "other": []}
+    day = first
+    while day <= today:
+        label = day.isoformat()
+        mine = [m for m in matches.values() if m["day"] == label]
+        ages = [
+            (m["start"] - m["last"]).total_seconds() / 3600 for m in mine if m["last"] is not None
+        ]
+        noon = datetime.combine(day, time(12), tzinfo=warsaw)
+        planned = len(automation.matchday_plan(store, uncapped, now=noon)) if mine else 0
+        found = runs.get(label, {"downloads": 0, "matchday_downloads": 0})
+        mode = "matchday" if found["matchday_downloads"] else "other"
+        ages_by_mode[mode] += ages
+        per_day.append(
+            {
+                "day": label,
+                **_age_summary(ages),
+                "without_price": len(mine) - len(ages),
+                "downloads": found["downloads"],
+                "matchday_downloads": found["matchday_downloads"],
+                "documents": documents.get(label, 0),
+                "slots_uncapped": planned,
+                "slots_capped": min(planned, cap),
+                "cap_cut": planned > cap,
+            }
+        )
+        day += timedelta(days=1)
+    every = [a for v in ages_by_mode.values() for a in v]
+    matchday_days = sum(1 for d in per_day if d["matchday_downloads"])
+    measured = matchday_days >= min_days
+    state = {
+        "state": "measured" if measured else "insufficient",
+        "label": "zmierzone"
+        if measured
+        else (
+            f"za mało danych ({matchday_days} "
+            f"{'dzień' if matchday_days == 1 else 'dni'} z pobraniami w dniu meczu; "
+            f"potrzeba {min_days})"
+        ),
+    }
+    content = sorted(
+        [str(k), m["last"].isoformat() if m["last"] else None] for k, m in matches.items()
+    )
+    return {
+        "period": {"from": first.isoformat(), "until": iso(now)},
+        "days": len(per_day),
+        "matchday_days": matchday_days,
+        **state,
+        "cap": cap,
+        **_age_summary(every),
+        "by_mode": {
+            "matchday": _age_summary(ages_by_mode["matchday"]),
+            "other": _age_summary(ages_by_mode["other"]),
+        },
+        "downloads": sum(d["downloads"] for d in per_day),
+        "matchday_downloads": sum(d["matchday_downloads"] for d in per_day),
+        "cap_cut_days": [d["day"] for d in per_day if d["cap_cut"]],
+        "per_day": per_day,
+        "digest": digest(["odds_age", content, [(d["day"], d["downloads"]) for d in per_day]]),
+        "basis": "wiek = start meczu − czas z ostatniego dokumentu STS z kursem meczu przed "
+        "startem; mecze 12 lig; dzień czasu polskiego",
+    }
+
+
 def weekly_report(
-    store: Store, *, now: datetime, policy: EvalPolicy | None = None, rows: list[dict] | None = None
+    store: Store,
+    *,
+    now: datetime,
+    policy: EvalPolicy | None = None,
+    rows: list[dict] | None = None,
+    settings: dict | None = None,
 ) -> dict:
     """The weekly report (TASK 012 §3.2): the coupon-zone calibration on matches and the STS
     market comparison, appended to ``calibration_reports`` as a history entry (one per data
@@ -844,6 +1021,7 @@ def weekly_report(
     rows = market_forecasts(store) if rows is None else rows
     calibration = calibration_report(store, policy=policy, rows=rows)
     comparison = market_comparison(store, policy=policy, rows=rows)
+    age = odds_age_report(store, now=now, settings=settings)
     # alerts: markets that can enter a coupon, served versions (every flag stays in the entry)
     flags = [
         r
@@ -875,9 +1053,15 @@ def weekly_report(
             if r["matches"]
         ],
         "verdicts": len(verdicts),
+        # TASK 013 §7: the age of the STS price at the kick-off (real downloads, last 7 days)
+        "odds_age": {k: v for k, v in age.items() if k != "digest"},
         "note": "raport informacyjny — nie zmienia modeli, progów profili ani kuponów",
     }
     report_id = digest(["calibration_report", "weekly", policy.version, snapshot])
+    if age["matches"] or age["downloads"]:  # TASK 013: new prices or downloads = a new state
+        report_id = digest(
+            ["calibration_report", "weekly", policy.version, snapshot, age["digest"]]
+        )
     recorded = False
     if store.get("calibration_reports", report_id) is None:
         store.insert(
@@ -939,6 +1123,7 @@ def weekly_report(
         "flags": len(flags),
         "verdicts": len(verdicts),
         "alerts": added,
+        "odds_age": {k: v for k, v in age.items() if k not in ("digest", "per_day")},
     }
 
 

@@ -26,7 +26,17 @@ KINDS = {
     # TASK 011: a challenger that stopped blocking the review (no evidence, or superseded by
     # a newer challenger of its scope); it is never activated by this, nothing is deleted
     "expired": "Wygasły (brak dowodów)",
+    # TASK 013 §6: the user's decision about the activation gate of protocol v3 (no model
+    # event; a withdrawal is a new row, nothing is overwritten)
+    "protocol_gate_accepted": "Bramka v3 zaakceptowana przez użytkownika",
+    "protocol_gate_withdrawn": "Akceptacja bramki v3 wycofana przez użytkownika",
 }
+GATE_KINDS = ("protocol_gate_accepted", "protocol_gate_withdrawn")
+GATE_TEXT = (
+    "Akceptuję bramkę v3: o aktywacji challengera v3 decyduje porównanie w trybie cienia "
+    "(≥ {n} wspólnych meczów), nie historyczny holdout"
+)
+GATE_WAITING = "metodologia v3 czeka na Twoją akceptację"
 ROLE_KINDS = ("activated", "rolled_back")
 CLOSING_KINDS = ("activated", "rolled_back", "rejected", "kept_previous", "expired")
 HOLDOUT_NOTE = (
@@ -85,6 +95,72 @@ def events(store: Store, *, scope: str | None = None, family: str | None = None)
         row["payload"] = json.loads(row.pop("payload_json") or "{}")
         row["label"] = KINDS.get(row["kind"], row["kind"])
     return rows
+
+
+def gate_state(store: Store) -> dict:
+    """TASK 013 §6: is the activation gate of protocol v3 accepted? The newest of the user's
+    decisions (acceptance / withdrawal) holds; without any decision it is NOT accepted."""
+    found = [e for e in events(store) if e["kind"] in GATE_KINDS]
+    last = found[-1] if found else None
+    return {
+        "accepted": bool(last and last["kind"] == "protocol_gate_accepted"),
+        "decision": last,
+        "history": found,
+    }
+
+
+def accept_gate(store: Store, *, now: datetime, shadow_matches: int, note: str = "") -> str:
+    """The USER accepts the v3 gate (only a user action in the Models panel calls this; the
+    system never does). Nothing is activated: an activation stays a separate decision."""
+    text = GATE_TEXT.format(n=shadow_matches)
+    return record(
+        store,
+        kind="protocol_gate_accepted",
+        actor="user",
+        reason=text + (f" — {note}" if note else ""),
+        now=now,
+        payload={"protocol": "v3", "shadow_matches": shadow_matches, "text": text},
+    )
+
+
+def withdraw_gate(store: Store, *, now: datetime, note: str = "") -> str:
+    """The USER withdraws the acceptance — a new row; the acceptance stays in the history."""
+    return record(
+        store,
+        kind="protocol_gate_withdrawn",
+        actor="user",
+        reason="Wycofanie akceptacji bramki v3" + (f" — {note}" if note else ""),
+        now=now,
+        payload={"protocol": "v3"},
+    )
+
+
+def version_protocol(store: Store, version_id: str) -> str:
+    row = store.get("model_versions", version_id)
+    if row is None:
+        return "v1"
+    return json.loads(row["validation_json"] or "{}").get("protocol", "v1")
+
+
+def ever_served(store: Store, version_id: str) -> bool:
+    return bool(
+        store.scalar(
+            "SELECT COUNT(*) FROM model_events WHERE model_version_id=? "
+            "AND kind IN ('activated','rolled_back')",
+            (version_id,),
+        )
+    )
+
+
+def gate_block(store: Store, version_ids) -> str | None:
+    """Why an activation of these versions is refused by the v3 gate (None: not refused): a
+    v3 version that was never served needs the user's acceptance of the gate first."""
+    fresh = [
+        v for v in version_ids if version_protocol(store, v) == "v3" and not ever_served(store, v)
+    ]
+    if fresh and not gate_state(store)["accepted"]:
+        return GATE_WAITING
+    return None
 
 
 def champion_id(store: Store, scope: str, family: str) -> str | None:
@@ -194,7 +270,13 @@ def activate(
     reason: str,
     actor: str = "user",
 ) -> list[str]:
-    """Promote challengers (one per family) of a scope. Called only by a user action."""
+    """Promote challengers (one per family) of a scope. Called only by a user action.
+
+    TASK 013 §6.2: a v3 version that was never served is refused until the user accepted
+    the v3 gate (``gate_block``); the shadow evidence is checked by ``services.switch_models``."""
+    blocked = gate_block(store, versions.values())
+    if blocked:
+        raise ValueError(f"Aktywacja zablokowana: {blocked}")
     return [
         record(
             store,

@@ -46,6 +46,9 @@ REFRESH_LABEL = {
 }
 
 
+HIGH_HIT = "high_hit"  # the WYSOKA TRAFNOŚĆ profile of probability_policy.toml
+
+
 def coupon_page() -> None:
     c.setup_page()
     ui.app_header("KUPON DNIA", "Najbardziej prawdopodobne propozycje według modeli Sports Edge AI")
@@ -223,9 +226,18 @@ def _day(db, settings, rules, day, run, online) -> None:
             st.caption(
                 "Ostatnio zapisane propozycje dla tego dnia — kliknij „Analizuj”, aby odświeżyć."
             )
+    # TASK 013 §5.3: the selection nearest to a WYSOKA TRAFNOŚĆ coupon (read only)
+    high = rules.profiles.get(HIGH_HIT)
+    closest = (
+        ins.closest_text(candidates, high, max_odds=max_odds)
+        if high is not None and proposals.get(HIGH_HIT) is None
+        else None
+    )
     if not any(proposals.values()):
         explanation = ins.explain_no_coupon(candidates, builder, offer, now=now, max_odds=max_odds)
         _no_coupon(explanation, day, run is not None, online)
+        if closest and explanation is not None:
+            st.caption(f"{high['label']} — {closest}")
         return
     by_odds = {x.odds_id: x for x in candidates}
     exposure = _exposure(proposals)
@@ -241,6 +253,7 @@ def _day(db, settings, rules, day, run, online) -> None:
             coupon_id=ids.get(name),
             status=statuses.get(name),
             exposure=exposure,
+            closest=closest if name == HIGH_HIT else None,
             alternatives=[
                 proposal_payload(a, policy_version=rules.version)
                 for a in alternatives.get(name, ())
@@ -301,6 +314,9 @@ def risk_numbers(proposals: dict, rates: dict | None = None) -> list[str]:
             + ", ".join(reasons)
             + ") — to przybliżenie, bo są skorelowane"
         )
+    if found["joint"]:
+        sources = sorted({i.get("source", "fallback") for i in found["joint"].values()})
+        basis += "; parametry meczu: " + ", ".join(ins.PARAMETER_SOURCES[k] for k in sources)
     if found["model_fallback"]:
         basis += f"; bez szansy ostrożnej (użyto szansy modelu): {found['model_fallback']}"
     points.append(basis + ". To opis ryzyka, nie rekomendacja stawek.")

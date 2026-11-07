@@ -235,28 +235,9 @@ def analyse_day(
     restricts the offer to what was known then (historical simulator)."""
     profiles = load_profiles(paths.config)
     rules = policy(paths)
-    candidates = evaluate(
-        offer_table(store, day=day, data_kinds=data_kinds, as_of=as_of),
-        predictions=with_predictive_status(
-            store,
-            latest_predictions(
-                store,
-                as_of=now,
-                prefer=prediction_preference(store),
-                versions=active_version_ids(store),
-                offer_dates=[day],
-            ),
-        ),
-        profile=profiles["sts"],
-        market_rules=load_rules(paths.config),
-        policy=rules,
-        now=now,
-        max_age=timedelta(minutes=settings.max_quote_age_minutes),
-        stake=Decimal(settings.nominal_stake),
+    candidates, _predictions = day_candidates_at(
+        store, paths, settings, day, now=now, data_kinds=data_kinds, as_of=as_of
     )
-    from sports_edge.international import gate_candidates
-
-    candidates = gate_candidates(store, candidates)  # TASK 009: cups only after validation
     report = build_daily_coupon(
         candidates,
         rules,
@@ -1637,6 +1618,52 @@ def league_code(sts_league: str, sport: str | None = None) -> str | None:
     return found.code if found else None
 
 
+def day_candidates_at(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    day: str,
+    *,
+    now: datetime,
+    data_kinds: tuple[str, ...] = ("prospective", "archive"),
+    as_of: datetime | None = None,
+    versions: set[str] | None = None,
+    goals: dict[str, dict] | None = None,
+) -> tuple[list[Candidate], dict]:
+    """(candidates, forecasts) of an offer day — the engine of ``analyse_day``.
+
+    TASK 013 §5 (measurements only): ``versions`` — the model versions whose forecasts are
+    used (default: the served ones); ``goals`` — scope → the Dixon–Coles version whose
+    report decides the 1X2 model and the Elo statuses (default: the served one). A shadow
+    replay passes the challengers here; nothing is served or saved by it."""
+    profiles = load_profiles(paths.config)
+    rules = policy(paths)
+    predictions = with_predictive_status(
+        store,
+        latest_predictions(
+            store,
+            as_of=now,
+            prefer=prediction_preference(store, goals=goals),
+            versions=active_version_ids(store) if versions is None else versions,
+            offer_dates=[day],
+        ),
+        benchmarks=elo_benchmarks(store, goals=goals) if goals is not None else None,
+    )
+    candidates = evaluate(
+        offer_table(store, day=day, data_kinds=data_kinds, as_of=as_of),
+        predictions=predictions,
+        profile=profiles["sts"],
+        market_rules=load_rules(paths.config),
+        policy=rules,
+        now=now,
+        max_age=timedelta(minutes=settings.max_quote_age_minutes),
+        stake=Decimal(settings.nominal_stake),
+    )
+    from sports_edge.international import gate_candidates
+
+    return gate_candidates(store, candidates), predictions  # TASK 009: cups after validation
+
+
 def match_review(
     store: Store, *, event_id: str, candidates: list[Candidate], now: datetime
 ) -> dict:
@@ -1860,27 +1887,28 @@ def run_goals_experiment(
     )
 
 
-def elo_benchmarks(store: Store) -> dict[str, dict]:
+def elo_benchmarks(store: Store, *, goals: dict[str, dict] | None = None) -> dict[str, dict]:
     """Elo version id → report of the served goals experiment that judged it (per scope).
 
     Goals versions registered before the Elo id was recorded used the newest Elo version of
-    their scope that existed when the goals experiment ran.
+    their scope that existed when the goals experiment ran. ``goals`` (TASK 013, shadow
+    measurements only): scope name → the goals version to read instead of the served one.
     """
     out: dict[str, dict] = {}
-    for scope in MODEL_SCOPES.values():
-        goals = scope_version(store, scope, GOALS_FAMILY)
-        if goals is None:
+    for name, scope in MODEL_SCOPES.items():
+        row = scope_version(store, scope, GOALS_FAMILY) if goals is None else goals.get(name)
+        if row is None:
             continue
-        report = json.loads(goals["validation_json"])
+        report = json.loads(row["validation_json"])
         version_id = report.get("elo_version_id")
         if version_id is None:
             version_id = next(
                 (
-                    row["version_id"]
-                    for row in model_overview(store)
-                    if row["family"] == ELO_FAMILY
-                    and row["created_at"] <= goals["created_at"]
-                    and set(version_competitions(row)) <= set(scope)
+                    found["version_id"]
+                    for found in model_overview(store)
+                    if found["family"] == ELO_FAMILY
+                    and found["created_at"] <= row["created_at"]
+                    and set(version_competitions(found)) <= set(scope)
                 ),
                 None,
             )
@@ -1898,11 +1926,14 @@ def elo_validation(store: Store) -> tuple[str | None, dict, dict]:
     return elo["version_id"], report.get("elo_predictive") or {}, report.get("elo_families") or {}
 
 
-def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict[tuple, dict]:
+def with_predictive_status(
+    store: Store, predictions: dict[tuple, dict], *, benchmarks: dict[str, dict] | None = None
+) -> dict[tuple, dict]:
     """Elo forecasts carry no status of their own: the goals experiment of their scope
     measured it for one Elo version, so only that version's forecasts receive it; a league
-    that fails its own gate stays experimental."""
-    benchmarks = elo_benchmarks(store)
+    that fails its own gate stays experimental. ``benchmarks`` (TASK 013, measurements):
+    the Elo version → goals report map to use instead of the served one."""
+    benchmarks = elo_benchmarks(store) if benchmarks is None else benchmarks
 
     def status(report: dict, family: str, competition: str | None) -> str:
         value = ((report.get("elo_predictive") or {}).get(family) or {}).get(
@@ -1955,19 +1986,20 @@ def _suspend_status(row: dict) -> None:
     row["version_status"] = "experimental"
 
 
-def prediction_preference(store: Store) -> dict:
+def prediction_preference(store: Store, *, goals: dict[str, dict] | None = None) -> dict:
     """Model serving 1X2 (and the double chance derived from it), per scope and league.
 
     The model that passed the predictive validation wins; when both or neither passed, the
     lower log loss of the deciding window decides (validation in v1, selection in v2). The
     holdout never decides: statuses of v1 versions (chosen on a used holdout) do not count.
+    ``goals`` (TASK 013, measurements only): scope name → the goals version to read.
     """
     out: dict = {}
     for name, scope in MODEL_SCOPES.items():
-        goals = scope_version(store, scope, GOALS_FAMILY)
-        if goals is None:
+        row = scope_version(store, scope, GOALS_FAMILY) if goals is None else goals.get(name)
+        if row is None:
             continue
-        report = json.loads(goals["validation_json"])
+        report = json.loads(row["validation_json"])
         v2 = report.get("protocol") in ("v2", "v3")
         elo_ok = (
             v2
@@ -2162,7 +2194,7 @@ def run_protocol_v3(
             "wyraźnie oznaczony)."
         )
     forced = bool(force and since is not None and fresh == 0)
-    windows_policy = rolling.load_policy(paths.config)
+    windows_policy = rolling.load_policy(paths.config).for_scope(scope)  # TASK 013 §3
     if progress:
         progress(f"Elo ({SCOPE_LABELS[scope]}): okna v3")
     elo = rolling.run_elo_v3(
@@ -2192,6 +2224,7 @@ def run_protocol_v3(
         identities=team_identities(paths),
         elo_version_id=elo["version_id"],
         rolling=windows_policy,
+        previous_half_life=previous_half_life(store, scope),
     )
     goals_row = next(r for r in model_overview(store) if r["version_id"] == goals["version_id"])
     changed = {
@@ -2241,9 +2274,11 @@ def run_walk_forward_v3(
     scope: str,
     first_month: str | None = None,
     progress=None,
+    rules: tuple[str, ...] | None = None,
 ) -> dict:
     """TASK 012 §2.3: monthly v3 retraining against the frozen champion (served v2 version)
-    of a scope, on the same matches (read-only: nothing is registered or activated)."""
+    of a scope, on the same matches (read-only: nothing is registered or activated).
+    ``rules`` (TASK 013 §3): Dixon–Coles half-life rules measured on the same matches."""
     from sports_edge import rolling
 
     champions = (
@@ -2252,7 +2287,7 @@ def run_walk_forward_v3(
     )
     if None in champions:
         raise ValueError("Brak aktywnych wersji Elo i Dixon–Coles tego zakresu")
-    policy_v3 = rolling.load_policy(paths.config)
+    policy_v3 = rolling.load_policy(paths.config).for_scope(scope)  # TASK 013 §3
     starts = rolling.month_starts(first_month or policy_v3.first_month, now)
     return rolling.walk_forward(
         store,
@@ -2265,7 +2300,24 @@ def run_walk_forward_v3(
         rolling=policy_v3,
         months=starts,
         progress=progress,
+        rules=rules,
     )
+
+
+def previous_half_life(store: Store, scope: str) -> float | None:
+    """TASK 013 §3: the previous half-life choice of a scope — the newest v3 Dixon–Coles
+    version (its own rule kept it or changed it), else the served version."""
+    from sports_edge import rolling
+
+    for row in (
+        newest_protocol_version(store, scope, GOALS_FAMILY, rolling.PROTOCOL),
+        scope_version(store, MODEL_SCOPES[scope], GOALS_FAMILY),
+    ):
+        if row is not None:
+            value = json.loads(row["validation_json"]).get("half_life_days")
+            if value is not None:
+                return float(value)
+    return None
 
 
 def train_challengers(
@@ -2359,6 +2411,39 @@ def model_versions_of(store: Store, scope: str) -> list[dict]:
     return out
 
 
+def activation_block(store: Store, scope: str, versions: dict[str, str]) -> str | None:
+    """TASK 013 §6.2: why serving these versions is refused (None: allowed — the decision
+    is still the user's). A v3 version that was never served needs the user's acceptance of
+    the v3 gate and then the shadow evidence: at least ``decision_matches`` common settled
+    matches with the champion (n/300). v1/v2 versions and older champions are not gated."""
+    from sports_edge import prospective_eval as pe
+
+    blocked = learning.gate_block(store, versions.values())
+    if blocked:
+        return blocked
+    policy = pe.load_policy()
+    rows = None
+    for family, version_id in sorted(versions.items()):
+        if learning.version_protocol(store, version_id) != "v3":
+            continue
+        if learning.ever_served(store, version_id):
+            continue
+        champion = scope_version(store, MODEL_SCOPES[scope], family)
+        if champion is None or champion["version_id"] == version_id:
+            continue
+        rows = pe.market_forecasts(store) if rows is None else rows
+        found = pe.paired_matches(
+            store, champion["version_id"], version_id, policy=policy, rows=rows
+        )
+        if not found.get("enough"):
+            needed = found.get("needed") or policy.decision_matches
+            return (
+                "za mało dowodów w trybie cienia "
+                f"({found.get('matches', 0)}/{needed} wspólnych rozliczonych meczów)"
+            )
+    return None
+
+
 def switch_models(
     store: Store,
     paths: AppPaths,
@@ -2369,7 +2454,11 @@ def switch_models(
     reason: str,
 ) -> dict:
     """Serve the chosen versions (user decision) and forecast upcoming events with them at
-    once, so the new champions do not start without forecasts."""
+    once, so the new champions do not start without forecasts. TASK 013: refused with the
+    reason of ``activation_block`` (v3 gate not accepted, too little shadow evidence)."""
+    blocked = activation_block(store, scope, versions)
+    if blocked:
+        raise ValueError(f"Aktywacja zablokowana: {blocked}")
     learning.activate(store, scope=scope, versions=versions, now=now, reason=reason)
     out = {"activated": versions}
     try:

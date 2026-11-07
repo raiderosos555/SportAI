@@ -213,6 +213,24 @@ def changes_between(store: Store, official_id: str, coupon_id: str) -> dict:
 # ---------------------------------------------------------------- the builder
 
 
+def prediction_ids_of(legs) -> dict[str, str]:
+    """TASK 013 §4: odds id → id of the forecast the leg's chance comes from (candidates or
+    payload legs); a leg without a forecast is left out (its ``prediction_id`` stays empty)."""
+    out = {}
+    for leg in legs:
+        if leg is None:
+            continue
+        odds_id = leg["odds_id"] if isinstance(leg, dict) else leg.odds_id
+        found = (
+            leg.get("prediction_id")
+            if isinstance(leg, dict)
+            else getattr(leg, "prediction_id", None)
+        )
+        if found:
+            out[odds_id] = found
+    return out
+
+
 def save_builder(
     store: Store,
     *,
@@ -226,8 +244,11 @@ def save_builder(
     now: datetime,
     sts,
     note: str,
+    prediction_ids: dict[str, str] | None = None,
 ) -> SaveResult:
-    """One builder proposal under the rules of the module docstring."""
+    """One builder proposal under the rules of the module docstring. ``prediction_ids``
+    (odds id → forecast id, TASK 013) are stored with the legs; they never enter the coupon
+    identity (another forecast of the same selection is the same coupon)."""
     legs = _odds_legs(store, odds_ids)
     selections = [s for s, _ in legs]
     signature = _signature(legs)
@@ -253,6 +274,7 @@ def save_builder(
             profile=sts,
             now=now,
             analysis_id=analysis_id,
+            prediction_ids=prediction_ids,
             note=note,
             proposal=payload,
             key=key,
@@ -380,6 +402,7 @@ def _leg(leg: Candidate) -> dict:
         "document_at": leg.document_at,
         "odds_age_hours": leg.odds_age_hours,
         "freshness": leg.freshness,
+        "prediction_id": getattr(leg, "prediction_id", None),  # TASK 013: the forecast of the leg
     }
 
 
@@ -406,6 +429,7 @@ def save_proposals(
                 now=now,
                 sts=sts,
                 note=f"Kreator kuponów — {proposal.label}",
+                prediction_ids=prediction_ids_of(proposal.legs),
             ).as_dict()
         except ValueError as error:
             out[name] = {"error": str(error)}
@@ -480,10 +504,12 @@ def save_manual(
     analysis_id: str | None = None,
     late_entry: bool = False,
     confirm_copy: bool = False,
+    prediction_ids: dict[str, str] | None = None,
 ) -> SaveResult:
     """A coupon saved by the user (Mój kupon, Historia, Diagnostyka). The same coupon saved
     again (a double click, a rerun) returns the existing one. A second IDENTICAL real coupon
-    (placed twice in STS) needs ``confirm_copy`` — a deliberate decision, never a click."""
+    (placed twice in STS) needs ``confirm_copy`` — a deliberate decision, never a click.
+    ``prediction_ids`` (odds id → forecast id, TASK 013) are stored with the legs."""
     legs = _odds_legs(store, odds_ids)
     selections = [s for s, _ in legs]
     day = local_day(now)
@@ -504,6 +530,7 @@ def save_manual(
         profile=sts,
         now=now,
         analysis_id=analysis_id,
+        prediction_ids=prediction_ids,
         note=note,
         proposal=proposal,
         key=key,
@@ -597,6 +624,7 @@ def save_my_coupon_result(
         proposal=payload,
         late_entry=late,
         confirm_copy=confirm_copy,
+        prediction_ids=prediction_ids_of(present),
     )
 
 

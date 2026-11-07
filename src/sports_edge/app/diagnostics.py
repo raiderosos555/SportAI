@@ -9,7 +9,7 @@ import streamlit as st
 from sports_edge.analysis.coupon import NO_EDGE
 from sports_edge.app import common as c
 from sports_edge.bookmakers import load_profiles
-from sports_edge.coupon_store import DUPLICATE_MESSAGE, save_manual
+from sports_edge.coupon_store import DUPLICATE_MESSAGE, prediction_ids_of, save_manual
 from sports_edge.services import policy
 
 
@@ -150,6 +150,7 @@ def ev_analysis(db, run) -> None:
                         sts=profile,
                         now=c.now(),
                         analysis_id=run.analysis_id,
+                        prediction_ids=prediction_ids_of([x]),
                     )
                     if result.relation == "duplicate":
                         st.info(DUPLICATE_MESSAGE)

@@ -236,6 +236,16 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         zone.session_state["models_view"] = "Uczenie AI"
         zone.run()
         check("modele: strefa kuponów i rynek STS", zone, ["nieznane (brak wspólnych meczów)"])
+        # ------------------------------------------------ TASK 013: v3 gate and "najbliżej"
+        check("modele: bramka v3 (stan)", zone, ["metodologia v3 czeka na Twoją akceptację"])
+        sure = next((b for b in zone.checkbox if b.label.startswith("Akceptuję bramkę v3")), None)
+        if sure is not None:
+            sure.check().run()
+            _button(zone, "Zapisz akceptację bramki v3").click().run()
+        check("modele: akceptacja bramki v3 (zapis decyzji)", zone, ["zaakceptowana przez Ciebie"])
+        nearest = _app(_page("kupon"))
+        nearest.run()
+        check("kupon dnia: najbliżej (WYSOKA TRAFNOŚĆ)", nearest, ["najbliżej:"])
     finally:
         if previous is None:
             os.environ.pop("SPORTS_EDGE_HOME", None)

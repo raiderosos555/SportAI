@@ -97,3 +97,12 @@ rozliczonych meczów, TASK 011); wynik okna selekcji to tylko informacja. Wersja
 rejestrowana jako challenger, a aktywacja należy do użytkownika. Dowód historyczny bez czekania:
 walk-forward z retreningiem co miesiąc (`sports-edge research walk-forward-v3`) na tych samych
 meczach co zamrożona wersja v2 — szczegóły i wyniki w `docs/task_012_report.md`.
+
+TASK 013 (wersja polityki `2026-11-07.v3b`): okres połowicznego zaniku Dixon–Coles wybierany
+regułą **kary za zmianę** (`sticky12`: inna wartość niż poprzedni wybór tylko, gdy górna granica
+95% bootstrapu po meczach różnicy log loss w oknie selekcji jest < 0), a 5 czołowych lig
+kalibruje na **24 miesiącach** ([T − 36, T − 12 mies.)) — z kalibratorami z 12 mies. każda
+reguła była tam istotnie gorsza od v2 w O/U 1,5 i 2,5. Reguła i jej decyzja są w
+`validation_json` nowych wersji (`half_life_rule`). O aktywacji challengera v3 decyduje tryb
+cienia dopiero po zapisanej akceptacji bramki przez użytkownika (`model_events`,
+`protocol_gate_accepted`); bez niej aktywacja v3 jest zablokowana. Wyniki: `docs/task_013_report.md`.

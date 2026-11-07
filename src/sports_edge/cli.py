@@ -77,6 +77,7 @@ def research(
     force: bool = False,
     first_month: str | None = None,
     out: Path | None = None,
+    rules: str | None = None,
 ) -> None:
     """Independent data and the first experiment; downloads respect the offline setting."""
     from sports_edge import services
@@ -136,7 +137,13 @@ def research(
         )
     elif step == "walk-forward-v3":  # TASK 012 §2.3: read-only proof on history
         found = services.run_walk_forward_v3(
-            store, paths, now=now, scope=scope, first_month=first_month, progress=print
+            store,
+            paths,
+            now=now,
+            scope=scope,
+            first_month=first_month,
+            progress=print,
+            rules=tuple(r.strip() for r in rules.split(",")) if rules else None,
         )
         rows = found.pop("rows")
         if out is not None:
@@ -388,6 +395,11 @@ def main() -> None:
     )
     res.add_argument("--first-month", help="walk-forward-v3: first month YYYY-MM (default 2024-07)")
     res.add_argument("--out", type=Path, help="walk-forward-v3: write every forecast row to JSON")
+    res.add_argument(
+        "--rules",
+        help="walk-forward-v3 (TASK 013): Dixon–Coles half-life rules on the same matches, "
+        "comma separated (select12, select24, sticky12, sticky24, fixed); the first is 'v3'",
+    )
     ana = commands.add_parser(
         "analyse", help="GENERUJ KUPONY DNIA without the interface (14 stages, saved proposals)"
     )
@@ -437,7 +449,12 @@ def main() -> None:
         sys.exit(check())
     elif args.command == "research":
         research(
-            args.step, args.scope, force=args.force, first_month=args.first_month, out=args.out
+            args.step,
+            args.scope,
+            force=args.force,
+            first_month=args.first_month,
+            out=args.out,
+            rules=args.rules,
         )
     elif args.command == "analyse":
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)

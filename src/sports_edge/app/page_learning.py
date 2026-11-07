@@ -24,6 +24,7 @@ from sports_edge.services import (
     ROLE_LABELS,
     SCOPE_LABELS,
     ablation_reports,
+    activation_block,
     challenger_versions,
     model_versions_of,
     switch_models,
@@ -65,6 +66,7 @@ def learning_panel() -> None:
             "po wyniku.",
         ],
     )
+    gate_panel(db)
     for scope in MODEL_SCOPES:
         _scope(db, scope, now)
     _review(db, now)
@@ -80,6 +82,76 @@ def learning_panel() -> None:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=320)
     else:
         st.caption("Brak zapisanych zdarzeń modeli.")
+
+
+def gate_text(db) -> tuple[str, str]:
+    """(state label, tone) of the v3 activation gate — the user's recorded decision."""
+    state = learning.gate_state(db)
+    decision = state["decision"]
+    if state["accepted"]:
+        return (
+            "Bramka v3 zaakceptowana przez Ciebie "
+            + c.local_time(decision["created_at"], "%d.%m.%Y %H:%M"),
+            "ok",
+        )
+    if decision is not None:
+        return (
+            "Bramka v3: akceptacja wycofana "
+            + c.local_time(decision["created_at"], "%d.%m.%Y %H:%M")
+            + " — "
+            + learning.GATE_WAITING,
+            "warn",
+        )
+    return "Bramka v3: " + learning.GATE_WAITING, "warn"
+
+
+def gate_panel(db) -> None:
+    """TASK 013 §6: the user's explicit, recorded decision about the activation gate of
+    protocol v3. Accepting activates nothing; a withdrawal is a new row of the history."""
+    from sports_edge import rolling
+
+    n = rolling.load_policy(c.paths().config).shadow_matches
+    state = learning.gate_state(db)
+    label, tone = gate_text(db)
+    ui.section("Bramka protokołu v3", "Twoja decyzja o metodologii aktywacji")
+    ui.pills([(label, tone)])
+    ui.explanation(
+        "Co oznacza bramka v3",
+        [
+            "Protokół v3 nie ma nietkniętego historycznego holdoutu: okna przesuwają się z datą "
+            "treningu, a ostatnie 12 miesięcy wybiera hiperparametry.",
+            f"Dlatego o aktywacji challengera v3 rozstrzyga porównanie z aktywną wersją w trybie "
+            f"cienia — co najmniej {n} wspólnych rozliczonych meczów.",
+            "Bez Twojej akceptacji challengery v3 są trenowane i obserwowane w cieniu, ale ich "
+            "aktywacja jest zablokowana. Akceptacja niczego nie aktywuje: aktywacja to osobna "
+            f"decyzja i wymaga dowodów (n/{n}).",
+            "Każda decyzja (akceptacja, wycofanie) to nowy wpis historii uczenia — nic nie jest "
+            "nadpisywane.",
+        ],
+    )
+    if state["accepted"]:
+        sure = st.checkbox(
+            "Chcę wycofać akceptację bramki v3 (aktywacja challengerów v3 znów zablokowana)",
+            key="gate_withdraw_sure",
+        )
+        if st.button(
+            "Wycofaj akceptację bramki v3",
+            key="gate_withdraw",
+            disabled=not sure,
+            icon=":material/undo:",
+        ):
+            learning.withdraw_gate(db, now=c.now(), note="panel Modele → Uczenie AI")
+            st.rerun()
+        return
+    sure = st.checkbox(learning.GATE_TEXT.format(n=n), key="gate_accept_sure")
+    if st.button(
+        "Zapisz akceptację bramki v3",
+        key="gate_accept",
+        disabled=not sure,
+        icon=":material/verified:",
+    ):
+        learning.accept_gate(db, now=c.now(), shadow_matches=n, note="panel Modele → Uczenie AI")
+        st.rerun()
 
 
 def _scope(db, scope: str, now) -> None:
@@ -115,11 +187,14 @@ def _scope(db, scope: str, now) -> None:
             {"elo": ELO_FAMILY, "goals": GOALS_FAMILY}[k]: row["version_id"]
             for k, row in waiting.items()
         }
+        blocked = activation_block(db, scope, versions)  # TASK 013 §6.2
+        if blocked:
+            st.caption(f"Aktywacja zablokowana: {blocked}.")
         if cols[0].button(
             "AKTYWUJ NOWY MODEL",
             key=f"learn_on_{scope}",
             type="primary",
-            disabled=not sure,
+            disabled=not sure or bool(blocked),
             icon=":material/rocket_launch:",
         ):
             _switch(scope, versions, "Decyzja użytkownika w panelu Uczenie AI (aktywacja)")
@@ -143,9 +218,13 @@ def _scope(db, scope: str, now) -> None:
 
 def _switch(scope: str, versions: dict[str, str], reason: str) -> None:
     with st.spinner("Zmiana modelu i prognozy nadchodzących meczów…"):
-        switch_models(
-            c.store(), c.paths(), scope=scope, versions=versions, now=c.now(), reason=reason
-        )
+        try:
+            switch_models(
+                c.store(), c.paths(), scope=scope, versions=versions, now=c.now(), reason=reason
+            )
+        except ValueError as error:  # TASK 013: the v3 gate or too little shadow evidence
+            st.error(str(error))
+            return
     st.cache_data.clear()
     st.rerun()
 
@@ -204,11 +283,14 @@ def _versions(db, scope: str) -> None:
             "Rozumiem: wybrane wersje zastąpią aktywne modele tego zakresu",
             key=f"learn_pick_sure_{scope}",
         )
+        blocked = activation_block(db, scope, chosen) if chosen else None  # TASK 013 §6.2
+        if blocked:
+            st.caption(f"Aktywacja zablokowana: {blocked}.")
         if st.button(
             "Ustaw wybrane jako aktywne",
             key=f"learn_pick_go_{scope}",
             icon=":material/restore:",
-            disabled=not (sure and chosen),
+            disabled=not (sure and chosen) or bool(blocked),
         ):
             _switch(scope, chosen, "Wybór wersji przez użytkownika w panelu Uczenie AI")
 

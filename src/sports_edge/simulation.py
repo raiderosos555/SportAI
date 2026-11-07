@@ -14,7 +14,7 @@ invented prices. Results are stored as simulation runs, apart from virtual or re
 """
 
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, time
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -446,3 +446,277 @@ def _result(store: Store, event_id: str) -> dict | None:
         (event_id,),
     )
     return rows[0] if rows else None
+
+
+# ---------------------------------------------------------------- TASK 013 §5: WYSOKA TRAFNOŚĆ
+
+HIGH_HIT = "high_hit"
+P_LOW_BINS = (0.0, 0.60, 0.65, 0.70, 0.75, 1.0001)
+N_BUCKETS = ((0, 100), (100, 300), (300, 1000), (1000, 10**9))
+
+
+def _bin_label(value: float, edges: tuple[float, ...]) -> str:
+    for low, high in zip(edges, edges[1:], strict=False):
+        if low <= value < high:
+            return f"{low:.2f}–{min(high, 1.0):.2f}"
+    return "?"
+
+
+def _bucket(n: int) -> str:
+    for low, high in N_BUCKETS:
+        if low <= n < high:
+            return f"{low}–{high}" if high < 10**9 else f"≥ {low}"
+    return "?"
+
+
+def calibration_sample(row: dict, market_key: str, selection: str, line) -> tuple[str, int | None]:
+    """What the conservative bound of a selection rests on: (label, n of the calibration
+    sample). Elo: the calibration-window reliability bin of the probability (double chance:
+    the bound is the SUM of the bounds of two 1X2 sides — the smaller bin); Dixon–Coles: the
+    isotonic block of the raw probability (double chance: the complement of ONE 1X2 side)."""
+    from sports_edge.analysis.edge_engine import DERIVED_FROM_1X2
+    from sports_edge.models import calibration
+    from sports_edge.probability_lab import OPPOSITE, family_of
+    from sports_edge.sportsdata import elo_parameters
+
+    probs = row["probabilities"]
+    if row["family"] == "elo_ordered_draw":
+        validation = row["validation"]
+        bins = elo_parameters(validation)[1] if "hyperparameters" in validation else []
+
+        def size(p: float) -> int | None:
+            return next((b["n"] for b in bins if b["low"] <= p < b["high"]), None)
+
+        if market_key == "double_chance":
+            found = [size(probs[k]) for k in DERIVED_FROM_1X2["double_chance"][selection]]
+            known = [n for n in found if n]
+            label = "Elo podwójna szansa (suma przedziałów 2 wyników 1X2)"
+            return label, min(known, default=None)
+        return "Elo 1X2", size(probs.get(selection, 0.0))
+    maps = row["validation"].get("calibrators") or {}
+    raw = row["uncertainty"].get("raw") or {}
+    if market_key == "double_chance":
+        blocks, value = maps.get("1x2"), raw.get(OPPOSITE[selection])
+        label = "Dixon–Coles podwójna szansa (dopełnienie 1 wyniku 1X2)"
+    else:
+        family = family_of(market_key, float(line) if line not in (None, "") else None)
+        blocks = maps.get(family) if family else None
+        first = next(iter(raw), None)
+        value = raw.get(selection) if market_key == "1x2" else raw.get(first)
+        label = f"Dixon–Coles {family or market_key}"
+    if not blocks or value is None:
+        return label, None
+    return label, int(calibration.isotonic_apply(blocks, value)[1])
+
+
+def _complement_low(row: dict, selection: str) -> float | None:
+    """Elo double chance with the Dixon–Coles definition: 1 − upper bound of the excluded
+    1X2 outcome (one interval instead of the sum of two) — a what-if, never served."""
+    from sports_edge.probability_lab import OPPOSITE
+
+    bounds = (row["uncertainty"].get("interval") or {}).get(OPPOSITE.get(selection))
+    return None if not bounds else max(0.0, 1.0 - float(bounds[1]))
+
+
+def _median(values: list[float]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def high_hit_diagnosis(
+    store: Store,
+    paths,
+    settings,
+    days: list[str],
+    *,
+    hours: tuple[int, ...] = (10, 14, 18),
+    until: datetime | None = None,
+    versions_at=None,
+    goals: dict[str, dict] | None = None,
+    profile_name: str = HIGH_HIT,
+    stake: Decimal = Decimal("10.00"),
+) -> dict:
+    """TASK 013 §5.1: why WYSOKA TRAFNOŚĆ makes (almost) no coupon — a read-only as-of replay.
+
+    For every day and decision hour (Warsaw; none after ``until``): the offer and the forecasts
+    known then (``versions_at(t)``: the versions whose forecasts count — default: the versions
+    SERVED at t), the builder run once with the unchanged policy, and measured: the binding
+    refusal code of the profile; the conservative chance of the selections priced inside the
+    profile's odds range (eligible ones: fresh price, before the start) by status; the gap
+    model chance − conservative chance per kind of bound and size of its calibration sample;
+    and a what-if of another definition of the conservative chance (Elo double chance from
+    one 1X2 interval, like Dixon–Coles). Nothing is saved; thresholds never change."""
+    from sports_edge import insights, learning
+    from sports_edge.analysis.coupon_builder import (
+        VALIDATED,
+        build_coupons,
+        eligibility,
+        in_odds_range,
+    )
+    from sports_edge.bookmakers import load_profiles
+    from sports_edge.models.registry import model_overview
+    from sports_edge.services import day_candidates_at, probability_policy
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    rules = probability_policy(paths)
+    sts = load_profiles(paths.config)["sts"]
+    profile = rules.profiles[profile_name]
+    floor = float(profile["min_leg_probability"])
+    max_odds = float(rules.builder["max_odds_per_leg"])
+    served = learning.served_check(store)
+    every = [r["version_id"] for r in model_overview(store)]
+    limit = getattr(settings, "max_profiles_per_selection", None)
+    codes: Counter = Counter()
+    counts = {s: Counter() for s in ("validated", "experimental")}
+    unique_counts = {s: Counter() for s in ("validated", "experimental")}
+    counted: set[tuple] = set()
+    excluded: Counter = Counter()
+    seen: dict[tuple, dict] = {}
+    per_decision, coupons = [], []
+    what_if = {"validated_ge_floor": 0, "decisions_with_coupon": 0, "p_conservative": []}
+    for day in days:
+        for hour in hours:
+            moment = datetime.combine(date.fromisoformat(day), time(hour), tzinfo=warsaw)
+            if until is not None and moment > until:
+                continue
+            versions = (
+                versions_at(moment) if versions_at else {v for v in every if served(v, moment)}
+            )
+            candidates, predictions = day_candidates_at(
+                store,
+                paths,
+                settings,
+                day,
+                now=moment,
+                as_of=moment,
+                versions=versions,
+                goals=goals,
+            )
+            rows = {row["id"]: row for row in predictions.values()}
+            built = build_coupons(
+                candidates,
+                rules,
+                cost=sts.cost,
+                on_date=moment.date(),
+                stake=stake,
+                max_profiles_per_selection=limit,
+            )
+            proposal = built.proposals.get(profile_name)
+            code = "coupon" if proposal is not None else built.refusal_codes.get(profile_name, "?")
+            codes[code] += 1
+            ranged = [c for c in candidates if c.p_low is not None and in_odds_range(c, profile)]
+            eligible = [c for c in ranged if eligibility(c, max_odds) is None]
+            reasons = Counter(eligibility(c, max_odds) for c in ranged)
+            reasons.pop(None, None)
+            excluded.update(reasons)
+            mine = {s: Counter() for s in counts}
+            for c in eligible:
+                status = "validated" if c.predictive_status == VALIDATED else "experimental"
+                band = _bin_label(c.p_low, P_LOW_BINS)
+                counts[status][band] += 1
+                mine[status][band] += 1
+                pick = (c.prediction_id, c.selection)
+                if pick not in counted:
+                    counted.add(pick)
+                    unique_counts[status][band] += 1
+                row = rows.get(c.prediction_id)
+                if row is not None and pick not in seen:
+                    label, n = calibration_sample(row, c.market_key, c.selection, c.line)
+                    seen[pick] = {"label": label, "n": n, "gap": c.p_model - c.p_low}
+            # what-if: Elo double chance bounded by ONE 1X2 interval (never served)
+            changed = []
+            for c in candidates:
+                row = rows.get(c.prediction_id)
+                if (
+                    row is not None
+                    and row["family"] == "elo_ordered_draw"
+                    and c.market_key == "double_chance"
+                    and c.p_low is not None
+                ):
+                    low = _complement_low(row, c.selection)
+                    if low is not None and low <= c.p_model:
+                        c = replace(c, p_low=max(c.p_low, low))
+                changed.append(c)
+            what_if["validated_ge_floor"] += sum(
+                1
+                for c in changed
+                if c.p_low is not None
+                and c.p_low >= floor
+                and c.predictive_status == VALIDATED
+                and in_odds_range(c, profile)
+                and eligibility(c, max_odds) is None
+            )
+            other = build_coupons(
+                changed,
+                rules,
+                cost=sts.cost,
+                on_date=moment.date(),
+                stake=stake,
+                max_profiles_per_selection=limit,
+            ).proposals.get(profile_name)
+            if other is not None:
+                what_if["decisions_with_coupon"] += 1
+                what_if["p_conservative"].append(round(other.p_conservative, 4))
+            if proposal is not None:
+                coupons.append(
+                    {
+                        "decision_at": iso(moment),
+                        "legs": len(proposal.legs),
+                        "total_odds": str(proposal.total_odds),
+                        "p_conservative": round(proposal.p_conservative, 4),
+                        "p_calibrated": round(proposal.p_calibrated, 4),
+                        "level": proposal.level,
+                    }
+                )
+            per_decision.append(
+                {
+                    "decision_at": iso(moment),
+                    "code": code,
+                    "refusal": built.refusals.get(profile_name),
+                    "candidates": len(candidates),
+                    "in_range": len(ranged),
+                    "in_range_eligible": len(eligible),
+                    "in_range_excluded": dict(reasons),
+                    "eligible_by_status": {
+                        s: dict(sorted(v.items())) for s, v in mine.items() if v
+                    },
+                    "closest": insights.closest_text(candidates, profile, max_odds=max_odds),
+                }
+            )
+    gaps: dict[str, dict] = {}
+    for item in seen.values():
+        entry = gaps.setdefault(item["label"], {"all": [], "by_n": defaultdict(list)})
+        entry["all"].append(item["gap"])
+        if item["n"] is not None:
+            entry["by_n"][_bucket(item["n"])].append(item["gap"])
+    return {
+        "profile": profile["label"],
+        "policy_version": rules.version,
+        "decisions": len(per_decision),
+        "hours": list(hours),
+        "codes": dict(codes),
+        "coupons": coupons,
+        "in_range_eligible": {s: dict(sorted(v.items())) for s, v in counts.items()},
+        "in_range_excluded": dict(excluded.most_common()),
+        "in_range_eligible_unique": {s: dict(sorted(v.items())) for s, v in unique_counts.items()},
+        "gap": {
+            label: {
+                "selections": len(entry["all"]),
+                "median_points": round(100 * _median(entry["all"]), 1),
+                "by_calibration_n": {
+                    bucket: {"selections": len(v), "median_points": round(100 * _median(v), 1)}
+                    for bucket, v in sorted(entry["by_n"].items())
+                },
+            }
+            for label, entry in sorted(gaps.items())
+        },
+        "what_if_elo_double_chance_one_interval": {
+            **what_if,
+            "note": "pomiar: podwójna szansa Elo z dolną granicą 1 − górna granica wykluczonego "
+            "wyniku (jak Dixon–Coles) zamiast sumy dolnych granic dwóch wyników; nie wdrożone",
+        },
+        "per_decision": per_decision,
+    }

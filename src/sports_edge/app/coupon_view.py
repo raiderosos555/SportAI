@@ -348,6 +348,7 @@ def card(
     alternatives: list[dict] = (),
     status: dict | None = None,
     exposure: dict | None = None,
+    closest: str | None = None,
 ) -> None:
     """The coupon of one profile for one day (or why there is none). ``status`` (TASK 010)
     is what saving did: official coupon, no change, price update or revision; ``exposure``
@@ -361,6 +362,8 @@ def card(
             ),
             unsafe_allow_html=True,
         )
+        if closest:  # TASK 013 §5.3: one line, thresholds and proposals unchanged
+            st.caption(closest)
         return
     tone = "violet" if name == "tasiemka" else ""
     with st.container(border=True, key=f"coupon-{day}-{name}{'-' + tone if tone else ''}"):

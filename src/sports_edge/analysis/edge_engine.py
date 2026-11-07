@@ -243,6 +243,9 @@ class Candidate:
     market_label: str = ""
     label_raw: str = ""  # market header exactly as printed in the PDF
     source_text: str = ""  # original PDF row
+    # TASK 013 §4: the stored forecast the probability comes from (None: no forecast); a
+    # derived market (double chance from 1X2) names the forecast it was derived from
+    prediction_id: str | None = None
 
     @property
     def accepted(self) -> bool:
@@ -553,6 +556,7 @@ def _candidate(
         market_label=market_label(row["market_key"], row["period"], row["line"]),
         label_raw=row.get("label_raw", ""),
         source_text=row.get("source_text", ""),
+        prediction_id=(prediction.get("id") if prediction else None),
     )
 
 

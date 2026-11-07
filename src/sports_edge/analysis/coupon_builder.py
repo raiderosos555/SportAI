@@ -18,6 +18,7 @@ predictive validation) versus "eksperymentalny" (simulation only). Neither claim
 economic edge over STS — that separate status belongs to the EV policy.
 """
 
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import ROUND_HALF_UP, Decimal
@@ -179,6 +180,33 @@ def build_coupons(
         for leg in built[0].legs:  # the diversity limit counts the proposals only
             used[leg.selection_id] = used.get(leg.selection_id, 0) + 1
     return BuilderReport(proposals, refusals, pool, excluded, codes, alternatives)
+
+
+def in_odds_range(candidate: Candidate, profile: dict) -> bool:
+    """The selection's own price lies inside the profile's total-odds range."""
+    high = profile.get("max_total_odds")
+    return Decimal(str(profile["min_total_odds"])) <= candidate.odds and (
+        high is None or candidate.odds <= Decimal(str(high))
+    )
+
+
+def closest(
+    candidates: list[Candidate], profile: dict, *, max_odds: float
+) -> tuple[Candidate | None, Counter]:
+    """TASK 013 §5.3: the selection nearest to a coupon of ``profile`` — eligible (fresh
+    price, before the start, forecast with a conservative estimate), its price inside the
+    profile's odds range, the highest conservative chance. Read only: no threshold and no
+    proposal changes. Also why the other selections of the range are not eligible."""
+    eligible, excluded = [], Counter()
+    for candidate in candidates:
+        if candidate.p_low is None or not in_odds_range(candidate, profile):
+            continue
+        why = eligibility(candidate, max_odds)
+        if why:
+            excluded[why] += 1
+        else:
+            eligible.append(candidate)
+    return max(eligible, key=_strength, default=None), excluded
 
 
 def _strength(candidate: Candidate) -> tuple[float, float]:

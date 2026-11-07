@@ -37,6 +37,9 @@ def test_main_user_paths_of_the_interface():
         "automatyzacja: prognozy automatyczne i raport tygodniowy",  # TASK 012
         "automatyzacja: kursy STS w dniu meczu",
         "kupon dnia: metoda Ryzyka dnia",
+        "modele: bramka v3 (stan)",  # TASK 013
+        "modele: akceptacja bramki v3 (zapis decyzji)",
+        "kupon dnia: najbliżej (WYSOKA TRAFNOŚĆ)",
     ):
         assert expected in names
     assert any(name.startswith("brak danych") for name in names)

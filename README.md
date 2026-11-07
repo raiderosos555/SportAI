@@ -29,7 +29,11 @@ Funkcje:
   użytkownika), walk-forward v3 kontra zamrożony v2, automatyczne prognozy oferty po każdym
   nowym dokumencie STS (bez kuponów), raport tygodniowy kalibracji z alertem, pobrania oferty
   „w dniu meczu” w limitach STS, porównanie z rynkiem według wieku kursu, „Ryzyko dnia” z macierzy
-  wyników Dixon–Coles.
+  wyników Dixon–Coles;
+- od challengera do decyzji (TASK 013): stabilny wybór okresu Dixon–Coles (kara za zmianę) i
+  kalibracja z 24 mies. w 5 czołowych ligach, identyfikator prognozy w każdej nodze kuponu
+  („Ryzyko dnia” z prognozy nogi), diagnoza profilu WYSOKA TRAFNOŚĆ z linią „najbliżej: …”,
+  zapisana decyzja użytkownika o bramce v3, wiek kursów w raporcie tygodniowym.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
@@ -40,7 +44,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 012](docs/task_012_report.md).
+Stan i ograniczenia: [raport TASK 013](docs/task_013_report.md).
 
 ## Uruchomienie na Windows
 
@@ -130,6 +134,7 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge research protocol-v2 --scope core   # nowe modele (challengery) w protokole v2
 .\.venv\Scripts\sports-edge research protocol-v3 --scope core   # TASK 012: challengery z oknami ruchomymi
 .\.venv\Scripts\sports-edge research walk-forward-v3 --scope core   # TASK 012: retrening co miesiąc vs v2
+.\.venv\Scripts\sports-edge research walk-forward-v3 --scope core --rules sticky12,select12,fixed   # TASK 013: reguły okresu DC
 .\.venv\Scripts\sports-edge research ablation --scope core      # ablacja A Elo / B DC / C DC+cechy / D ML
 .\.venv\Scripts\sports-edge learning review             # przegląd modeli na żądanie (automatycznie: panel Automatyzacja AI)
 .\.venv\Scripts\sports-edge learning catch-up           # uzupełnienie po przerwie (rozliczenia, wyniki)
@@ -182,7 +187,7 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-388 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+412 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
@@ -198,8 +203,12 @@ samych meczach, automatyczne prognozy bez kuponów i bez duplikatów, wyzwalacz 
 dokumencie STS, raport tygodniowy z jednym alertem na fakt, plan pobrań w dniu meczu z limitami
 i zgodą, wiek kursu w porównaniu z rynkiem, Ryzyko dnia z macierzy wyników i oznaczony fallback,
 stare nogi kuponów bez identyfikatora meczu,
-migracja v10, `conftest` importujący własny kod, panel Automatyzacji).
-Ścieżki interfejsu: `python -m sports_edge.qa` (29 ścieżek). Zrzuty ekranu:
+migracja v10, `conftest` importujący własny kod, panel Automatyzacji; 6 z poprawki workera
+(`test_runtime_write.py`: zapis `runtime.json` przez własny plik tymczasowy, ponowienia, worker
+nie umiera); 18 z TASK 013: reguła okresu połowicznego zaniku bez przecieku, `prediction_id` na
+każdej ścieżce zapisu, Ryzyko dnia z prognozy nogi, „najbliżej”, bramka v3 jako decyzja
+użytkownika, wiek kursów w raporcie tygodniowym, panel Modeli i Kupon dnia).
+Ścieżki interfejsu: `python -m sports_edge.qa` (32 ścieżki). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
 768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,
@@ -231,7 +240,7 @@ src/sports_edge/
                   page_learning (Uczenie AI)
   storage.py      SQLite tylko-dopisywanie, migracje do v10 z kopią;  repository.py  importy i widoki
   my_coupon.py, advisor.py, explainer.py, llm.py   Mój kupon, ocena AI, pytania, lokalny model (Ollama)
-  analysis/generator.py  kupon na kurs;  simulation.py  symulator budżetu i historyczny
+  analysis/generator.py  kupon na kurs;  simulation.py  symulator budżetu i historyczny, diagnoza WYSOKIEJ TRAFNOŚCI (TASK 013)
   learning.py, retraining.py, ablation.py   historia modeli, przegląd, champion–challenger, ablacja
   collection.py   rozliczanie prognoz, zadania, kompletność;  forecast_quality.py  jakość prognoz
   maintenance.py  rozmiar, przyrost, integralność, test odtworzenia;  qa.py  ścieżki UI i artefakt
@@ -244,7 +253,8 @@ src/sports_edge/
   performance.py  skuteczność kuponów i selekcji kreatora
   prospective_eval.py  TASK 011: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS
                   (TASK 012: według wieku kursu), dowody champion–challenger, raport tygodniowy
-  rolling.py      TASK 012: protokół v3 (okna ruchome od daty treningu), walk-forward v3 vs v2
+  rolling.py      TASK 012: protokół v3 (okna ruchome od daty treningu), walk-forward v3 vs v2;
+                  TASK 013: reguły okresu połowicznego zaniku, okna zakresu (5 lig: kalibracja 24 mies.)
   insights.py     warstwa prostego języka: wiarygodność, grupy typów A/B/C, powody braku kuponu
   coverage.py     audyt pokrycia oferty STS (wydarzenia, rynki, selekcje, powody braku prognozy)
   provenance.py   stan kodu i snapshot danych;  bookmakers.py  profil STS i reguły rynków
@@ -256,6 +266,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 013](docs/task_013_report.md) | Od challengera do decyzji: scalona poprawka workera, warianty okresu połowicznego zaniku Dixon–Coles i wybrana reguła, identyfikator prognozy w nodze kuponu, diagnoza WYSOKIEJ TRAFNOŚCI z opcjami do decyzji, zapisana bramka v3, wiek kursów |
 | [Raport TASK 012](docs/task_012_report.md) | Modele, które się uczą: protokół v3 z oknami ruchomymi i jego bramka decyzji, walk-forward v3 vs v2, automatyczne prognozy oferty, raport tygodniowy kalibracji, kursy STS w dniu meczu, Ryzyko dnia z macierzy wyników |
 | [Raport TASK 011](docs/task_011_report.md) | Wiarygodność prognoz: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS, wykonalność szybszego zbierania dowodów, proces challengerów, Ryzyko dnia jako liczba |
 | [Raport TASK 010](docs/task_010_report.md) | Jeden kupon, jedna historia: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów, statystyki bez duplikatów, alerty raz na zmianę, ryzyko dnia |

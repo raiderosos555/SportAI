@@ -856,7 +856,7 @@ def job_calibration_report(store, paths, *, now, settings) -> JobOutcome:
     app = _app(paths)
     if app.offline_mode:
         return JobOutcome("skipped", "tryb offline — raport tygodniowy pominięty")
-    found = pe.weekly_report(store, now=now, policy=pe.load_policy(paths.config))
+    found = pe.weekly_report(store, now=now, policy=pe.load_policy(paths.config), settings=settings)
     return JobOutcome(
         "ok",
         "" if found["recorded"] else "bez zmian w danych od poprzedniego raportu",
