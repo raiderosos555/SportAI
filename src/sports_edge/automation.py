@@ -18,10 +18,13 @@
 * No Windows Task Scheduler, no system service, no paid service.
 """
 
+import contextlib
 import json
+import logging
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -36,7 +39,10 @@ from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.settings import AppPaths
 from sports_edge.storage import Store
 
+logger = logging.getLogger(__name__)  # the worker's stderr goes to data/automation/worker.log
+
 HEARTBEAT_SECONDS = 5
+REPLACE_ATTEMPTS = 6  # runtime.json: retries of a replace refused for a moment by Windows
 STALE_AFTER = timedelta(seconds=30)
 TICK_SECONDS = 5
 FREQUENCIES = {
@@ -288,16 +294,28 @@ def lock_held(paths: AppPaths) -> bool:
 
 
 def write_runtime(paths: AppPaths, data: dict) -> None:
-    """Atomic replace; on Windows a reader may hold the file for a moment — retry briefly."""
+    """Atomic replace through a temporary file of THIS write only: the heartbeat thread and
+    the main loop both write, and a shared ``runtime.tmp`` let one ``os.replace`` find it
+    already moved. On Windows a reader may hold the target for a moment — retry briefly; a
+    lasting failure is raised and the temporary file is removed."""
     target = folder(paths) / "runtime.json"
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
-    for attempt in range(5):
-        try:
-            os.replace(tmp, target)
-            return
-        except PermissionError:
-            time.sleep(0.05 * (attempt + 1))
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=target.parent, prefix="runtime.", suffix=".tmp", delete=False
+    ) as handle:
+        tmp = Path(handle.name)
+        handle.write(json.dumps(data, ensure_ascii=False, default=str))
+    try:
+        for attempt in range(REPLACE_ATTEMPTS):
+            try:
+                os.replace(tmp, target)
+                return
+            except PermissionError:
+                if attempt == REPLACE_ATTEMPTS - 1:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    finally:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 def read_runtime(paths: AppPaths) -> dict:
@@ -1143,6 +1161,7 @@ class Worker:
         self.started_at = self.clock()
         self.next_runs: dict[str, str] = {}
         self._stop = threading.Event()
+        self._beat_lock = threading.Lock()
         self.lock = WorkerLock(folder(paths) / "worker.lock")
 
     # -- heartbeat ----------------------------------------------------------------
@@ -1155,9 +1174,10 @@ class Worker:
                 if when is not None:
                     nexts[job] = iso(when)
             self.next_runs = nexts
-        write_runtime(
-            self.paths,
-            {
+        # one beat at a time in this process: the snapshot is taken and written together, so
+        # a slower heartbeat can never overwrite a newer state (e.g. the final "stopped")
+        with self._beat_lock:
+            data = {
                 "worker_id": self.worker_id,
                 "pid": os.getpid(),
                 "parent": self.parent,
@@ -1167,15 +1187,22 @@ class Worker:
                 "current_task": self.current,
                 **self.stats,
                 "next_runs": self.next_runs,
-            },
-        )
+            }
+            try:
+                write_runtime(self.paths, data)
+            except OSError as error:  # the status file is not worth the worker's life
+                logger.warning(
+                    "nie zapisano statusu runtime.json (%s: %s) — worker działa dalej",
+                    type(error).__name__,
+                    error,
+                )
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(HEARTBEAT_SECONDS):
             try:
                 self.beat()
-            except OSError:
-                pass
+            except Exception:  # noqa: BLE001 — the heartbeat thread must not die silently
+                logger.exception("błąd wątku heartbeat — kolejna próba za %s s", HEARTBEAT_SECONDS)
 
     # -- commands and jobs -------------------------------------------------------
     def _run(
@@ -1421,6 +1448,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("mode", choices=["run", "once", "commands", "autostart"])
     parser.add_argument("--parent", type=int, default=None)
     args = parser.parse_args(argv)
+    logging.basicConfig(
+        level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )  # stderr of the worker process = data/automation/worker.log
     paths = AppPaths(project_root())
     if args.mode == "autostart":
         from sports_edge.services import open_store
