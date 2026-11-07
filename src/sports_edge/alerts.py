@@ -24,6 +24,9 @@ PRIORITY = {
     "coupon_attention": "high",
     "coupon_outdated": "high",
     "odds_changed": "medium",
+    # TASK 012: weekly prospective report (information only — nothing changes in the models)
+    "calibration_flag": "medium",
+    "market_verdict": "medium",
 }
 LABELS = {
     "confirmed_published": "Opublikowano potwierdzony skład",
@@ -38,6 +41,8 @@ LABELS = {
     "coupon_attention": "Kupon wymaga ponownej kontroli",
     "coupon_outdated": "Kupon nieaktualny",
     "odds_changed": "Kurs STS nie jest już aktualny",
+    "calibration_flag": "Kalibracja strefy kuponów: nowa flaga",
+    "market_verdict": "Porównanie z rynkiem STS: pierwszy werdykt",
 }
 
 

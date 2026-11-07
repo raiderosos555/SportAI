@@ -229,7 +229,7 @@ def _day(db, settings, rules, day, run, online) -> None:
         return
     by_odds = {x.odds_id: x for x in candidates}
     exposure = _exposure(proposals)
-    _day_risk(proposals, exposure)
+    _day_risk(proposals, exposure, db)
     for name in rules.profiles:  # one full-width card per profile: never squeezed
         coupon_view.card(
             name,
@@ -254,13 +254,15 @@ def _exposure(proposals: dict) -> dict[str, list[tuple[str, str, tuple]]]:
     for name, payload in proposals.items():
         for leg in (payload or {}).get("legs", []):
             pick = (leg.get("market_key"), leg.get("line"), leg.get("selection"))
-            out.setdefault(leg["event_id"], []).append((name, payload.get("label") or name, pick))
+            out.setdefault(ins.match_of(leg), []).append((name, payload.get("label") or name, pick))
     return out
 
 
-def risk_numbers(proposals: dict) -> list[str]:
-    """TASK 011 §6: the chance that two or more coupons of the day lose, as a number."""
-    found = ins.day_risk(proposals)
+def risk_numbers(proposals: dict, rates: dict | None = None) -> list[str]:
+    """TASK 011 §6: the chance that two or more coupons of the day lose, as a number.
+    TASK 012 §5: several selections of one match from the score matrix, or — said plainly —
+    the independence assumption."""
+    found = ins.day_risk(proposals, rates)
     if found is None:
         return []
     points = [
@@ -274,11 +276,30 @@ def risk_numbers(proposals: dict) -> list[str]:
             "Gdyby kupony nie miały wspólnych selekcji (były niezależne), ta szansa wynosiłaby "
             f"{ins.pct(found['independent_two_or_more_lose'])} — wspólne typy zmieniają ryzyko."
         )
+    for info in found["joint"].values():
+        if info["method"] == "matrix":
+            points.append(
+                f"{info['event']}: {info['selections']} różne typy tego meczu — łączna szansa "
+                f"{ins.pct(info['joint'])} z macierzy wyników Dixon–Coles (przy założeniu "
+                f"niezależności byłoby {ins.pct(info['product'])})."
+            )
     basis = "Założenie: różne mecze są niezależne"
-    if found["same_match_pairs"]:
+    if found["matrix_matches"]:
         basis += (
-            "; różne typy tego samego meczu też liczone jak niezależne — to przybliżenie "
-            "(są skorelowane)"
+            "; metoda dla typów jednego meczu: macierz wyników Dixon–Coles ("
+            + ins.plural(found["matrix_matches"], "mecz", "mecze", "meczów")
+            + ")"
+        )
+    if found["independent_matches"]:
+        reasons = sorted(
+            {i["reason"] for i in found["joint"].values() if i["method"] == "independent"}
+        )
+        basis += (
+            "; metoda dla typów jednego meczu: założenie niezależności ("
+            + ins.plural(found["independent_matches"], "mecz", "mecze", "meczów")
+            + ": "
+            + ", ".join(reasons)
+            + ") — to przybliżenie, bo są skorelowane"
         )
     if found["model_fallback"]:
         basis += f"; bez szansy ostrożnej (użyto szansy modelu): {found['model_fallback']}"
@@ -286,17 +307,17 @@ def risk_numbers(proposals: dict) -> list[str]:
     return points
 
 
-def _day_risk(proposals: dict, exposure: dict) -> None:
+def _day_risk(proposals: dict, exposure: dict, db=None) -> None:
     """Ryzyko dnia: matches shared by several coupons — one lost match loses them all."""
     made = [p for p in proposals.values() if p]
     if len(made) < 2:
         return
-    names = {leg["event_id"]: leg["event"] for p in made for leg in p["legs"]}
+    names = {ins.match_of(leg): leg.get("event", "—") for p in made for leg in p["legs"]}
     shared = sorted(
         ((event, profiles) for event, profiles in exposure.items() if len(profiles) > 1),
         key=lambda item: -len(item[1]),
     )
-    numbers = risk_numbers(proposals)
+    numbers = risk_numbers(proposals, ins.matrix_rates(db, proposals) if db is not None else None)
     if not shared:
         ui.explanation(
             "Ryzyko dnia",

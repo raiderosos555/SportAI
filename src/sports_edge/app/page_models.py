@@ -76,7 +76,7 @@ def _basic() -> None:
         report = json.loads(pair["goals"]["validation_json"]) if pair["goals"] else {}
         leagues = ", ".join(COMPETITIONS[code].name for code in scope if code in COMPETITIONS)
         one_x_two = preference.get(("1x2", scope[0]), ELO_FAMILY)
-        suspended = report.get("protocol") != "v2"
+        suspended = report.get("protocol") not in ("v2", "v3")
         ui.section(SCOPE_LABELS[name].capitalize(), leagues)
         if suspended:
             ui.explanation(

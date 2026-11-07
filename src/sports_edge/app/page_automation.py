@@ -318,6 +318,7 @@ def _schedule(db, settings: dict, now: datetime) -> None:
         cards.append(ui.card(f"<b>{ui.esc(c.day_label(day.isoformat()))}</b>" + body + more))
     ui.card_grid(cards, wide=False)
     _kickoff(db, settings, now)
+    _matchday(db, settings, now)
     _editor(db, settings)
     _one_off(db, settings, now)
 
@@ -363,6 +364,78 @@ def _kickoff(db, settings: dict, now: datetime) -> None:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
     else:
         st.caption("Brak meczów do monitorowania w najbliższych 48 godzinach.")
+
+
+MATCHDAY_LEADS = [180, 120, 90, 60, 45, 30]
+
+
+def _matchday(db, settings: dict, now: datetime) -> None:
+    """TASK 012 §4.1: extra downloads of today's STS offer before groups of matches."""
+    ui.section(
+        "Kursy STS w dniu meczu",
+        "dodatkowe pobrania oferty na dziś przed grupami meczów 12 lig z modelem",
+    )
+    cfg = automation.matchday_config(settings)
+    job = settings["jobs"].get("sts_offer") or {}
+    allowed = automation.download_allowed(c.paths())
+    used = len(automation.matchday_runs_today(db, now=now))
+    if not allowed:
+        state = "nieaktywny — brak zgody na pobieranie oferty STS (Źródła i ustawienia) lub tryb offline"
+    elif not job.get("enabled"):
+        state = "nieaktywny — zadanie „Sprawdzanie nowych kursów STS” jest wyłączone"
+    elif not cfg.get("enabled"):
+        state = "wyłączony"
+    else:
+        state = "aktywny (zgoda na pobieranie oferty STS — bez dodatkowej zgody)"
+    st.caption(
+        f"Stan: {state} · pobrania dziś: {used}/{cfg['daily_cap']} · każdy plik STS najwyżej "
+        "raz na 10 minut"
+    )
+    rows = [
+        {
+            "Pobranie": c.local_time(slot["at"].isoformat(), "%H:%M"),
+            "Pierwszy mecz grupy": c.local_time(slot["group"].isoformat(), "%H:%M"),
+            "Wyprzedzenie": f"{slot['lead']} min",
+            "Stan": slot["status"]
+            + (
+                f" ({c.local_time(slot['download'].isoformat(), '%H:%M')})"
+                if slot["download"]
+                else ""
+            ),
+        }
+        for slot in automation.matchday_status(db, settings, now=now)
+    ]
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    else:
+        st.caption("Brak meczów 12 lig w dzisiejszej ofercie STS — brak pobrań w dniu meczu.")
+    with st.container(key="row-matchday"):
+        cols = st.columns([1, 2, 1], vertical_alignment="bottom")
+        enabled = cols[0].toggle(
+            "Tryb w dniu meczu", value=bool(cfg.get("enabled")), key="auto_matchday_on"
+        )
+        leads = cols[1].multiselect(
+            "Minuty przed pierwszym meczem grupy",
+            MATCHDAY_LEADS,
+            default=[m for m in cfg.get("leads_minutes") or [] if m in MATCHDAY_LEADS],
+            key="auto_matchday_leads",
+            placeholder="wybierz…",
+        )
+        cap = cols[2].number_input(
+            "Dzienny limit",
+            1,
+            12,
+            min(12, int(cfg.get("daily_cap") or 12)),
+            key="auto_matchday_cap",
+        )
+    if st.button("Zapisz tryb w dniu meczu", icon=":material/save:", key="auto_save_matchday"):
+        settings["jobs"].setdefault("sts_offer", {})["matchday"] = {
+            "enabled": bool(enabled),
+            "leads_minutes": sorted({int(m) for m in leads}, reverse=True) or [45],
+            "daily_cap": int(cap),
+        }
+        automation.save_settings(db, settings, now=c.now())
+        st.success("Tryb w dniu meczu zapisany.")
 
 
 def _editor(db, settings: dict) -> None:
@@ -493,6 +566,13 @@ def _processes(db, settings: dict) -> None:
                 cols[1].caption("razem z kontrolą składów (brak zweryfikowanego źródła)")
             elif job == "training":
                 cols[1].caption("tylko challenger — aktywacja zawsze należy do Ciebie")
+            if job == "forecasts" and cfg.get("enabled"):  # TASK 012
+                st.caption(
+                    f"Także po każdym nowym dokumencie STS i codziennie o {cfg.get('morning') or '—'} "
+                    "(awaryjnie); bez kuponów, bez pobierania danych, pomijane w trybie offline."
+                )
+            elif job == "sts_offer":
+                st.caption("Tryb „w dniu meczu”: Harmonogram → Kursy STS w dniu meczu.")
     ui.section("Konfiguracja")
     with st.container(key="row-config"):
         cols = st.columns(2)

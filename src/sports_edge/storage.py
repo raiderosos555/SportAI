@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -39,6 +39,7 @@ MIGRATIONS = {
     7: "TASK 008: lineups, absences, pre-match checks, alerts, coupon reassessments, automation",
     8: "TASK 010: coupon lineage — one official coupon per profile and day, versions linked",
     9: "TASK 011: prospective STS market benchmark of the models (append-only snapshots)",
+    10: "TASK 012: weekly prospective calibration reports (append-only history entries)",
 }
 
 SCHEMA = """
@@ -312,6 +313,12 @@ CREATE TABLE IF NOT EXISTS market_benchmarks (
 );
 CREATE INDEX IF NOT EXISTS benchmark_group
  ON market_benchmarks(scope, family, market, computed_at);
+CREATE TABLE IF NOT EXISTS calibration_reports (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, kind TEXT NOT NULL,
+ policy_version TEXT NOT NULL, data_snapshot TEXT NOT NULL, matches INTEGER NOT NULL,
+ flags INTEGER NOT NULL, verdicts INTEGER NOT NULL, payload_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS calibration_report_time ON calibration_reports(kind, created_at);
 CREATE INDEX IF NOT EXISTS fixture_event ON provider_fixtures(event_id, provider);
 CREATE INDEX IF NOT EXISTS lineup_event ON lineup_observations(event_id, side, observed_at);
 CREATE INDEX IF NOT EXISTS absence_event ON player_absence_observations(event_id, team_name);
@@ -398,6 +405,9 @@ class Store:
         v9: one new append-only table (``market_benchmarks``: prospective comparison of the
         models with the de-margined STS prices of the same matches); no existing row is
         touched and ``validation_json`` of the model versions stays as it was.
+        v10: one new append-only table (``calibration_reports``: the weekly report of the
+        coupon-zone calibration and the STS market comparison, TASK 012); no existing row is
+        touched (old forecasts and model versions stay as they were).
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

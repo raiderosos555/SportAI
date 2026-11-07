@@ -225,8 +225,9 @@ def _train(scope: str) -> None:
         f"Trenuj teraz — {SCOPE_LABELS[scope]}",
         key=f"learn_train_{scope}",
         icon=":material/model_training:",
-        help="Protokół v2 na aktualnych danych (1–2 min). Nowe wersje trafiają do trybu cienia "
-        "jako challengery — aktywujesz je sam po porównaniu.",
+        help="Protokół v3 (okna ruchome do dziś; v2, gdy historia jest za krótka) na aktualnych "
+        "danych (kilka minut). Nowe wersje trafiają do trybu cienia jako challengery — "
+        "aktywujesz je sam po porównaniu.",
     ):
         with st.status("Trening w toku…", expanded=True) as box:
             try:
@@ -267,8 +268,14 @@ def _window(entry: dict) -> str:
     decision = entry.get("decision") or {}
     if not decision:
         return "—" if not entry else f"protokół {entry.get('protocol')} (bez okna selekcji)"
+    windows = entry.get("windows") or {}
+    period = (
+        f"v3 od {windows.get('selection_from')} · "  # TASK 012: rolling window of this version
+        if windows
+        else f"{entry.get('protocol')} · "
+    )
     return (
-        f"n={decision.get('n')} · log loss {ins.num(decision.get('log_loss'), 5)} · "
+        f"{period}n={decision.get('n')} · log loss {ins.num(decision.get('log_loss'), 5)} · "
         f"ECE {ins.num(decision.get('ece'), 4)}"
     )
 
@@ -447,6 +454,7 @@ def market_panel() -> None:
         and (r["market"] == pe.POOLED or r["market"] in pe.COUPON_MARKETS.get(r["family"], ()))
     ]
     st.dataframe(_market_frame(chosen), hide_index=True, width="stretch")
+    _age_panel(chosen)
     st.caption(
         "Marża usunięta metodą „power” (p = (1/kurs)^k, suma 1) — ostrzejszy wzorzec niż "
         "proporcjonalny w strefie faworytów; wynik metody proporcjonalnej jest zapisany jako "
@@ -454,6 +462,42 @@ def market_panel() -> None:
         "od 300 wspólnych meczów; brak wspólnych meczów to „nieznane”, nigdy „false”. Kurs "
         "służy wyłącznie do oceny po fakcie — nigdy nie jest cechą modelu."
     )
+
+
+def _age_panel(rows: list[dict]) -> None:
+    """TASK 012 §4.2: the comparison per age of the STS document (sensitivity only)."""
+    pooled = [r for r in rows if r["market"] == pe.POOLED and r.get("by_document_age")]
+    if not pooled:
+        return
+    frame = []
+    for r in pooled:
+        age = r.get("document_age_hours") or {}
+        for band, info in r["by_document_age"].items():
+            frame.append(
+                {
+                    "Model": pe.FAMILY_LABELS.get(r["family"], r["family"]),
+                    "Wiek kursu STS": band,
+                    "Mecze": info["matches"],
+                    "Udział meczów": ins.pct((age.get("bands") or {}).get(band)),
+                    "Log loss model / rynek": f"{ins.num(info['model_log_loss'], 3)} / "
+                    f"{ins.num(info['market_log_loss'], 3)}"
+                    if info["model_log_loss"] is not None
+                    else "—",
+                    "Różnica (95%)": _difference(info) if info.get("ci95") else "—",
+                    "Stan": info["state_label"],
+                }
+            )
+    with st.expander("Według wieku kursu STS (≤ 3 h, 3–12 h, > 12 h przed meczem)"):
+        st.dataframe(pd.DataFrame(frame), hide_index=True, width="stretch")
+        medians = ", ".join(
+            f"{pe.FAMILY_LABELS.get(r['family'], r['family'])}: "
+            f"{ins.num((r.get('document_age_hours') or {}).get('median'), 1)} h"
+            for r in pooled
+        )
+        st.caption(
+            f"Mediana wieku użytego dokumentu (czas meczu − czas z dokumentu): {medians}. "
+            "Podział to tylko kontrola wrażliwości — werdykt liczony jest łącznie."
+        )
 
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=8)

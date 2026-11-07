@@ -107,6 +107,19 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         check("automatyzacja: status", panel, ["zatrzymana"])
         _button(panel, "ZAPISZ USTAWIENIA").click().run()
         check("automatyzacja: zapis ustawień", panel, ["Ustawienia zapisane"])
+        # TASK 012: the automatic forecasts, the weekly report and the match-day downloads
+        labels = {t.label for t in panel.toggle}
+        record(
+            "automatyzacja: prognozy automatyczne i raport tygodniowy",
+            {
+                "Automatyczne prognozy meczów z oferty (dziś i jutro, bez kuponów)",
+                "Raport tygodniowy: kalibracja strefy kuponów i porównanie z rynkiem",
+            }
+            <= labels
+            and not _errors(panel),
+            "" if not _errors(panel) else _errors(panel)[0],
+        )
+        check("automatyzacja: kursy STS w dniu meczu", panel, ["Kursy STS w dniu meczu"])
         # ------------------------------------------------ DEMO home with a fresh offer
         os.environ["SPORTS_EDGE_HOME"] = str(_home(config))
         loader = _app("from sports_edge.app import common as c; c.load_demo_data()")
@@ -166,6 +179,16 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         budget.radio[0].set_value("manual").run()
         _button(budget, "URUCHOM SYMULACJĘ").click().run()
         check("symulator budżetu", budget, ["Symulacja warunkowa", "warunkowa"])
+        # TASK 012: two saved DEMO coupons of tomorrow (demo.seed_coupons) — the block "Ryzyko
+        # dnia" names the method used for the selections of one match
+        tomorrow = _app(
+            "from sports_edge.app import common as c\n"
+            "from sports_edge.demo import seed_coupons\n"
+            "seed_coupons(c.store(), c.now())\n" + _page("kupon")
+        )
+        tomorrow.session_state["coupon_range"] = "Jutro"
+        tomorrow.run()
+        check("kupon dnia: metoda Ryzyka dnia", tomorrow, ["Założenie: różne mecze są niezależne"])
         # ------------------------------------------------ stale odds: offer received 6 h ago
         os.environ["SPORTS_EDGE_HOME"] = str(_home(config))
         stale = _app(

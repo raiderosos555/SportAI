@@ -54,6 +54,9 @@ FREQUENCIES = {
     "cup_monitor": [60, 180, 360],
     "intl_completeness": [1440, 4320, 10080],
     "cup_training": [1440, 4320, 10080],
+    # TASK 012: automatic forecasts of the offer and the weekly calibration report
+    "forecasts": [180, 360, 720, 1440],
+    "calibration_report": [1440, 4320, 10080],
 }
 JOB_LABELS = {
     "results": "Aktualizacja wyników sportowych",
@@ -71,6 +74,8 @@ JOB_LABELS = {
     "cup_monitor": "Nowe mecze pucharowe w ofercie STS i prognozy cieniowe",
     "intl_completeness": "Kontrola kompletności danych międzynarodowych",
     "cup_training": "Eksperymenty modeli pucharowych (po spełnieniu warunków)",
+    "forecasts": "Automatyczne prognozy meczów z oferty (dziś i jutro, bez kuponów)",
+    "calibration_report": "Raport tygodniowy: kalibracja strefy kuponów i porównanie z rynkiem",
 }
 DEFAULTS = {
     "auto_resume": False,
@@ -80,7 +85,13 @@ DEFAULTS = {
         "coupon_settlement": {"enabled": True, "every_minutes": 60},
         "lineups": {"enabled": True, "every_minutes": 5},
         "absences": {"enabled": True},
-        "sts_offer": {"enabled": False, "every_minutes": 360},
+        # TASK 012: "matchday" — extra downloads of today's offer before groups of matches
+        # (only when the user allowed STS downloads; no further consent needed)
+        "sts_offer": {
+            "enabled": False,
+            "every_minutes": 360,
+            "matchday": {"enabled": True, "leads_minutes": [120, 45], "daily_cap": 12},
+        },
         "coupon_reassessment": {"enabled": True, "every_minutes": 30},
         "quality": {"enabled": True, "every_minutes": 1440},
         "review": {"enabled": True, "every_minutes": 10080},
@@ -90,6 +101,10 @@ DEFAULTS = {
         "cup_monitor": {"enabled": True, "every_minutes": 180},
         "intl_completeness": {"enabled": True, "every_minutes": 1440},
         "cup_training": {"enabled": True, "every_minutes": 4320},
+        # TASK 012: after every new STS document (after_sts), every 12 h and once in the
+        # morning (fallback): every match of the offer gets a forecast before its start
+        "forecasts": {"enabled": True, "every_minutes": 720, "morning": "07:30", "after_sts": True},
+        "calibration_report": {"enabled": True, "every_minutes": 10080},
     },
     "checkpoints_minutes": [2880, 1440, 360, 90, 60, 30, 15],
     "max_candidates": 30,
@@ -462,6 +477,21 @@ def _daily_next(store: Store, job: str, cfg: dict, *, now: datetime) -> datetime
 
 
 def next_run(store: Store, job: str, settings: dict, *, now: datetime) -> datetime | None:
+    """The next run of a job: its schedule, and for ``sts_offer`` the match-day downloads,
+    for ``forecasts`` the fixed morning run (TASK 012) — whichever comes first."""
+    when = _scheduled_next(store, job, settings, now=now)
+    extra = None
+    if job == "sts_offer":
+        slot = matchday_next(store, settings, now=now)
+        extra = slot["at"] if slot else None
+    elif job == "forecasts":
+        extra = morning_next(store, settings, now=now)
+    if extra is not None and (when is None or extra < when):
+        return extra
+    return when
+
+
+def _scheduled_next(store: Store, job: str, settings: dict, *, now: datetime) -> datetime | None:
     cfg = settings["jobs"].get(job) or {}
     if cfg.get("enabled") and cfg.get("mode") == "daily":
         return _daily_next(store, job, cfg, now=now)
@@ -644,15 +674,40 @@ def job_review(store, paths, *, now, settings) -> JobOutcome:
 
 
 def job_sts_offer(store, paths, *, now, settings) -> JobOutcome:
+    """New STS offer: the regular schedule fetches today and tomorrow; a match-day slot
+    (TASK 012 §4.1) fetches today's offer only. After a NEW document the automatic
+    forecasts run at once (TASK 012 §3.1)."""
     from sports_edge.services import refresh_offers
 
     app = _app(paths)
     if app.offline_mode or not app.sts_download_enabled:
         return JobOutcome("skipped", "pobieranie oferty STS jest wyłączone w ustawieniach")
-    today = now.date()
-    days = [today.isoformat(), (today + timedelta(days=1)).isoformat()]
+    regular = _scheduled_next(store, "sts_offer", settings, now=now)
+    slot = matchday_next(store, settings, now=now, allowed=True)
+    matchday = slot is not None and slot["at"] <= now and (regular is None or regular > now)
+    if matchday:
+        today = now.astimezone(WARSAW).date()
+        days = [today.isoformat()]
+    else:
+        today = now.date()
+        days = [today.isoformat(), (today + timedelta(days=1)).isoformat()]
     attempts = refresh_offers(store, paths, app, days, now=now)
-    return JobOutcome("ok", "", {"processed": len(attempts)})
+    fresh = [a for a in attempts if a["status"] == "new"]
+    payload = {
+        "processed": len(attempts),
+        "new": len(fresh),
+        "statuses": [a["status"] for a in attempts],
+        "matchday": matchday,
+    }
+    if matchday:
+        payload.update(slot=iso(slot["at"]), lead_minutes=slot["lead"], group=iso(slot["group"]))
+    forecasts = settings["jobs"].get("forecasts") or {}
+    if fresh and forecasts.get("enabled") and forecasts.get("after_sts", True):
+        outcome = run_job(
+            store, paths, "forecasts", now=now, settings=settings, trigger="sts_offer"
+        )
+        payload["forecasts"] = outcome.status
+    return JobOutcome("ok", "", payload)
 
 
 def _international(store, paths, *, now, cups: bool, national: bool) -> JobOutcome:
@@ -758,6 +813,202 @@ def job_cup_training(store, paths, *, now, settings) -> JobOutcome:
     )
 
 
+def job_forecasts(store, paths, *, now, settings) -> JobOutcome:
+    """TASK 012 §3.1: the analysis stages from the offer to the forecasts (today and
+    tomorrow), without coupons, downloads or training; skipped offline."""
+    from sports_edge.services import run_forecasts
+
+    app = _app(paths)
+    if app.offline_mode:
+        return JobOutcome("skipped", "tryb offline — automatyczne prognozy pominięte")
+    found = run_forecasts(store, paths, app, now=now)
+    missing = found["events"] - found["with_forecast"]
+    return JobOutcome(
+        "partial" if found["errors"] else "ok",
+        ("; ".join(found["errors"]) or (f"bez prognozy: {missing}" if missing else ""))[:300],
+        {"processed": found["events"], **found},
+    )
+
+
+def job_calibration_report(store, paths, *, now, settings) -> JobOutcome:
+    """TASK 012 §3.2: the weekly calibration and market report as a history entry; one alert
+    per new fact (first flag, first verdict). Nothing in the models changes."""
+    from sports_edge import prospective_eval as pe
+
+    app = _app(paths)
+    if app.offline_mode:
+        return JobOutcome("skipped", "tryb offline — raport tygodniowy pominięty")
+    found = pe.weekly_report(store, now=now, policy=pe.load_policy(paths.config))
+    return JobOutcome(
+        "ok",
+        "" if found["recorded"] else "bez zmian w danych od poprzedniego raportu",
+        {"processed": found["matches"], "new": found["alerts"], **found},
+    )
+
+
+# ---------------------------------------------------------------- TASK 012: match-day downloads
+
+MATCHDAY_DEFAULTS = {"enabled": True, "leads_minutes": [120, 45], "daily_cap": 12}
+MIN_FETCH_GAP = timedelta(minutes=10)  # official STS files: at most once per 10 minutes each
+
+
+def matchday_config(settings: dict) -> dict:
+    cfg = (settings.get("jobs") or {}).get("sts_offer") or {}
+    return {**MATCHDAY_DEFAULTS, **(cfg.get("matchday") or {})}
+
+
+def download_allowed(paths: AppPaths | None = None) -> bool:
+    """The user's consent to download the official STS offer (and not offline)."""
+    from sports_edge.settings import project_root
+
+    try:
+        app = _app(paths or AppPaths(project_root()))
+    except Exception:  # noqa: BLE001 — unreadable settings: no download
+        return False
+    return bool(app.sts_download_enabled and not app.offline_mode)
+
+
+def matchday_groups(store: Store, *, now: datetime) -> list[datetime]:
+    """The first kick-off of every hour (Warsaw time) of today with a match of the
+    supported leagues in the STS offer."""
+    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+
+    today = now.astimezone(WARSAW).date()
+    days = [(today + timedelta(days=d)).isoformat() for d in (-1, 0, 1)]
+    rows = store.rows(
+        "SELECT league, sport, start_at FROM events WHERE bookmaker_id='sts' "
+        "AND start_at IS NOT NULL AND offer_date IN (?,?,?)",
+        tuple(days),
+    )
+    starts = sorted(
+        {
+            datetime.fromisoformat(r["start_at"])
+            for r in rows
+            if league_code(r["league"], r["sport"]) in RESEARCH_COMPETITIONS
+            and datetime.fromisoformat(r["start_at"]).astimezone(WARSAW).date() == today
+        }
+    )
+    first: dict[datetime, datetime] = {}
+    for start in starts:
+        hour = start.astimezone(WARSAW).replace(minute=0, second=0, microsecond=0)
+        first.setdefault(hour, start)
+    return sorted(first.values())
+
+
+def matchday_plan(store: Store, settings: dict, *, now: datetime) -> list[dict]:
+    """Today's planned match-day downloads: ``leads_minutes`` before the first kick-off of
+    every hour with a match; two slots closer than 10 minutes become one (the later — it is
+    still before the earlier group); at most ``daily_cap`` slots (the leads closest to the
+    kick-off first)."""
+    cfg = matchday_config(settings)
+    leads = sorted({int(x) for x in cfg.get("leads_minutes") or [] if int(x) > 0}, reverse=True)
+    slots = sorted(
+        (
+            {"at": first - timedelta(minutes=lead), "group": first, "lead": lead}
+            for first in matchday_groups(store, now=now)
+            for lead in leads
+        ),
+        key=lambda s: (s["at"], s["lead"]),
+    )
+    merged: list[dict] = []
+    for slot in slots:
+        if merged and slot["at"] - merged[-1]["at"] < MIN_FETCH_GAP:
+            merged[-1] = {**slot, "group": min(merged[-1]["group"], slot["group"])}
+            continue
+        merged.append(slot)
+    cap = max(0, int(cfg.get("daily_cap") or 0))
+    if len(merged) > cap:
+        kept = sorted(merged, key=lambda s: (s["lead"], s["at"]))[:cap]
+        merged = sorted(kept, key=lambda s: s["at"])
+    return merged
+
+
+def matchday_runs_today(store: Store, *, now: datetime) -> list[datetime]:
+    """Finished match-day downloads of today (Warsaw)."""
+    start = datetime.combine(now.astimezone(WARSAW).date(), datetime.min.time(), tzinfo=WARSAW)
+    rows = store.rows(
+        "SELECT finished_at, payload_json FROM job_runs WHERE job=? AND started_at>=? "
+        "AND status IN ('ok','partial','skipped')",
+        (_job_name("sts_offer"), iso(start.astimezone(UTC))),
+    )
+    return [
+        datetime.fromisoformat(r["finished_at"])
+        for r in rows
+        if json.loads(r["payload_json"] or "{}").get("matchday")
+    ]
+
+
+def matchday_next(
+    store: Store, settings: dict, *, now: datetime, allowed: bool | None = None
+) -> dict | None:
+    """The earliest pending match-day slot (its time may already have passed: then it is
+    due), or None: the mode or the job is off, no consent, the daily cap is used, or every
+    slot is covered by a download finished at most 10 minutes before it. A slot whose group
+    has started is never run late."""
+    cfg = matchday_config(settings)
+    job = (settings.get("jobs") or {}).get("sts_offer") or {}
+    if not job.get("enabled") or not cfg.get("enabled"):
+        return None
+    if not (download_allowed() if allowed is None else allowed):
+        return None
+    if len(matchday_runs_today(store, now=now)) >= int(cfg.get("daily_cap") or 0):
+        return None
+    last = last_finished(store, "sts_offer")
+    for slot in matchday_plan(store, settings, now=now):
+        if now >= slot["group"]:
+            continue
+        if last is not None and last >= slot["at"] - MIN_FETCH_GAP:
+            continue
+        return slot
+    return None
+
+
+def matchday_status(store: Store, settings: dict, *, now: datetime) -> list[dict]:
+    """Today's plan with the state of every slot (panel): "wykonane" — an STS download
+    finished between 10 minutes before the slot and the start of its group; "zaległe" — due
+    now; "oczekuje"; "pominięte (grupa rozpoczęta)". A later download never marks an earlier
+    slot as done."""
+    start = datetime.combine(now.astimezone(WARSAW).date(), datetime.min.time(), tzinfo=WARSAW)
+    runs = [
+        datetime.fromisoformat(r["finished_at"])
+        for r in store.rows(
+            "SELECT finished_at FROM job_runs WHERE job=? AND finished_at>=? "
+            "AND status IN ('ok','partial')",
+            (_job_name("sts_offer"), iso((start - timedelta(hours=1)).astimezone(UTC))),
+        )
+    ]
+    out = []
+    for slot in matchday_plan(store, settings, now=now):
+        done = sorted(
+            r for r in runs if slot["at"] - MIN_FETCH_GAP <= r < slot["group"] and r <= now
+        )
+        if done:
+            status = "wykonane"
+        elif now >= slot["group"]:
+            status = "pominięte (grupa rozpoczęta)"
+        elif slot["at"] <= now:
+            status = "zaległe"
+        else:
+            status = "oczekuje"
+        out.append({**slot, "status": status, "download": done[0] if done else None})
+    return out
+
+
+def morning_next(store: Store, settings: dict, *, now: datetime) -> datetime | None:
+    """The fixed morning run of the automatic forecasts (fallback when no new STS document
+    arrived): due when today's time passed and no run finished since."""
+    cfg = (settings.get("jobs") or {}).get("forecasts") or {}
+    if not cfg.get("enabled") or not _valid_time(cfg.get("morning") or ""):
+        return None
+    fixed = {"times": [cfg["morning"]], "weekdays": cfg.get("morning_weekdays")}
+    previous = slots(fixed, now - timedelta(days=1), now)
+    done = last_finished(store, "forecasts")
+    if previous and (done is None or done < previous[-1]):
+        return previous[-1]
+    upcoming = slots(fixed, now + timedelta(seconds=1), now + timedelta(days=2))
+    return upcoming[0] if upcoming else None
+
+
 JOBS: dict[str, Callable] = {
     "results": job_results,
     "prediction_settlement": job_prediction_settlement,
@@ -772,6 +1023,8 @@ JOBS: dict[str, Callable] = {
     "cup_monitor": job_cup_monitor,
     "intl_completeness": job_intl_completeness,
     "cup_training": job_cup_training,
+    "forecasts": job_forecasts,
+    "calibration_report": job_calibration_report,
 }
 
 
@@ -835,8 +1088,17 @@ def planned(store: Store, settings: dict, *, now: datetime, days: int = 7) -> li
             out += [{"at": at, "job": job, "kind": "o godzinie"} for at in slots(cfg, now, end)]
             continue
         every = int(cfg.get("every_minutes") or 0)
+        if job == "forecasts" and _valid_time(cfg.get("morning") or ""):
+            fixed = {"times": [cfg["morning"]], "weekdays": cfg.get("morning_weekdays")}
+            out += [{"at": at, "job": job, "kind": "o godzinie"} for at in slots(fixed, now, end)]
+        if job == "sts_offer" and matchday_next(store, settings, now=now) is not None:
+            out += [
+                {"at": s["at"], "job": job, "kind": "w dniu meczu"}
+                for s in matchday_plan(store, settings, now=now)
+                if s["at"] >= now
+            ]
         if every >= 360:
-            first = next_run(store, job, settings, now=now) or now
+            first = _scheduled_next(store, job, settings, now=now) or now
             moment = max(first, now)
             while moment <= end:
                 out.append({"at": moment, "job": job, "kind": "interwał"})

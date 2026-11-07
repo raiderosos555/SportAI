@@ -90,7 +90,7 @@ DC_PARTS = {
 
 @dataclass(frozen=True)
 class EvalPolicy:
-    version: str = "2026-11-06.e1"
+    version: str = "2026-11-06.e2"
     zone: float = 0.60
     bins: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0)
     min_matches: int = 30
@@ -101,6 +101,7 @@ class EvalPolicy:
     seed: int = 7
     decision_matches: int = 300
     expiry_days: int = 14
+    age_groups: tuple[float, ...] = (3.0, 12.0)  # TASK 012: hours before the kick-off
 
 
 def load_policy(config: Path | None = None) -> EvalPolicy:
@@ -127,6 +128,7 @@ def load_policy(config: Path | None = None) -> EvalPolicy:
         seed=int(market["seed"]),
         decision_matches=int(chal["decision_matches"]),
         expiry_days=int(chal["expiry_days"]),
+        age_groups=tuple(float(x) for x in market.get("age_groups", (3, 12))),
     )
 
 
@@ -683,6 +685,29 @@ def _comparison_row(scope, family, market, part, *, policy: EvalPolicy, instance
         sorted([i["prediction_id"], i["quote_set_id"], i["market"]] for i in instances)
     )
     leads = sorted(i["lead_hours"] for i in part)
+    by_age = {}
+    for label, low, high in age_bands(policy.age_groups):
+        group = [i for i in part if low < i["lead_hours"] <= high]
+        matches_in = defaultdict(list)
+        for item in group:
+            matches_in[item["match"]].append(item)
+        cut = [
+            mean("model_log_loss", items) - mean("market_log_loss", items)
+            for items in matches_in.values()
+        ]
+        band_ci = _bootstrap(cut, resamples=policy.resamples, seed=policy.seed) if cut else None
+        band_state = _state(len(cut), band_ci, policy.market_min_matches)
+        by_age[label] = {
+            "matches": len(cut),
+            "forecasts": len(group),
+            "model_log_loss": _round(mean("model_log_loss", group)) if group else None,
+            "market_log_loss": _round(mean("market_log_loss", group)) if group else None,
+            "difference": _round(sum(cut) / len(cut)) if cut else None,
+            "ci95": band_ci,
+            "state": band_state,
+            "state_label": state_label(band_state, len(cut), policy.market_min_matches),
+        }
+    per_match_lead = sorted(min(i["lead_hours"] for i in items) for items in by_match.values())
     return {
         "scope": scope,
         "family": family,
@@ -699,9 +724,48 @@ def _comparison_row(scope, family, market, part, *, policy: EvalPolicy, instance
         "difference": _round(sum(diffs) / n) if n else None,  # model − market (< 0: model better)
         "ci95": ci,
         "median_lead_hours": round(leads[len(leads) // 2], 2) if leads else None,
+        # TASK 012 §4.2: age of the STS document used, one value per match (its youngest
+        # quote), and the comparison per age band (sensitivity; the verdict stays pooled)
+        "document_age_hours": age_summary(per_match_lead, policy.age_groups),
+        "by_document_age": by_age,
         "devig": policy.devig,
         "min_matches": policy.market_min_matches,
         "data_snapshot": snapshot,
+    }
+
+
+def age_bands(edges: tuple[float, ...]) -> list[tuple[str, float, float]]:
+    """("≤ 3 h", 0, 3), ("3–12 h", 3, 12), ("> 12 h", 12, inf) for edges (3, 12)."""
+    out, low = [], 0.0
+    for edge in edges:
+        label = f"≤ {edge:g} h" if low == 0 else f"{low:g}–{edge:g} h"
+        out.append((label, low, edge))
+        low = edge
+    out.append((f"> {low:g} h", low, math.inf))
+    return out
+
+
+def age_summary(hours: list[float], edges: tuple[float, ...] = (3.0, 12.0)) -> dict:
+    """Median, quartiles and the share per age band of the document ages (one per match)."""
+    if not hours:
+        return {"matches": 0, "median": None}
+    values = sorted(hours)
+
+    def quantile(q: float) -> float:
+        position = q * (len(values) - 1)
+        low = int(position)
+        high = min(low + 1, len(values) - 1)
+        return values[low] + (values[high] - values[low]) * (position - low)
+
+    return {
+        "matches": len(values),
+        "median": round(quantile(0.5), 2),
+        "p25": round(quantile(0.25), 2),
+        "p75": round(quantile(0.75), 2),
+        "bands": {
+            label: round(sum(low < h <= high for h in values) / len(values), 4)
+            for label, low, high in age_bands(edges)
+        },
     }
 
 
@@ -757,6 +821,136 @@ def latest_benchmarks(store: Store) -> dict[tuple, dict]:
             "payload": json.loads(row["payload_json"]),
         }
     return out
+
+
+# ---------------------------------------------------------------- TASK 012: weekly report
+
+VERDICT_STATES = ("model_better", "model_worse", "no_difference")
+
+
+def weekly_report(
+    store: Store, *, now: datetime, policy: EvalPolicy | None = None, rows: list[dict] | None = None
+) -> dict:
+    """The weekly report (TASK 012 §3.2): the coupon-zone calibration on matches and the STS
+    market comparison, appended to ``calibration_reports`` as a history entry (one per data
+    state and policy: an unchanged state adds nothing). An ALERT is created once per fact —
+    the first flag "zbyt optymistyczna" / "zbyt ostrożna" of a market and range of the served
+    versions, and the first verdict of the market comparison (model better / worse / no
+    difference, i.e. at least the minimum of common matches). The alert changes nothing in the
+    models, thresholds or coupons."""
+    from sports_edge import alerts
+
+    policy = policy or load_policy()
+    rows = market_forecasts(store) if rows is None else rows
+    calibration = calibration_report(store, policy=policy, rows=rows)
+    comparison = market_comparison(store, policy=policy, rows=rows)
+    # alerts: markets that can enter a coupon, served versions (every flag stays in the entry)
+    flags = [
+        r
+        for r in calibration["flags"]
+        if r["role"] == "active" and r["market"] != POOLED and r["coupon_market"]
+    ]
+    verdicts = [r for r in comparison if r["state"] in VERDICT_STATES]
+    snapshot = digest(sorted([r["prediction_id"], r["market"], r["role"]] for r in rows))
+    zone = [
+        {k: r[k] for k in ("role", "scope", "family", "market", "matches", "mean_p", "freq")}
+        | {"ci95": r["ci95"], "flag": r["flag"]}
+        for r in calibration["rows"]
+        if r["zone_total"] and r["role"] == "active"
+    ]
+    payload = {
+        "policy_version": policy.version,
+        "matches": calibration["matches"],
+        "forecasts": calibration["forecasts"],
+        "zone": zone,
+        "flags": [
+            {k: r[k] for k in ("role", "scope", "family", "market", "range", "matches")}
+            | {"mean_p": r["mean_p"], "freq": r["freq"], "flag": r["flag_label"], "ci95": r["ci95"]}
+            for r in calibration["flags"]
+        ],
+        "market": [
+            {k: r[k] for k in ("scope", "family", "market", "matches", "state_label")}
+            | {"difference": r["difference"], "ci95": r["ci95"]}
+            for r in comparison
+            if r["matches"]
+        ],
+        "verdicts": len(verdicts),
+        "note": "raport informacyjny — nie zmienia modeli, progów profili ani kuponów",
+    }
+    report_id = digest(["calibration_report", "weekly", policy.version, snapshot])
+    recorded = False
+    if store.get("calibration_reports", report_id) is None:
+        store.insert(
+            "calibration_reports",
+            id=report_id,
+            created_at=iso(now),
+            kind="weekly",
+            policy_version=policy.version,
+            data_snapshot=snapshot,
+            matches=int(calibration["matches"]),
+            flags=len(flags),
+            verdicts=len(verdicts),
+            payload_json=canonical(payload),
+        )
+        recorded = True
+    added = 0
+    # one alert per FACT: a market and range of a model with its flag ("all leagues" and the
+    # scope flagged by the same matches are one fact; the message names every scope)
+    facts: dict[tuple, list[dict]] = defaultdict(list)
+    for r in flags:
+        facts[(r["family"], r["market"], r["range"], r["flag"])].append(r)
+    for (family, market, band, flag), found in sorted(facts.items()):
+        first = max(found, key=lambda r: r["matches"])
+        scopes = ", ".join(SCOPE_LABELS.get(r["scope"], r["scope"]) for r in found)
+        added += alerts.create(
+            store,
+            kind="calibration_flag",
+            message=(
+                f"Strefa kuponów — {FAMILY_LABELS.get(family, family)}, "
+                f"{market_label(market)}, {band} ({scopes}): {first['flag_label']} "
+                f"(n={matches_text(first['matches'])}; średnia szansa "
+                f"{_percent(first['mean_p'])}, trafność {_percent(first['freq'])}). Alert "
+                "informacyjny — modele i progi bez zmian."
+            ),
+            source="raport tygodniowy kalibracji",
+            now=now,
+            identity=["calibration_flag", family, market, band, flag],
+            payload={"scopes": [r["scope"] for r in found], "matches": first["matches"]},
+        )
+    for r in verdicts:
+        added += alerts.create(
+            store,
+            kind="market_verdict",
+            message=(
+                f"Porównanie z rynkiem STS — {FAMILY_LABELS.get(r['family'], r['family'])}, "
+                f"{market_label(r['market'])} ({SCOPE_LABELS.get(r['scope'])}): "
+                f"{r['state_label']} (n={matches_text(r['matches'])}). Alert informacyjny — "
+                "statusy rynków zmienia wyłącznie użytkownik."
+            ),
+            source="raport tygodniowy kalibracji",
+            now=now,
+            identity=["market_verdict", r["scope"], r["family"], r["market"], r["state"]],
+            payload={k: r[k] for k in ("scope", "family", "market", "matches", "state")},
+        )
+    return {
+        "recorded": recorded,
+        "report_id": report_id,
+        "matches": calibration["matches"],
+        "flags": len(flags),
+        "verdicts": len(verdicts),
+        "alerts": added,
+    }
+
+
+def _percent(value: float) -> str:
+    return f"{value * 100:.1f}".replace(".", ",") + "%"
+
+
+def latest_weekly_report(store: Store) -> dict | None:
+    rows = store.rows(
+        "SELECT * FROM calibration_reports WHERE kind='weekly' ORDER BY created_at DESC, id LIMIT 1"
+    )
+    return {**rows[0], "payload": json.loads(rows[0]["payload_json"])} if rows else None
 
 
 # ---------------------------------------------------------------- champion vs challenger

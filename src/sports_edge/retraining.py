@@ -15,6 +15,11 @@ Expiry never activates anything. The evidence of a challenger is counted in MATC
 (``prospective_eval.paired_matches``) and the decision panel says plainly whether it waits
 for evidence (n/300), whether the evidence is sufficient (the decision is the user's) or
 whether it is identical to the champion in the selection window.
+
+TASK 012: challengers are trained under protocol v3 (``rolling``: windows counted back from
+the training date), so a retraining can change the hyperparameters and calibration maps; the
+conditions above are unchanged. Only when the v3 windows are not feasible (too short a
+history) the challenger is trained under protocol v2 as before. Nothing activates a model.
 """
 
 import json
@@ -103,11 +108,12 @@ def review(
     train=None,
     allow_training: bool = True,
 ) -> dict:
-    """One weekly review of every scope. ``train`` (scope → report) defaults to protocol v2."""
-    from sports_edge.services import MODEL_SCOPES, run_protocol_v2
+    """One weekly review of every scope. ``train`` (scope → report) defaults to protocol v3
+    (TASK 012: rolling windows; v2 only when v3 is not feasible; never an activation)."""
+    from sports_edge.services import MODEL_SCOPES, train_challengers
 
     train = train or (
-        lambda scope: run_protocol_v2(store, paths, now=now, scope=scope, force=force)
+        lambda scope: train_challengers(store, paths, now=now, scope=scope, force=force)
     )
     out = {}
     expired: dict[str, list[dict]] = {}
@@ -205,7 +211,8 @@ def _decision(row: dict | None, measured: dict[str, dict] | None = None) -> dict
         "version_id": row["version_id"],
         "version": row["version"],
         "protocol": report.get("protocol", "v1"),
-        "decision": report.get("decision") if report.get("protocol") == "v2" else None,
+        "decision": report.get("decision") if report.get("protocol") in ("v2", "v3") else None,
+        "windows": report.get("split") if report.get("protocol") == "v3" else None,
         "holdout": report.get("holdout"),
         "statuses": statuses,
         "hyperparameters": report.get("hyperparameters"),
@@ -322,13 +329,21 @@ def conclusion(entry: dict) -> str:
     if not challenger:
         return "Brak challengera — model aktywny bez zmian."
     parts = []
-    if champion.get("protocol") != "v2":
+    if champion.get("protocol") not in ("v2", "v3"):
         parts.append(
             "Aktywna wersja ma statusy z protokołu v1 (holdout użyty do decyzji) — są zawieszone."
         )
     new = challenger.get("decision") or {}
     old = champion.get("decision") or {}
-    if new and old:
+    if new and old and challenger.get("protocol") == "v3" and champion.get("protocol") != "v3":
+        windows = challenger.get("windows") or {}
+        parts.append(
+            "Challenger z protokołu v3 (okna ruchome: selekcja od "
+            f"{windows.get('selection_from', '—')} do daty treningu). Jego okno selekcji to inny "
+            f"okres niż u aktywnej wersji v2, więc log loss {new['log_loss']} i {old['log_loss']} "
+            "nie są porównywalne — rozstrzyga porównanie w trybie cienia na tych samych meczach."
+        )
+    elif new and old:
         delta = new["log_loss"] - old["log_loss"]
         parts.append(
             f"W oknie selekcji challenger ma log loss {new['log_loss']} wobec {old['log_loss']} "

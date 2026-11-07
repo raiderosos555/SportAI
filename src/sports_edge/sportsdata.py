@@ -742,10 +742,11 @@ def _run_elo_v2(
 def elo_parameters(validation: dict) -> tuple[float, list[dict], float]:
     """(draw margin, reliability bins, ECE) behind prospective Elo forecasts and intervals.
 
-    v2 versions use the calibration window; v1 versions used the holdout (kept as stored).
+    v2 and v3 versions use the calibration window; v1 versions used the holdout (kept as
+    stored).
     """
     params = validation["hyperparameters"]
-    if validation.get("protocol") == "v2":
+    if validation.get("protocol") in ("v2", "v3"):
         source = validation["calibration"]
         return params["draw_margin"], source.get("reliability", []), source.get("ece") or 0.0
     source = validation["holdout"]

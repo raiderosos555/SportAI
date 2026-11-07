@@ -34,6 +34,9 @@ def test_main_user_paths_of_the_interface():
         "brak prognozy",
         "awaria źródła wyników",
         "modele: strefa kuponów i rynek STS",  # TASK 011
+        "automatyzacja: prognozy automatyczne i raport tygodniowy",  # TASK 012
+        "automatyzacja: kursy STS w dniu meczu",
+        "kupon dnia: metoda Ryzyka dnia",
     ):
         assert expected in names
     assert any(name.startswith("brak danych") for name in names)

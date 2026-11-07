@@ -26,7 +26,7 @@ from sports_edge.datasources.competitions import COMPETITIONS
 from sports_edge.ingestion.types import iso
 from sports_edge.matching import TeamIdentities, alias_map, match_participant
 from sports_edge.models import calibration
-from sports_edge.models.goals import GoalsMatch, fit, markets
+from sports_edge.models.goals import MAX_GOALS, GoalsMatch, fit, markets
 from sports_edge.models.registry import register_version, save_prediction
 from sports_edge.offers.text import NameNormalizer
 from sports_edge.provenance import code_state, data_snapshot
@@ -1029,6 +1029,15 @@ def predict_offer_goals(
         if matrix is None:
             skipped.append(f"{label}: drużyna poza modelem")
             continue
+        lam, mu = model.rates(*pair)
+        # TASK 012 §5.1: the parameters of the score matrix travel with every NEW forecast, so
+        # the joint chance of several markets of one match can be read again later
+        rates = {
+            "lambda": float(lam),
+            "mu": float(mu),
+            "rho": float(model.rho),
+            "max_goals": MAX_GOALS,
+        }
         priced = markets(matrix, LINES)
         for (market_key, line), probs in priced.items():
             if market_key == "double_chance" or market_key not in (served | {"1x2"}):
@@ -1078,6 +1087,7 @@ def predict_offer_goals(
                     "games": list(games),
                     "fit_date": fit_date,
                     "data": "wyniki as-of: " + ", ".join(providers),
+                    "score_matrix": rates,
                 },
                 kind="prospective",
                 created_at=now,

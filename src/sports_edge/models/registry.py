@@ -37,7 +37,7 @@ def validation_status(validation: dict, policy) -> tuple[str, list[str]]:
     data. Protocol v2 (TASK 007) judges the selection window; its final holdout never
     decides. Protocol v1 versions judged their holdout and keep that stored status."""
     reasons = []
-    if validation.get("protocol") == "v2":
+    if validation.get("protocol") in ("v2", "v3"):  # TASK 012: v3 judges its selection window
         sample, where, of = validation.get("decision") or {}, "w oknie selekcji", "okna selekcji"
     else:
         sample, where, of = validation.get("holdout") or {}, "w holdoucie", "holdoutu"

@@ -47,6 +47,7 @@ from sports_edge.matching import (
     load_team_identities,
     match_participant,
 )
+from sports_edge.models.elo import Elo, walk_forward
 from sports_edge.models.registry import latest_predictions, model_overview
 from sports_edge.offers.labels import market_label
 from sports_edge.offers.sources import STS_URLS, SourceBlocked, StsOfficialPdf
@@ -392,7 +393,7 @@ def ensure_model_roles(store: Store, *, now: datetime | None = None) -> int:
     v1 = [
         row["version_id"]
         for row in model_overview(store)
-        if json.loads(row["validation_json"]).get("protocol") != "v2"
+        if json.loads(row["validation_json"]).get("protocol") not in ("v2", "v3")
     ]
     return learning.ensure_roles(store, now=now, served=served, holdout_used=v1)
 
@@ -1082,6 +1083,8 @@ def run_analysis(
     save_coupons: bool = True,
     stats_provider: PitchApiProvider | None = None,
     fetch: Callable[..., ImportOutcome] | None = None,
+    forecasts_only: bool = False,
+    train_missing: bool = True,
 ) -> RangeRun:
     """Offer → results → statistics → matching → features → forecasts → calibration (once),
     then for EVERY day separately: ranking → coupon builder → probabilities → payouts → risk →
@@ -1091,6 +1094,10 @@ def run_analysis(
     sources are never called; models are trained only when no version exists yet. Forecasts
     for later days use only data available now. Missing data stops nothing: each stage
     reports what it could do.
+
+    TASK 012: ``forecasts_only`` stops after the forecasts (no pre-match feature snapshots,
+    no ranking, no coupon, no saved analysis — the automatic forecasts of the worker), and
+    ``train_missing=False`` never trains a missing model.
     """
     days = list(days)
     shared: list[dict] = []
@@ -1230,10 +1237,13 @@ def run_analysis(
 
     # 5. Pre-match features (as of now) ------------------------------------------------
     snapshots = 0
-    for event in covered:
-        if event_features(store, paths, event, decision_time=now) is not None:
-            snapshots += 1
-    stage(shared, 4, "ok", f"migawki cech przedmeczowych: {snapshots}", snapshots=snapshots)
+    if forecasts_only:
+        stage(shared, 4, "pominięte", "tryb prognoz automatycznych — bez migawek cech")
+    else:
+        for event in covered:
+            if event_features(store, paths, event, decision_time=now) is not None:
+                snapshots += 1
+        stage(shared, 4, "ok", f"migawki cech przedmeczowych: {snapshots}", snapshots=snapshots)
 
     # 6. Models (one Elo and one Dixon–Coles version per scope; trained only when missing,
     # under protocol v2: the first version of a scope is served, later ones are challengers)
@@ -1242,7 +1252,10 @@ def run_analysis(
         if not scope_has_data(store, scope):
             continue  # no history for this scope yet: nothing to train
         had_elo = scope_version(store, scope) is not None
-        if not had_elo or scope_version(store, scope, GOALS_FAMILY) is None:
+        missing = not had_elo or scope_version(store, scope, GOALS_FAMILY) is None
+        if missing and not train_missing:
+            errors.append(f"{SCOPE_LABELS[name]}: brak modelu (trening pominięty)")
+        elif missing:
             try:
                 run_protocol_v2(store, paths, now=now, scope=name)
                 trained = trained or not had_elo
@@ -1303,6 +1316,9 @@ def run_analysis(
         errors=errors,
     )
 
+    if forecasts_only:  # TASK 012: the automatic forecasts end here (no coupon, no analysis)
+        return RangeRun(days, {}, shared, refresh, now.astimezone(UTC).isoformat())
+
     # 7. Calibration and predictive validation -----------------------------------------
     quality = model_quality(store)
     by_scope = model_quality_by_scope(store)
@@ -1345,6 +1361,81 @@ def run_analysis(
         runs[day].offer = offers[day]
         runs[day].refresh = refresh
     return RangeRun(days, runs, shared, refresh, now.astimezone(UTC).isoformat())
+
+
+def run_forecasts(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    *,
+    now: datetime,
+    days: Sequence[str] | None = None,
+) -> dict:
+    """TASK 012 §3.1: the analysis stages from the STS offer to the forecasts for today and
+    tomorrow — no download, no results update, no statistics request, no model training, no
+    coupon and no saved analysis. Forecasts that are still valid (same model, same data) are
+    kept, not duplicated (the existing idempotency of the forecast functions)."""
+    today = now.astimezone(WARSAW).date()
+    days = list(days or [today.isoformat(), (today + timedelta(days=1)).isoformat()])
+    run = run_analysis(
+        store,
+        paths,
+        settings,
+        days,
+        now=now,
+        refresh_offer=False,
+        refresh_results=False,
+        save_coupons=False,
+        forecasts_only=True,
+        train_missing=False,
+    )
+    models = next(s for s in run.stages if s["stage"] == STAGES[5])
+    coverage = forecast_coverage(store, now=now, days=days)
+    return {
+        "days": days,
+        "events": coverage["events"],
+        "with_forecast": coverage["with_forecast"],
+        "without_forecast": coverage["without_forecast"][:30],
+        "saved": int(models.get("forecasts_saved", 0)) + int(models.get("goals_saved", 0)),
+        "kept": int(models.get("forecasts_kept", 0)),
+        "errors": list(models.get("errors") or []),
+        "skipped": len(models.get("skipped") or []),
+        "detail": models["detail"],
+    }
+
+
+def forecast_coverage(store: Store, *, now: datetime, days: Sequence[str]) -> dict:
+    """Upcoming STS matches of the supported leagues on ``days`` and whether a served model
+    has a prospective forecast for them (TASK 012: every match should have one)."""
+    marks = ",".join("?" for _ in days)
+    events = [
+        e
+        for e in store.rows(
+            f"SELECT * FROM events WHERE bookmaker_id='sts' AND offer_date IN ({marks}) "
+            "AND start_at IS NOT NULL AND start_at > ?",
+            (*days, now.isoformat()),
+        )
+        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+    ]
+    served = active_version_ids(store)
+    covered = set()
+    for chunk in range(0, len(events), 400):
+        part = [e["id"] for e in events[chunk : chunk + 400]]
+        if not part or not served:
+            continue
+        found = store.rows(
+            f"""SELECT DISTINCT event_id FROM predictions WHERE kind='prospective'
+            AND event_id IN ({",".join("?" for _ in part)})
+            AND model_version_id IN ({",".join("?" for _ in served)})""",
+            (*part, *sorted(served)),
+        )
+        covered |= {r["event_id"] for r in found}
+    missing = [e for e in events if e["id"] not in covered]
+    return {
+        "events": len(events),
+        "with_forecast": len(events) - len(missing),
+        "without_forecast": [f"{e['home']} - {e['away']} ({e['league']})" for e in missing],
+    }
 
 
 def _analyse_one_day(
@@ -1712,7 +1803,8 @@ def elo_walk_forward_forecasts(
     version = version or scope_version(store, competitions)
     if version is None:
         return {}
-    params = json.loads(version["validation_json"])["hyperparameters"]
+    validation = json.loads(version["validation_json"])
+    params = validation["hyperparameters"]
     matches = _scoped(
         history(
             store,
@@ -1722,13 +1814,22 @@ def elo_walk_forward_forecasts(
             identities=identities,
         )
     )
-    items, _margin = _forecasts(
-        matches,
-        k=params["k"],
-        home_advantage=params["home_advantage"],
-        # v2: the draw margin of the version (fitted before its selection window)
-        margin_until=params.get("draw_margin_until", RESEARCH_SPLIT.holdout_from),
-    )
+    if validation.get("protocol") == "v3":
+        # TASK 012: the draw margin of a v3 version was fitted on its calibration window
+        model = Elo(
+            k=params["k"],
+            home_advantage=params["home_advantage"],
+            draw_margin=params["draw_margin"],
+        )
+        items = walk_forward(matches, model, three_way=True)
+    else:
+        items, _margin = _forecasts(
+            matches,
+            k=params["k"],
+            home_advantage=params["home_advantage"],
+            # v2: the draw margin of the version (fitted before its selection window)
+            margin_until=params.get("draw_margin_until", RESEARCH_SPLIT.holdout_from),
+        )
     return {item["match"].result_id: item["forecast"] for item in items}
 
 
@@ -1811,7 +1912,7 @@ def with_predictive_status(store: Store, predictions: dict[tuple, dict]) -> dict
         return "experimental" if gate and not gate["ok"] else value
 
     for row in predictions.values():
-        if (row.get("validation") or {}).get("protocol") != "v2":
+        if (row.get("validation") or {}).get("protocol") not in ("v2", "v3"):
             _suspend_status(row)  # TASK 007 §4.2: statuses chosen on a used holdout
             continue
         report = benchmarks.get(row["model_version_id"])
@@ -1867,7 +1968,7 @@ def prediction_preference(store: Store) -> dict:
         if goals is None:
             continue
         report = json.loads(goals["validation_json"])
-        v2 = report.get("protocol") == "v2"
+        v2 = report.get("protocol") in ("v2", "v3")
         elo_ok = (
             v2
             and ((report.get("elo_predictive") or {}).get("1x2") or {}).get("status")
@@ -1997,6 +2098,197 @@ def run_protocol_v2(
     return {"elo": elo, "goals": goals, "summary": summary}
 
 
+def newest_protocol_version(store: Store, scope: str, family: str, protocol: str) -> dict | None:
+    """Newest version of a family of one scope trained under ``protocol``."""
+    for row in model_overview(store):
+        if row["family"] != family or row["status"] == "retired":
+            continue
+        if json.loads(row["validation_json"]).get("protocol") == protocol and set(
+            version_competitions(row)
+        ) <= set(MODEL_SCOPES[scope]):
+            return row
+    return None
+
+
+def run_protocol_v3(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    scope: str,
+    progress=None,
+    force: bool = False,
+) -> dict:
+    """TASK 012 §2: Elo and Dixon–Coles of one scope under protocol v3 (rolling windows from
+    the training date), registered as CHALLENGERS (shadow mode).
+
+    v3 trains challengers only: the champion (v2) stays served, and nothing is ever activated
+    here — the activation gate of v3 is the prospective comparison in shadow mode and the
+    decision is the user's. A v3 challenger on the same data as the newest v3 version of the
+    scope (no new match since its training) is refused unless forced."""
+    from sports_edge import rolling
+    from sports_edge.retraining import new_matches
+
+    competitions = MODEL_SCOPES[scope]
+    ensure_model_roles(store, now=now)
+    if learning.champion_id(store, scope, ELO_FAMILY) is None:
+        raise ValueError(
+            "Brak aktywnego modelu tego zakresu — protokół v3 trenuje wyłącznie challengery "
+            "(pierwszy model zakresu powstaje w protokole v2)."
+        )
+    # TASK 011 §5.3 holds for v3 too: no challenger on the same data as a v2/v3 champion or
+    # as the newest v3 version of the scope (no new match since) unless the user forces it
+    champion = scope_version(store, competitions, ELO_FAMILY)
+    if champion is not None and not rolling.decision_free(json.loads(champion["validation_json"])):
+        champion = None  # a v1 champion (used holdout) never blocks a new challenger
+    since = max(
+        (
+            row["trained_through"]
+            for row in (
+                champion,
+                newest_protocol_version(store, scope, ELO_FAMILY, rolling.PROTOCOL),
+            )
+            if row is not None and row.get("trained_through")
+        ),
+        default=None,
+    )
+    fresh = new_matches(
+        store, competitions, since=since, now=now, identities=team_identities(paths)
+    )
+    if since is not None and fresh == 0 and not force:
+        raise ValueError(
+            "Brak nowych meczów od treningu aktywnej wersji ani ostatniego challengera v3 — "
+            "challenger miałby te same dane. Trening możliwy tylko jako wymuszony (zostanie "
+            "wyraźnie oznaczony)."
+        )
+    forced = bool(force and since is not None and fresh == 0)
+    windows_policy = rolling.load_policy(paths.config)
+    if progress:
+        progress(f"Elo ({SCOPE_LABELS[scope]}): okna v3")
+    elo = rolling.run_elo_v3(
+        store,
+        competitions=competitions,
+        now=now,
+        policy=policy(paths),
+        identities=team_identities(paths),
+        rolling=windows_policy,
+    )
+    elo_row = next(r for r in model_overview(store) if r["version_id"] == elo["version_id"])
+    if progress:
+        progress(f"Dixon–Coles ({SCOPE_LABELS[scope]}): okna v3")
+    goals = rolling.run_dc_v3(
+        store,
+        competitions=competitions,
+        now=now,
+        policy=policy(paths),
+        probability_policy=probability_policy(paths),
+        elo_forecasts=elo_walk_forward_forecasts(
+            store,
+            now=now,
+            identities=team_identities(paths),
+            competitions=competitions,
+            version=elo_row,
+        ),
+        identities=team_identities(paths),
+        elo_version_id=elo["version_id"],
+        rolling=windows_policy,
+    )
+    goals_row = next(r for r in model_overview(store) if r["version_id"] == goals["version_id"])
+    changed = {
+        "elo": rolling.differences(scope_version(store, competitions, ELO_FAMILY), elo_row),
+        "goals": rolling.differences(scope_version(store, competitions, GOALS_FAMILY), goals_row),
+    }
+    summary = {
+        "protocol": rolling.PROTOCOL,
+        "split": elo["split"],
+        "elo_decision": elo.get("decision"),
+        "goals_decision": goals.get("decision"),
+        "statuses": {k: v["status"] for k, v in goals["predictive"].items()},
+        "elo_statuses": {k: v["status"] for k, v in goals["elo_predictive"].items()},
+        "markets_served": goals["markets_served"],
+        "new_matches": fresh,
+        "forced": forced,
+        "decision_gate": elo["decision_gate"],
+        "differs_from_champion": {k: not v.get("identical", False) for k, v in changed.items()},
+        "hyperparameters": {k: v.get("hyperparameters") for k, v in changed.items()},
+    }
+    reason = (
+        f"Protokół v3 (okna ruchome, {elo['split']['rule']}): wybór na ostatnich miesiącach, "
+        "bramka = porównanie w trybie cienia; aktywacja wyłącznie przez użytkownika"
+    )
+    if forced:
+        reason = "WYMUSZONY TRENING (użytkownik): 0 nowych meczów od poprzedniego v3. " + reason
+    for family, report in ((ELO_FAMILY, elo), (GOALS_FAMILY, goals)):
+        learning.record(
+            store,
+            kind="challenger_ready",
+            actor="system",
+            reason=reason,
+            now=now,
+            version_id=report["version_id"],
+            scope=scope,
+            family=family,
+            payload=summary,
+        )
+    return {"elo": elo, "goals": goals, "summary": summary, "differences": changed}
+
+
+def run_walk_forward_v3(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    scope: str,
+    first_month: str | None = None,
+    progress=None,
+) -> dict:
+    """TASK 012 §2.3: monthly v3 retraining against the frozen champion (served v2 version)
+    of a scope, on the same matches (read-only: nothing is registered or activated)."""
+    from sports_edge import rolling
+
+    champions = (
+        scope_version(store, MODEL_SCOPES[scope], ELO_FAMILY),
+        scope_version(store, MODEL_SCOPES[scope], GOALS_FAMILY),
+    )
+    if None in champions:
+        raise ValueError("Brak aktywnych wersji Elo i Dixon–Coles tego zakresu")
+    policy_v3 = rolling.load_policy(paths.config)
+    starts = rolling.month_starts(first_month or policy_v3.first_month, now)
+    return rolling.walk_forward(
+        store,
+        scope,
+        now=now,
+        competitions=MODEL_SCOPES[scope],
+        champion_elo=champions[0],
+        champion_goals=champions[1],
+        identities=team_identities(paths),
+        rolling=policy_v3,
+        months=starts,
+        progress=progress,
+    )
+
+
+def train_challengers(
+    store: Store,
+    paths: AppPaths,
+    *,
+    now: datetime,
+    scope: str,
+    progress=None,
+    force: bool = False,
+) -> dict:
+    """Challengers of one scope: protocol v3 (TASK 012); protocol v2 only when the v3
+    windows are not feasible (too short a history) — said in the summary."""
+    try:
+        return run_protocol_v3(store, paths, now=now, scope=scope, progress=progress, force=force)
+    except ValueError as error:
+        if "oknach protokołu v3" not in str(error) and "trenuje wyłącznie" not in str(error):
+            raise  # e.g. no new matches: the same refusal as before
+        found = run_protocol_v2(store, paths, now=now, scope=scope, progress=progress, force=force)
+        found["summary"]["v3_not_feasible"] = str(error)
+        return found
+
+
 ROLE_LABELS = {
     "active": "aktywna",
     "challenger": "challenger (tryb cienia)",
@@ -2043,7 +2335,7 @@ def model_versions_of(store: Store, scope: str) -> list[dict]:
                 if vid in served
                 else "unused"
             )
-            decision = report.get("decision") if report.get("protocol") == "v2" else None
+            decision = report.get("decision") if report.get("protocol") in ("v2", "v3") else None
             statuses = (
                 report.get("predictive")
                 or (measured.get(vid) or {}).get("elo_predictive")  # TASK 011: Elo statuses
@@ -2061,7 +2353,7 @@ def model_versions_of(store: Store, scope: str) -> list[dict]:
                     "protocol": report.get("protocol", "v1"),
                     "role": role,
                     "log_loss": (decision or {}).get("log_loss"),
-                    "validated": validated if report.get("protocol") == "v2" else [],
+                    "validated": validated if report.get("protocol") in ("v2", "v3") else [],
                 }
             )
     return out
@@ -2097,10 +2389,11 @@ def train_now(
     progress=None,
     force: bool = False,
 ) -> dict:
-    """Training on demand (button in Uczenie AI): new versions under protocol v2 become
-    challengers in shadow mode at once; activating them stays the user's decision. Without
-    new matches since the champion's training it refuses unless force (TASK 011)."""
-    found = run_protocol_v2(store, paths, now=now, scope=scope, progress=progress, force=force)
+    """Training on demand (button in Uczenie AI): new versions under protocol v3 (TASK 012;
+    v2 when v3 is not feasible) become challengers in shadow mode at once; activating them
+    stays the user's decision. Without new matches since the champion's training it refuses
+    unless force (TASK 011)."""
+    found = train_challengers(store, paths, now=now, scope=scope, progress=progress, force=force)
     if progress:
         progress("Prognozy challengerów (tryb cienia)")
     try:

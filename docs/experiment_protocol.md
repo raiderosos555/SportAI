@@ -81,3 +81,19 @@ koszty składowe, CI i metodę resamplingu, liczbę wszystkich hipotez, korektę
 wielokrotności, brakujące CLV, wyniki per sezon/sport/rynek oraz wnioski ograniczone
 do badanej populacji. Decyzja: odrzucenie / brak dowodów / dalsza walidacja, bez typów
 do gry prawdziwymi pieniędzmi.
+
+## Protokół v3 modeli piłkarskich (TASK 012)
+
+Protokół v2 (TASK 007) ma stałe daty okien, więc retrening na nowych meczach odtwarza te same
+hiperparametry i kalibratory. Protokół v3 (`config/protocol_v3.toml`, `src/sports_edge/rolling.py`)
+liczy okna wstecz od daty treningu T, wyłącznie z danych dostępnych w T:
+dopasowanie (siły drużyn as-of) przed T − 24 mies., kalibracja [T − 24, T − 12 mies.),
+selekcja hiperparametrów [T − 12 mies., T); przy krótszej historii półsezony 6 + 6 mies.
+Mecz należy do okna tylko wtedy, gdy jego wynik był dostępny (`available_at`) przed końcem okna.
+
+Bramka decyzji v3 jest inna niż w v2: nie ma nietkniętego historycznego holdoutu. O aktywacji
+rozstrzyga porównanie prospektywne z aktywną wersją w trybie cienia (co najmniej 300 wspólnych
+rozliczonych meczów, TASK 011); wynik okna selekcji to tylko informacja. Wersja v3 jest zawsze
+rejestrowana jako challenger, a aktywacja należy do użytkownika. Dowód historyczny bez czekania:
+walk-forward z retreningiem co miesiąc (`sports-edge research walk-forward-v3`) na tych samych
+meczach co zamrożona wersja v2 — szczegóły i wyniki w `docs/task_012_report.md`.

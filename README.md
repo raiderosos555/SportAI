@@ -23,7 +23,13 @@ Funkcje:
 - paper trading, automatyczne rozliczenia i panel skuteczności;
 - ocena prospektywna (TASK 011): kalibracja strefy kuponów (szansa ≥ 60%) liczona na meczach,
   porównanie z kursami STS sprzed meczu bez marży, panel decyzji champion–challenger,
-  liczbowe „Ryzyko dnia”.
+  liczbowe „Ryzyko dnia”;
+- modele, które się uczą (TASK 012): protokół v3 z oknami ruchomymi względem daty treningu
+  (challengery mogą zmienić hiperparametry i kalibratory; aktywacja nadal tylko przez
+  użytkownika), walk-forward v3 kontra zamrożony v2, automatyczne prognozy oferty po każdym
+  nowym dokumencie STS (bez kuponów), raport tygodniowy kalibracji z alertem, pobrania oferty
+  „w dniu meczu” w limitach STS, porównanie z rynkiem według wieku kursu, „Ryzyko dnia” z macierzy
+  wyników Dixon–Coles.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
@@ -34,7 +40,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 011](docs/task_011_report.md).
+Stan i ograniczenia: [raport TASK 012](docs/task_012_report.md).
 
 ## Uruchomienie na Windows
 
@@ -62,7 +68,7 @@ serwera”. Harmonogram zadań Windows nie jest potrzebny.
 | Kupon jak najbliżej wybranego kursu; długi kupon 8–12 | **Kupon na kurs**, **Tasiemka** |
 | Ryzyko serii kuponów (Monte Carlo); odtworzenie przeszłego dnia as-of | **Symulator budżetu**, **Symulator historyczny** |
 | Champion i challenger, aktywacja nowego modelu, przegląd, jakość prognoz, eksperyment cech (model rozszerzony) | **Uczenie AI** |
-| Worker automatyzacji w zakładkach: przegląd, harmonogram (kalendarz, stałe godziny i dni, zadania jednorazowe, kontrole przed meczem), procesy, historia, alerty | **Automatyzacja AI** |
+| Worker automatyzacji w zakładkach: przegląd, harmonogram (kalendarz, stałe godziny i dni, zadania jednorazowe, kontrole przed meczem, kursy STS w dniu meczu), procesy (także automatyczne prognozy i raport tygodniowy), historia, alerty | **Automatyzacja AI** |
 | Ocena modelu, najbardziej prawdopodobny typ, uzasadnienie, forma, statystyki, składy, tryb po meczu | **Analiza meczów** |
 | Terminarz, zakończone mecze z wynikami, pełna oferta STS i historia kursów, import PDF | **Wydarzenia i wyniki** |
 | Kupony, trafność, ROI, wykres w czasie, rozliczenia, CLV, analizy | **Historia i skuteczność** |
@@ -90,7 +96,9 @@ PitchAPI (zalecane): darmowy klucz z pitchapi.dev jako `PITCHAPI_KEY=…` w `.en
 
 Profile kuponów i progi walidacji: `config/probability_policy.toml` (wersjonowane). Ocena
 prospektywna (próg 30 meczów dla flag, 300 meczów dla werdyktu, wygasanie challengerów po 14
-dniach): `config/prospective_policy.toml` — nie zmienia progów profili ani statusów.
+dniach, przedziały wieku kursu): `config/prospective_policy.toml` — nie zmienia progów profili
+ani statusów. Okna protokołu v3 (12 + 12 miesięcy, półsezony przy krótszej historii):
+`config/protocol_v3.toml`.
 
 Lokalny model AI do objaśnień kuponu (opcjonalnie, bezpłatnie): zainstaluj Ollamę z
 [ollama.com](https://ollama.com/download/windows), pobierz model jednym poleceniem i włącz go w
@@ -120,6 +128,8 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge research backfill           # historia lig z planu HISTORY_PLAN (bezpłatne źródła)
 .\.venv\Scripts\sports-edge research results            # wyniki z danych niezależnych (pewne dopasowanie)
 .\.venv\Scripts\sports-edge research protocol-v2 --scope core   # nowe modele (challengery) w protokole v2
+.\.venv\Scripts\sports-edge research protocol-v3 --scope core   # TASK 012: challengery z oknami ruchomymi
+.\.venv\Scripts\sports-edge research walk-forward-v3 --scope core   # TASK 012: retrening co miesiąc vs v2
 .\.venv\Scripts\sports-edge research ablation --scope core      # ablacja A Elo / B DC / C DC+cechy / D ML
 .\.venv\Scripts\sports-edge learning review             # przegląd modeli na żądanie (automatycznie: panel Automatyzacja AI)
 .\.venv\Scripts\sports-edge learning catch-up           # uzupełnienie po przerwie (rozliczenia, wyniki)
@@ -128,6 +138,8 @@ CLI (te same funkcje bez interfejsu):
 .\.venv\Scripts\sports-edge diversity --time 10:00      # TASK 010: replay as-of z limitem różnicowania 0 / 1 / 2
 .\.venv\Scripts\sports-edge calibration --scope core    # TASK 011: kalibracja strefy kuponów na meczach (JSON)
 .\.venv\Scripts\sports-edge market-benchmark            # TASK 011: zapis porównania z rynkiem STS (append-only)
+.\.venv\Scripts\sports-edge forecasts                   # TASK 012: prognozy oferty dziś i jutro, bez kuponów
+.\.venv\Scripts\sports-edge calibration-report          # TASK 012: raport tygodniowy kalibracji i alerty
 .\.venv\Scripts\sports-edge export json
 .\.venv\Scripts\sports-edge backup
 .\.venv\Scripts\sports-edge demo
@@ -170,7 +182,7 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-371 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+388 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
@@ -180,8 +192,14 @@ własne pule profili generatora, wybór widocznego przycisku i diagnostyka w Pla
 statystyki i alerty liczone raz, podwójne kliknięcie, migracja v8, `.gitignore`; 15 z TASK 011:
 kalibracja na meczach i flagi, kurs STS sprzed meczu i usuwanie marży, stany porównania bez
 wartości domyślnych, wygasanie challengerów i statusy Elo, brak treningu na tych samych danych,
-Ryzyko dnia, migracja v9, panel Modeli).
-Ścieżki interfejsu: `python -m sports_edge.qa` (26 ścieżek). Zrzuty ekranu:
+Ryzyko dnia, migracja v9, panel Modeli; 17 z TASK 012: okna v3 i dostępność wyników,
+challenger v3 a champion v2 i brak automatycznej aktywacji, walk-forward bez przecieku na tych
+samych meczach, automatyczne prognozy bez kuponów i bez duplikatów, wyzwalacz po nowym
+dokumencie STS, raport tygodniowy z jednym alertem na fakt, plan pobrań w dniu meczu z limitami
+i zgodą, wiek kursu w porównaniu z rynkiem, Ryzyko dnia z macierzy wyników i oznaczony fallback,
+stare nogi kuponów bez identyfikatora meczu,
+migracja v10, `conftest` importujący własny kod, panel Automatyzacji).
+Ścieżki interfejsu: `python -m sports_edge.qa` (29 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
 768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,
@@ -211,7 +229,7 @@ src/sports_edge/
                   page_models, page_sources, diagnostics (analiza EV), common (cache, formaty),
                   page_my_coupon + cart (Mój kupon), page_generator, page_simulators,
                   page_learning (Uczenie AI)
-  storage.py      SQLite tylko-dopisywanie, migracje do v9 z kopią;  repository.py  importy i widoki
+  storage.py      SQLite tylko-dopisywanie, migracje do v10 z kopią;  repository.py  importy i widoki
   my_coupon.py, advisor.py, explainer.py, llm.py   Mój kupon, ocena AI, pytania, lokalny model (Ollama)
   analysis/generator.py  kupon na kurs;  simulation.py  symulator budżetu i historyczny
   learning.py, retraining.py, ablation.py   historia modeli, przegląd, champion–challenger, ablacja
@@ -224,8 +242,9 @@ src/sports_edge/
   probability_lab.py  Dixon–Coles walk-forward, kalibracja, walidacja predykcyjna, prognozy
   sports_intel.py statystyki meczowe, składy, cechy przedmeczowe as-of (migawki)
   performance.py  skuteczność kuponów i selekcji kreatora
-  prospective_eval.py  TASK 011: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS,
-                  dowody champion–challenger
+  prospective_eval.py  TASK 011: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS
+                  (TASK 012: według wieku kursu), dowody champion–challenger, raport tygodniowy
+  rolling.py      TASK 012: protokół v3 (okna ruchome od daty treningu), walk-forward v3 vs v2
   insights.py     warstwa prostego języka: wiarygodność, grupy typów A/B/C, powody braku kuponu
   coverage.py     audyt pokrycia oferty STS (wydarzenia, rynki, selekcje, powody braku prognozy)
   provenance.py   stan kodu i snapshot danych;  bookmakers.py  profil STS i reguły rynków
@@ -237,6 +256,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 012](docs/task_012_report.md) | Modele, które się uczą: protokół v3 z oknami ruchomymi i jego bramka decyzji, walk-forward v3 vs v2, automatyczne prognozy oferty, raport tygodniowy kalibracji, kursy STS w dniu meczu, Ryzyko dnia z macierzy wyników |
 | [Raport TASK 011](docs/task_011_report.md) | Wiarygodność prognoz: kalibracja strefy kuponów na meczach, porównanie z rynkiem STS, wykonalność szybszego zbierania dowodów, proces challengerów, Ryzyko dnia jako liczba |
 | [Raport TASK 010](docs/task_010_report.md) | Jeden kupon, jedna historia: tożsamość kuponu, kupon oficjalny dnia, rewizje i aktualizacje kursów, statystyki bez duplikatów, alerty raz na zmianę, ryzyko dnia |
 | [Raport HOTFIX 009.1](docs/task_009_1_report.md) | Playwright: widoczny przycisk i diagnostyka, pełny cykl workera, odbiór generatora kuponów, CI |

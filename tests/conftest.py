@@ -1,15 +1,31 @@
+import os
 import shutil
+import sys
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
-import pytest
-
-from sports_edge.domain import Event, Market, Selection
-from sports_edge.settlement import CostProfile
-from sports_edge.temporal import Timestamps
-
 ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+
+# TASK 012 §6: the editable install of the shared virtual environment points at the MAIN
+# checkout; a worktree (or any copy of the repository) must test its OWN code. ``src`` of
+# this checkout goes first on sys.path — before sports_edge is imported anywhere — and on
+# PYTHONPATH for the tests that start a subprocess (the automation worker, Streamlit QA).
+if not sys.path or Path(sys.path[0]).resolve() != SRC:
+    sys.path.insert(0, str(SRC))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    [str(SRC), *[p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p]]
+)
+for _name in [m for m in sys.modules if m == "sports_edge" or m.startswith("sports_edge.")]:
+    if not str(getattr(sys.modules[_name], "__file__", "") or "").startswith(str(SRC)):
+        del sys.modules[_name]  # imported from another checkout before this file ran
+
+import pytest  # noqa: E402
+
+from sports_edge.domain import Event, Market, Selection  # noqa: E402
+from sports_edge.settlement import CostProfile  # noqa: E402
+from sports_edge.temporal import Timestamps  # noqa: E402
 
 
 @pytest.fixture

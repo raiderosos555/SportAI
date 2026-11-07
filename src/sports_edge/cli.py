@@ -70,7 +70,14 @@ def fetch_sts(day: str) -> None:
     _print({"duplicate": outcome.duplicate, **outcome.summary})
 
 
-def research(step: str, scope: str = "core", *, force: bool = False) -> None:
+def research(
+    step: str,
+    scope: str = "core",
+    *,
+    force: bool = False,
+    first_month: str | None = None,
+    out: Path | None = None,
+) -> None:
     """Independent data and the first experiment; downloads respect the offline setting."""
     from sports_edge import services
     from sports_edge.datasources import openfootball
@@ -115,6 +122,29 @@ def research(step: str, scope: str = "core", *, force: bool = False) -> None:
                 **found["summary"],
             }
         )
+    elif step == "protocol-v3":  # TASK 012: rolling windows, challengers only
+        found = services.run_protocol_v3(
+            store, paths, now=now, scope=scope, progress=print, force=force
+        )
+        _print(
+            {
+                "elo_version_id": found["elo"]["version_id"],
+                "goals_version_id": found["goals"]["version_id"],
+                **found["summary"],
+                "differences": found["differences"],
+            }
+        )
+    elif step == "walk-forward-v3":  # TASK 012 §2.3: read-only proof on history
+        found = services.run_walk_forward_v3(
+            store, paths, now=now, scope=scope, first_month=first_month, progress=print
+        )
+        rows = found.pop("rows")
+        if out is not None:
+            out.write_text(
+                json.dumps({**found, "rows": rows}, ensure_ascii=False, default=str),
+                encoding="utf-8",
+            )
+        _print(found)
     elif step == "goals-predict":
         _print(services.generate_goals_predictions(store, paths, now=now))
     elif step == "backfill":
@@ -231,6 +261,22 @@ def calibration(scope: str | None, min_prob: float, *, market: bool = False) -> 
     _print(found)
 
 
+def forecasts() -> None:
+    """TASK 012 §3.1: automatic forecasts of today's and tomorrow's offer (no coupons)."""
+    from sports_edge.services import run_forecasts
+
+    paths, settings, store = _context()
+    _print(run_forecasts(store, paths, settings, now=datetime.now(UTC)))
+
+
+def calibration_report() -> None:
+    """TASK 012 §3.2: the weekly calibration report (history entry + alerts once per fact)."""
+    from sports_edge import prospective_eval as pe
+
+    paths, _settings, store = _context()
+    _print(pe.weekly_report(store, now=datetime.now(UTC), policy=pe.load_policy(paths.config)))
+
+
 def market_benchmark() -> None:
     """TASK 011 §3: record the prospective STS market benchmark (append-only, idempotent)."""
     from sports_edge import prospective_eval as pe
@@ -325,6 +371,8 @@ def main() -> None:
             "goals-experiment",
             "goals-predict",
             "protocol-v2",
+            "protocol-v3",
+            "walk-forward-v3",
             "ablation",
             "backfill",
             "results",
@@ -336,8 +384,10 @@ def main() -> None:
     res.add_argument(
         "--force",
         action="store_true",
-        help="protocol-v2: train even without new matches since the champion (marked)",
+        help="protocol-v2/v3: train even without new matches since the champion (marked)",
     )
+    res.add_argument("--first-month", help="walk-forward-v3: first month YYYY-MM (default 2024-07)")
+    res.add_argument("--out", type=Path, help="walk-forward-v3: write every forecast row to JSON")
     ana = commands.add_parser(
         "analyse", help="GENERUJ KUPONY DNIA without the interface (14 stages, saved proposals)"
     )
@@ -366,6 +416,12 @@ def main() -> None:
     commands.add_parser(
         "market-benchmark", help="TASK 011: record the prospective STS market benchmark"
     )
+    commands.add_parser(
+        "forecasts", help="TASK 012: forecasts of today's and tomorrow's offer, no coupons"
+    )
+    commands.add_parser(
+        "calibration-report", help="TASK 012: weekly calibration report and its alerts"
+    )
     args = parser.parse_args()
     if args.command == "demo":
         demo()
@@ -380,7 +436,9 @@ def main() -> None:
     elif args.command == "check":
         sys.exit(check())
     elif args.command == "research":
-        research(args.step, args.scope, force=args.force)
+        research(
+            args.step, args.scope, force=args.force, first_month=args.first_month, out=args.out
+        )
     elif args.command == "analyse":
         analyse(args.day, refresh_offer=args.refresh_offer, refresh_results=not args.no_results)
     elif args.command == "learning":
@@ -393,6 +451,10 @@ def main() -> None:
         calibration(args.scope, args.min_prob, market=args.market)
     elif args.command == "market-benchmark":
         market_benchmark()
+    elif args.command == "forecasts":
+        forecasts()
+    elif args.command == "calibration-report":
+        calibration_report()
 
 
 if __name__ == "__main__":

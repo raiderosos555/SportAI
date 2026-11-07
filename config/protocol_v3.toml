@@ -1,0 +1,39 @@
+# TASK 012: protocol v3 — ROLLING windows counted back from the training date T (data known
+# up to T). Protocol v2 (services.PROTOCOLS) keeps its fixed dates; nothing here changes a
+# coupon profile, a validation threshold or a served model. A v3 version is always trained as a
+# CHALLENGER (shadow mode); activation stays the user's decision.
+[policy]
+version = "2026-11-06.v3a"
+
+# Windows of one scope (months before T, each "from" inclusive):
+#   fit (team strengths, as-of)   everything before T − (calibration + selection)
+#   calibration                   [T − 24 mies., T − 12 mies.)   calibration maps, Elo draw margin
+#   selection                     [T − 12 mies., T)              hyperparameters; statuses = information
+# A match belongs to a window only when its result was AVAILABLE (available_at) before the end of
+# that window (the selection window ends at T).
+[windows]
+calibration_months = 12
+selection_months = 12
+min_window_matches = 300     # every window of a scope needs at least this many matches
+min_fit_matches = 300        # matches before the calibration window (warm-up of team strengths)
+
+# Rule for scopes with a shorter history (the 7 added leagues: results from 2021/22, Poland and
+# Turkey from 2022/23): when the 12 + 12 months windows miss one of the minimums above, both
+# windows shrink to half seasons (6 + 6 months), like the half-season windows of protocol v2.
+# Too little data even then: protocol v3 is not feasible at T (an explicit error, no model).
+[windows.short]
+calibration_months = 6
+selection_months = 6
+
+# Activation gate of v3 (there is no untouched historical holdout any more): the prospective
+# comparison with the champion in shadow mode (TASK 011, common settled MATCHES). The selection
+# window result is information only.
+[decision]
+shadow_matches = 300
+
+# Walk-forward proof on history (sports-edge research walk-forward-v3): a v3 retraining at the
+# first day of every month from first_month on; only the matches of that month are forecast.
+[walk_forward]
+first_month = "2024-07"
+resamples = 1000
+seed = 7

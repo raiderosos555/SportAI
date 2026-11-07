@@ -784,9 +784,9 @@ def test_migration_to_v9_backs_up_and_keeps_every_row(tmp_path):
     raw.commit()
     raw.close()
     migrated = Store(path, backup_dir=tmp_path / "backups")
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION >= 9  # TASK 012: v10 adds calibration_reports on top of v9
     assert migrated.migration_backup is not None and migrated.migration_backup.exists()
-    assert migrated.migration_backup.name.startswith("pre-migration-v9_")
+    assert migrated.migration_backup.name.startswith(f"pre-migration-v{SCHEMA_VERSION}_")
     for table, n in counts.items():
         if table != "schema_migrations":
             assert migrated.scalar(f"SELECT COUNT(*) FROM {table}") == n, table
@@ -794,7 +794,9 @@ def test_migration_to_v9_backs_up_and_keeps_every_row(tmp_path):
     query = "SELECT name FROM sqlite_master WHERE type='trigger'"
     triggers = {r[0] for r in migrated.connection.execute(query)}
     assert {"immutable_market_benchmarks_UPDATE", "immutable_market_benchmarks_DELETE"} <= triggers
-    note = migrated.rows("SELECT description FROM schema_migrations WHERE version=9")
+    note = migrated.rows(  # TASK 012: the one migration run is logged under the current version
+        "SELECT description FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
+    )
     assert note and "v9 TASK 011" in note[-1]["description"]
     migrated.close()
 

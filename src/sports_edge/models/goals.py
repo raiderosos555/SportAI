@@ -212,3 +212,32 @@ def markets(matrix: np.ndarray, lines: tuple[float, ...] = (0.5, 1.5, 2.5, 3.5, 
         out[("team_total_home", line)] = {"over": home_over, "under": 1.0 - home_over}
         out[("team_total_away", line)] = {"over": away_over, "under": 1.0 - away_over}
     return out
+
+
+def outcome_mask(
+    market_key: str, line: float | str | None, selection: str, size: int = MAX_GOALS + 1
+) -> np.ndarray | None:
+    """Scores (home goals i, away goals j) where a selection wins, as a 0/1 matrix — the
+    same definitions as ``markets``; None for a market that the score matrix does not give
+    (TASK 012: joint chance of several selections of one match)."""
+    i, j = np.indices((size, size))
+    value = float(line) if line not in (None, "") else None
+    found = {
+        ("1x2", "home"): i > j,
+        ("1x2", "draw"): i == j,
+        ("1x2", "away"): i < j,
+        ("double_chance", "home_draw"): i >= j,
+        ("double_chance", "draw_away"): i <= j,
+        ("double_chance", "home_away"): i != j,
+        ("btts", "yes"): (i > 0) & (j > 0),
+        ("btts", "no"): (i == 0) | (j == 0),
+        ("home_to_score", "yes"): i > 0,
+        ("home_to_score", "no"): i == 0,
+        ("away_to_score", "yes"): j > 0,
+        ("away_to_score", "no"): j == 0,
+    }.get((market_key, selection))
+    if found is None and value is not None:
+        goals = {"total": i + j, "team_total_home": i, "team_total_away": j}.get(market_key)
+        if goals is not None and selection in ("over", "under"):
+            found = goals > value if selection == "over" else goals < value
+    return None if found is None else found.astype(float)

@@ -265,7 +265,9 @@ def _exposed(rows: list[dict], payload: dict, name: str, exposure: dict | None) 
         return rows
     for row, leg in zip(rows, payload["legs"], strict=True):
         others = [
-            label for profile, label, _pick in exposure.get(leg["event_id"], []) if profile != name
+            label
+            for profile, label, _pick in exposure.get(ins.match_of(leg), [])
+            if profile != name
         ]
         if others:
             note = f"ten mecz jest też w: {', '.join(others)}"

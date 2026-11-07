@@ -163,7 +163,7 @@ def calibration_note(prediction: dict | None, p: float | None) -> str:
     if prediction is None or p is None:
         return "—"
     validation = prediction["validation"]
-    v2 = validation.get("protocol") == "v2"
+    v2 = validation.get("protocol") in ("v2", "v3")  # TASK 012: v3 is decision-free too
     where = "okno selekcji" if v2 else "holdout"
     family = prediction["uncertainty"].get("family")
     ranges = ((validation.get("families") or {}).get(family) or {}).get("ranges")
@@ -429,7 +429,7 @@ def _candidate(
                 probability_ok = False
                 p_low = p_high = None
         validation = prediction["validation"]
-        v2 = validation.get("protocol") == "v2"
+        v2 = validation.get("protocol") in ("v2", "v3")
         sample = (validation.get("decision") if v2 else validation.get("holdout")) or {}
         # TASK 011: without a benchmark on the same matches the comparison is unknown, never a
         # default "False" (the prospective comparison lives in prospective_eval)

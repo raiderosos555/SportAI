@@ -3,7 +3,7 @@
 # validation threshold, a model status or a stored forecast. Flags and comparisons are shown to
 # the user only; promoting a model stays the user's decision.
 [policy]
-version = "2026-11-06.e1"
+version = "2026-11-06.e2"  # e2 (TASK 012): age of the STS document
 
 # Reliability in the coupon zone. The unit is a MATCH: several markets of one match ("home
 # team scores" and "home team over 0.5 goals") are one dependent observation, never two.
@@ -19,6 +19,9 @@ min_matches = 300            # common settled matches before a verdict (model be
 devig = "power"              # margin removal: "power" (primary) or "proportional"
 resamples = 1000             # bootstrap over matches of the log loss difference
 seed = 7
+# TASK 012: the comparison per AGE of the STS document used (kick-off − time printed in the
+# document), in hours: <= 3 h, 3–12 h, > 12 h. Sensitivity only — the verdict stays pooled.
+age_groups = [3, 12]
 
 # Champion vs challenger (shadow mode).
 [challengers]
