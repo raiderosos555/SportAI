@@ -257,10 +257,10 @@ def replay_day(
     from sports_edge.analysis.coupon_builder import build_coupons
     from sports_edge.bookmakers import load_profiles
     from sports_edge.paper import resolve
-    from sports_edge.services import analyse_day, probability_policy
+    from sports_edge.services import analyse_day, coupon_rules
     from sports_edge.settlement import Outcome, settle
 
-    rules = probability_policy(paths)
+    rules = coupon_rules(paths, settings)  # TASK 014: + optional profiles switched on
     sts = load_profiles(paths.config)["sts"]
     _report, candidates = analyse_day(
         store, paths, settings, day, now=decision_at, as_of=decision_at
@@ -357,10 +357,10 @@ def diversity_replay(
     the default of the policy stays off."""
     from sports_edge.analysis.coupon_builder import build_coupons
     from sports_edge.bookmakers import load_profiles
-    from sports_edge.services import analyse_day, probability_policy
+    from sports_edge.services import analyse_day, coupon_rules
 
     warsaw = ZoneInfo("Europe/Warsaw")
-    rules = probability_policy(paths)
+    rules = coupon_rules(paths, settings)  # TASK 014: + optional profiles switched on
     sts = load_profiles(paths.config)["sts"]
     totals = {
         limit: {
@@ -518,6 +518,27 @@ def _complement_low(row: dict, selection: str) -> float | None:
     return None if not bounds else max(0.0, 1.0 - float(bounds[1]))
 
 
+def option_d(candidates: list, rows: dict) -> list:
+    """Option D of TASK 013 §5.4 (a what-if, never served): the cautious chance of an Elo
+    double chance becomes 1 − the upper bound of the excluded 1X2 outcome (one interval, like
+    Dixon–Coles) instead of the sum of the lower bounds of two outcomes. ``rows``: the
+    forecast rows by id. Other selections are returned unchanged."""
+    changed = []
+    for c in candidates:
+        row = rows.get(c.prediction_id)
+        if (
+            row is not None
+            and row["family"] == "elo_ordered_draw"
+            and c.market_key == "double_chance"
+            and c.p_low is not None
+        ):
+            low = _complement_low(row, c.selection)
+            if low is not None and low <= c.p_model:
+                c = replace(c, p_low=max(c.p_low, low))
+        changed.append(c)
+    return changed
+
+
 def _median(values: list[float]) -> float | None:
     if not values:
         return None
@@ -558,10 +579,10 @@ def high_hit_diagnosis(
     )
     from sports_edge.bookmakers import load_profiles
     from sports_edge.models.registry import model_overview
-    from sports_edge.services import day_candidates_at, probability_policy
+    from sports_edge.services import coupon_rules, day_candidates_at
 
     warsaw = ZoneInfo("Europe/Warsaw")
-    rules = probability_policy(paths)
+    rules = coupon_rules(paths, settings)  # TASK 014: + optional profiles switched on
     sts = load_profiles(paths.config)["sts"]
     profile = rules.profiles[profile_name]
     floor = float(profile["min_leg_probability"])
@@ -627,19 +648,7 @@ def high_hit_diagnosis(
                     label, n = calibration_sample(row, c.market_key, c.selection, c.line)
                     seen[pick] = {"label": label, "n": n, "gap": c.p_model - c.p_low}
             # what-if: Elo double chance bounded by ONE 1X2 interval (never served)
-            changed = []
-            for c in candidates:
-                row = rows.get(c.prediction_id)
-                if (
-                    row is not None
-                    and row["family"] == "elo_ordered_draw"
-                    and c.market_key == "double_chance"
-                    and c.p_low is not None
-                ):
-                    low = _complement_low(row, c.selection)
-                    if low is not None and low <= c.p_model:
-                        c = replace(c, p_low=max(c.p_low, low))
-                changed.append(c)
+            changed = option_d(candidates, rows)
             what_if["validated_ge_floor"] += sum(
                 1
                 for c in changed
@@ -720,3 +729,395 @@ def high_hit_diagnosis(
         },
         "per_decision": per_decision,
     }
+
+
+# ---------------------------------------------------------------- TASK 014 §3, §4.1, §5.3
+
+# The safer coupon variants of §3.1 (SOLO from 1.15 with a net profit > 0 after the 0.88
+# coefficient: at 1.15 a win of 10 zł pays 10.12 zł). Measured with and without the
+# predictive validation requirement.
+SAFE_PROFILES = {
+    "solo_70": {
+        "label": "(b) SOLO, ostrożnie ≥ 0,70",
+        "min_total_odds": 1.15,
+        "max_legs": 1,
+        "min_leg_probability": 0.70,
+        "min_coupon_probability": 0.70,
+        "min_net_profit_share": 0.0,
+    },
+    "solo_75": {
+        "label": "(b) SOLO, ostrożnie ≥ 0,75",
+        "min_total_odds": 1.15,
+        "max_legs": 1,
+        "min_leg_probability": 0.75,
+        "min_coupon_probability": 0.75,
+        "min_net_profit_share": 0.0,
+    },
+    "two_60": {
+        "label": "(c) do 2 nóg, ostrożnie kuponu ≥ 0,60",
+        "min_total_odds": 1.15,
+        "max_legs": 2,
+        "min_leg_probability": 0.60,
+        "min_coupon_probability": 0.60,
+        "min_net_profit_share": 0.0,
+    },
+}
+HOURS = (10, 14, 18)
+
+
+def safe_variants(rules) -> dict[str, dict]:
+    """Every variant of §3.1 / §5.3, measured on the SAME decisions. ``kind``: "policy" (all
+    profiles of the policy with a diversity limit; None = the user's setting) or "profile"
+    (one profile alone); ``candidates``: "served" (forecasts of the versions served at the
+    decision), "option_d" (the same with option D, a what-if) or "shadow" (v3 challengers)."""
+    out: dict[str, dict] = {
+        "current": {"label": "(a) obecna polityka", "kind": "policy", "limit": None},
+        "current_limit1": {
+            "label": "(a) obecna polityka, limit 1 (ta sama selekcja w 1 kuponie dnia)",
+            "kind": "policy",
+            "limit": 1,
+        },
+    }
+    for key, profile in SAFE_PROFILES.items():
+        for validated in (True, False):
+            label = profile["label"] + ("" if validated else " — bez wymogu walidacji")
+            out[key if validated else f"{key}_any"] = {
+                "label": label,
+                "kind": "profile",
+                "profile": {**profile, "label": label, "require_predictive_validation": validated},
+            }
+    for name, profile in rules.optional.items():  # the optional profile as configured (p4)
+        out[f"optional:{name}"] = {
+            "label": f"{profile['label']} (profil opcjonalny polityki {rules.version})",
+            "kind": "profile",
+            "profile": profile,
+        }
+    if "high_hit" in rules.profiles:
+        out["high_hit"] = {
+            "label": rules.profiles["high_hit"]["label"],
+            "kind": "profile",
+            "profile": rules.profiles["high_hit"],
+        }
+        out["high_hit_d"] = {
+            "label": f"{rules.profiles['high_hit']['label']} + opcja D (pomiar)",
+            "kind": "profile",
+            "profile": rules.profiles["high_hit"],
+            "candidates": "option_d",
+        }
+    out["solo_75_d"] = {
+        "label": "(b) SOLO, ostrożnie ≥ 0,75 + opcja D (pomiar)",
+        "kind": "profile",
+        "profile": {**SAFE_PROFILES["solo_75"], "require_predictive_validation": True},
+        "candidates": "option_d",
+    }
+    for key, variant in (("high_hit", out.get("high_hit")), ("solo_75", out["solo_75"])):
+        if variant is not None:  # TASK 013 §5.2: the v3 challengers in shadow mode
+            out[f"{key}_shadow"] = {
+                **variant,
+                "label": f"{variant['label']} — challenger v3 w cieniu",
+                "candidates": "shadow",
+            }
+    return out
+
+
+def shadow_versions(store: Store, moment: datetime) -> tuple[set[str], dict] | None:
+    """The newest v3 challengers of every scope registered before ``moment`` (versions and
+    the goals version per scope for ``day_candidates_at``), or None when there are none."""
+    import json
+
+    from sports_edge.models.registry import model_overview
+    from sports_edge.services import ELO_FAMILY, GOALS_FAMILY, MODEL_SCOPES, version_competitions
+
+    found, goals = set(), {}
+    for scope, codes in MODEL_SCOPES.items():
+        for family in (ELO_FAMILY, GOALS_FAMILY):
+            row = next(
+                (
+                    r
+                    for r in model_overview(store)
+                    if r["family"] == family
+                    and r["status"] != "retired"
+                    and r["created_at"] <= iso(moment)
+                    and json.loads(r["validation_json"]).get("protocol") == "v3"
+                    and set(version_competitions(r)) <= set(codes)
+                ),
+                None,
+            )
+            if row is not None:
+                found.add(row["version_id"])
+                if family == GOALS_FAMILY:
+                    goals[scope] = row
+    return (found, goals) if found else None
+
+
+def _settle_proposal(store: Store, proposal, *, stake: Decimal, cost, on_date) -> dict:
+    from sports_edge.paper import resolve
+    from sports_edge.settlement import Outcome, settle
+
+    legs = []
+    for leg in proposal.legs:
+        market = {
+            "market_key": leg.market_key,
+            "period": leg.period,
+            "line": leg.line,
+            "overtime": "false",
+        }
+        result = _result(store, leg.event_id)
+        outcome = resolve(market, leg.selection, result) if result else None
+        legs.append(
+            {
+                "selection_id": leg.selection_id,
+                "event_id": leg.event_id,
+                "start_at": leg.start_at,
+                "p_model": leg.p_model,
+                "p_conservative": leg.p_low,
+                "validated": leg.predictive_status == "validated_predictive",
+                "outcome": outcome.value if outcome else None,
+            }
+        )
+    outcomes = [leg["outcome"] for leg in legs]
+    if any(o is None for o in outcomes) or any(o not in ("win", "loss") for o in outcomes):
+        status, net = None, None  # not settled (or a void / push leg: left out)
+    elif all(o == "win" for o in outcomes):
+        status = "win"
+        net = settle(stake, proposal.total_odds, Outcome.WIN, cost, on_date=on_date).net_profit
+    else:
+        status, net = "loss", -stake
+    return {"legs": legs, "status": status, "net_profit": net}
+
+
+def _wilson(hits: int, n: int) -> list[float] | None:
+    from sports_edge.models.calibration import wilson_interval
+
+    return [round(v, 4) for v in wilson_interval(hits, n)] if n else None
+
+
+def _variant_summary(coupons: list[dict], *, days: list[str], decisions: int) -> dict:
+    """Numbers of one variant from its OFFICIAL coupons — the first coupon of a profile and
+    day (rule "first" of TASK 010); later decisions of the same day are versions."""
+    from sports_edge.performance import judge
+
+    official: dict[tuple, dict] = {}
+    for item in sorted(coupons, key=lambda x: x["decision_at"]):
+        official.setdefault((item["profile"], item["day"]), item)
+    chosen = list(official.values())
+    covered = {day for _profile, day in official}
+    settled = [x for x in chosen if x["status"] in ("win", "loss")]
+    wins = sum(x["status"] == "win" for x in settled)
+    legs: dict[str, dict] = {}
+    for item in chosen:
+        for leg in item["legs"]:
+            legs.setdefault(leg["selection_id"], leg)
+    decided = [leg for leg in legs.values() if leg["outcome"] in ("win", "loss")]
+    leg_wins = sum(leg["outcome"] == "win" for leg in decided)
+
+    def mean(values):
+        values = [float(v) for v in values if v is not None]
+        return round(sum(values) / len(values), 4) if values else None
+
+    expected = judge([x["p_model"] for x in settled], wins) if settled else None
+    return {
+        "decisions": decisions,
+        "decisions_with_coupon": len({x["decision_at"] for x in coupons}),
+        "days": len(days),
+        "days_with_coupon": len(covered),
+        "days_without_coupon": len(days) - len(covered),
+        "coupons": len(chosen),
+        "coupons_per_day": round(len(chosen) / len(days), 3) if days else None,
+        "validated_coupons": sum(x["level"] == "validated_predictive" for x in chosen),
+        "validated_legs": sum(leg["validated"] for leg in legs.values()),
+        "legs": len(legs),
+        "mean_legs": mean(len(x["legs"]) for x in chosen),
+        "mean_p_model": mean(x["p_model"] for x in chosen),
+        "mean_p_conservative": mean(x["p_conservative"] for x in chosen),
+        "mean_odds": mean(x["total_odds"] for x in chosen),
+        "mean_payout": mean(x["payout"] for x in chosen),
+        "mean_net_on_win": mean(x["net_on_win"] for x in chosen),
+        "settled": len(settled),
+        "wins": wins,
+        "hit_rate": round(wins / len(settled), 4) if settled else None,
+        "hit_rate_ci95": _wilson(wins, len(settled)),
+        "expected_hits": round(expected["expected"], 3) if expected else None,
+        "p_le": round(expected["p_le"], 4) if expected else None,
+        "legs_settled": len(decided),
+        "leg_wins": leg_wins,
+        "leg_hit_rate": round(leg_wins / len(decided), 4) if decided else None,
+        "leg_hit_rate_ci95": _wilson(leg_wins, len(decided)),
+        "mean_leg_p_model": mean(leg["p_model"] for leg in decided),
+        "net_profit_settled": str(sum((x["net_profit"] for x in settled), Decimal(0))),
+        "net_profit_per_coupon": (
+            str(
+                (sum((x["net_profit"] for x in settled), Decimal(0)) / len(settled)).quantize(
+                    Decimal("0.01")
+                )
+            )
+            if settled
+            else None
+        ),
+    }
+
+
+def _shared_losses(coupons: list[dict]) -> dict:
+    """Policy variants: on how many days ONE lost selection was in 2+ official coupons."""
+    official: dict[tuple, dict] = {}
+    for item in sorted(coupons, key=lambda x: x["decision_at"]):
+        official.setdefault((item["profile"], item["day"]), item)
+    by_day: dict[str, Counter] = defaultdict(Counter)
+    lost: dict[str, set] = defaultdict(set)
+    for (_profile, day), item in official.items():
+        for leg in item["legs"]:
+            by_day[day][leg["selection_id"]] += 1
+            if leg["outcome"] == "loss":
+                lost[day].add(leg["selection_id"])
+    shared_days = [d for d, picks in by_day.items() if any(n >= 2 for n in picks.values())]
+    loss_days = [d for d in by_day if any(by_day[d][s] >= 2 for s in lost[d])]
+    return {"days_shared_selection": len(shared_days), "days_one_lost_leg_2plus": len(loss_days)}
+
+
+def variant_replay(
+    store: Store,
+    paths,
+    settings,
+    days: list[str],
+    *,
+    hours: tuple[int, ...] = HOURS,
+    until: datetime | None = None,
+    versions_at=None,
+    shadow_at=None,
+    variants: dict[str, dict] | None = None,
+    stake: Decimal = Decimal("10.00"),
+) -> dict:
+    """TASK 014 §3.1 / §4.1 / §5.3: the as-of replay of ``days`` × ``hours`` (Warsaw; none
+    after ``until``) — EVERY variant on the SAME decisions. At every decision only what was
+    known then: the offer and the prices of the documents before it, the forecasts made
+    before it by the versions served then (``versions_at``; default: the served ones);
+    option D transforms those candidates; "shadow" uses the v3 challengers registered before
+    the decision (``shadow_at``; default: ``shadow_versions``), when there are any. The
+    builder runs once per variant; the first coupon of a variant, profile and day is its
+    official coupon (later ones are versions). Settled with the results recorded since.
+    Nothing is saved, no threshold changes; the profit is information only."""
+    from sports_edge import learning
+    from sports_edge.analysis.coupon_builder import build_coupons
+    from sports_edge.bookmakers import load_profiles
+    from sports_edge.models.registry import model_overview
+    from sports_edge.services import day_candidates_at, probability_policy
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    rules = probability_policy(paths)  # the four profiles of the policy (optional ones apart)
+    variants = variants or safe_variants(rules)
+    sts = load_profiles(paths.config)["sts"]
+    served = learning.served_check(store)
+    every = [r["version_id"] for r in model_overview(store)]
+    limit_setting = getattr(settings, "max_profiles_per_selection", None)
+    shadow_at = shadow_at or (lambda moment: shadow_versions(store, moment))
+    decisions: list[str] = []
+    found: dict[str, list[dict]] = {name: [] for name in variants}
+    shadow_decisions = 0
+    for day in days:
+        for hour in hours:
+            moment = datetime.combine(date.fromisoformat(day), time(hour), tzinfo=warsaw)
+            if until is not None and moment > until:
+                continue
+            decisions.append(iso(moment))
+            versions = (
+                versions_at(moment) if versions_at else {v for v in every if served(v, moment)}
+            )
+            candidates, predictions = day_candidates_at(
+                store, paths, settings, day, now=moment, as_of=moment, versions=versions
+            )
+            pools = {"served": candidates}
+            if any(v.get("candidates") == "option_d" for v in variants.values()):
+                rows = {row["id"]: row for row in predictions.values()}
+                pools["option_d"] = option_d(candidates, rows)
+            shadow = (
+                shadow_at(moment)
+                if any(v.get("candidates") == "shadow" for v in variants.values())
+                else None
+            )
+            if shadow is not None:
+                shadow_decisions += 1
+                pools["shadow"] = day_candidates_at(
+                    store,
+                    paths,
+                    settings,
+                    day,
+                    now=moment,
+                    as_of=moment,
+                    versions=shadow[0],
+                    goals=shadow[1],
+                )[0]
+            for name, variant in variants.items():
+                pool = pools.get(variant.get("candidates", "served"))
+                if pool is None:
+                    continue
+                if variant["kind"] == "policy":
+                    policy = rules
+                    limit = variant.get("limit")
+                    limit = limit_setting if limit is None else limit
+                else:
+                    policy = replace(rules, profiles={name: variant["profile"]}, optional={})
+                    limit = 0
+                built = build_coupons(
+                    pool,
+                    policy,
+                    cost=sts.cost,
+                    on_date=moment.date(),
+                    stake=stake,
+                    max_profiles_per_selection=limit,
+                )
+                for profile, proposal in built.proposals.items():
+                    if proposal is None:
+                        continue
+                    settled = _settle_proposal(
+                        store, proposal, stake=stake, cost=sts.cost, on_date=moment.date()
+                    )
+                    found[name].append(
+                        {
+                            "day": day,
+                            "decision_at": iso(moment),
+                            "profile": profile,
+                            "p_model": proposal.p_calibrated,
+                            "p_conservative": proposal.p_conservative,
+                            "total_odds": proposal.total_odds,
+                            "payout": proposal.payout,
+                            "net_on_win": proposal.net_profit,
+                            "level": proposal.level,
+                            **settled,
+                        }
+                    )
+    used_days = sorted({_local_date(x) for x in decisions})
+    table = {}
+    for name, variant in variants.items():
+        coupons = found[name]
+        entry = {
+            "label": variant["label"],
+            "candidates": variant.get("candidates", "served"),
+            **_variant_summary(coupons, days=used_days, decisions=len(decisions)),
+        }
+        if variant["kind"] == "policy":
+            entry["profiles"] = {
+                profile: _variant_summary(
+                    [x for x in coupons if x["profile"] == profile],
+                    days=used_days,
+                    decisions=len(decisions),
+                )
+                for profile in rules.profiles
+            }
+            entry.update(_shared_losses(coupons))
+        if variant.get("candidates") == "shadow" and not shadow_decisions:
+            entry["note"] = "brak challengera v3 w bazie — pomiar w cieniu niemożliwy"
+        table[name] = entry
+    return {
+        "policy_version": rules.version,
+        "hours": list(hours),
+        "days": used_days,
+        "decisions": decisions,
+        "shadow_decisions": shadow_decisions,
+        "variants": table,
+        "note": "pomiar as-of, tylko odczyt: nic nie jest zapisywane, progi profili bez zmian; "
+        "zysk netto po 12% podatku od stawki wyłącznie informacyjnie — bez rekomendacji",
+    }
+
+
+def _local_date(moment: str) -> str:
+    return datetime.fromisoformat(moment).astimezone(ZoneInfo("Europe/Warsaw")).date().isoformat()

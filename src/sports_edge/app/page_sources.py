@@ -62,6 +62,11 @@ def sources_page() -> None:
         "Zbieranie danych i monitoring": _monitoring,
         "Diagnostyka": _diagnostics,
     }
+    # TASK 014 §4.2: a direct link (?widok=Ustawienia) opens the chosen view once
+    wanted = st.query_params.get("widok")
+    if wanted in views:
+        st.session_state["sources_view"] = wanted
+        del st.query_params["widok"]
     view = st.segmented_control("Widok", list(views), default="Źródła danych", key="sources_view")
     views[view or "Źródła danych"]()
 

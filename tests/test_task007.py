@@ -784,7 +784,10 @@ def test_policy_has_the_four_profiles_and_never_lowers_thresholds():
     assert high_hit["prefer_solo"] and high_hit["min_leg_probability"] >= 0.75
     assert profiles["standard"]["min_leg_probability"] >= 0.65
     assert profiles["higher_payout"]["min_leg_probability"] >= 0.55
-    assert RULES_P3.version == "2026-11-02.p3"
+    # TASK 014: p4 only adds the optional PEWNY SOLO profile (enabled = false, not in
+    # ``profiles``); the four profiles and their thresholds above are those of p3
+    assert RULES_P3.version == "2026-11-07.p4"
+    assert list(RULES_P3.optional) == ["safe_solo"]
 
 
 def test_profiles_build_coupons_inside_their_odds_ranges():

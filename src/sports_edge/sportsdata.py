@@ -753,6 +753,22 @@ def elo_parameters(validation: dict) -> tuple[float, list[dict], float]:
     return params["draw_margin_holdout"], source.get("reliability", []), source.get("ece") or 0.0
 
 
+def elo_interval(forecast: dict[str, float], bins, ece: float) -> dict[str, list[float]]:
+    """The interval of every 1X2 side of an Elo forecast: ± max(ECE, 1.96·√(p(1−p)/n)), n =
+    the forecasts of the calibration-window reliability bin of p. ``bins``: {(low, high):
+    bin} or the list of bins. (TASK 014: shared by the prospective forecasts and the
+    lower-bound coverage on history — the same formula.)"""
+    if not isinstance(bins, dict):
+        bins = {(row["low"], row["high"]): row for row in bins}
+    interval = {}
+    for state_key, value in forecast.items():
+        row = next((r for (lo, hi), r in bins.items() if lo <= value < hi), None)
+        n = row["n"] if row and row["n"] else 1
+        half = max(ece, 1.96 * sqrt(value * (1 - value) / n))
+        interval[state_key] = [max(0.0, value - half), min(1.0, value + half)]
+    return interval
+
+
 # ---------------------------------------------------------------- prospective forecasts
 
 
@@ -850,12 +866,7 @@ def predict_offer(
             kept += 1  # same model and the same data: the stored forecast stays valid
             continue
         forecast = model.probabilities(home, away, three_way=True)
-        interval = {}
-        for state_key, value in forecast.items():
-            row = next((r for (lo, hi), r in bins.items() if lo <= value < hi), None)
-            n = row["n"] if row and row["n"] else 1
-            half = max(ece, 1.96 * sqrt(value * (1 - value) / n))
-            interval[state_key] = [max(0.0, value - half), min(1.0, value + half)]
+        interval = elo_interval(forecast, bins, ece)
         save_prediction(
             store,
             model_version_id=version_id,

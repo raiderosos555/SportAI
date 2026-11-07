@@ -31,9 +31,12 @@ from sports_edge.paper import (
 from sports_edge.performance import (
     builder_coupons,
     coupon_performance,
+    expected_vs_actual,
     leg_outcomes,
+    legs_expected_vs_actual,
     selection_outcomes,
     selection_summary,
+    shared_losses,
 )
 from sports_edge.repository import offer_days, offer_table
 from sports_edge.services import normalizer, team_aliases, team_identities
@@ -576,7 +579,100 @@ GROUPS = {
 }
 
 
+def _hits(value) -> str:
+    if value is None:
+        return ins.NO_DATA
+    return ins.num(value, 0 if float(value).is_integer() else 1)
+
+
+def _expected_rows(rows: list[dict], *, legs: bool = False) -> pd.DataFrame:
+    records = []
+    for r in rows:
+        record = {"Grupa" if legs else "Profil": r["label"]}
+        if legs:
+            record.update({"Mecze": r["matches"], "Nogi": r["legs"]})
+        else:
+            record["Rozliczone"] = r["n"]
+        record["Oczekiwane (model)"] = _hits(r["expected"])
+        if not legs:
+            record["Oczekiwane (ostrożnie)"] = _hits(r.get("expected_conservative"))
+        record.update(
+            {
+                "Trafione": _hits(r["hits"]) if r["n"] else ins.NO_DATA,
+                "P(≤ faktyczny)": _pct(r.get("p_le")),
+                "P(≥ faktyczny)": _pct(r.get("p_ge")),
+                "Ocena": r.get("verdict_label") or ins.NO_DATA,
+            }
+        )
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def expected_panel(db) -> None:
+    """TASK 014 §2: expected against actual hits — luck or a model error (read only)."""
+    ui.section(
+        "Oczekiwane kontra faktyczne",
+        "czy przegrane to pech, czy błąd modelu — liczone na szansach modelu",
+    )
+    found = expected_vs_actual(db)
+    if not found["total"]["n"]:
+        ui.empty_state(
+            "Oczekiwane kontra faktyczne: brak danych",
+            "Brak rozliczonych kuponów z szansą modelu (liczą się kupony oficjalne i Twoje).",
+        )
+    else:
+        st.dataframe(
+            _expected_rows([*found["rows"], found["total"]]), hide_index=True, width="stretch"
+        )
+        total = found["total"]
+        st.caption(
+            f"Łącznie: {_hits(total['hits'])} z {total['n']} trafionych, model oczekiwał "
+            f"{ins.num(total['expected'], 1)} — {total['sentence']}. Rozkład "
+            "Poissona-dwumianowy na szansach modelu; poniżej 5% po jednej stronie: „gorzej” "
+            "albo „lepiej niż przewiduje model”. Tylko kupony liczone w statystykach (bez "
+            "duplikatów i wersji)."
+        )
+    for item in found["without_model"]:
+        st.caption(
+            f"Bez szansy modelu: {item['label']} — rozliczone {item['settled']}, trafione "
+            f"{item['wins']} (poza obliczeniami)."
+        )
+    legs = legs_expected_vs_actual(db)
+    if legs["total"]["n"]:
+        st.markdown("**Nogi kuponów według rynku** (na meczach)")
+        st.dataframe(
+            _expected_rows([*legs["rows"], legs["total"]], legs=True),
+            hide_index=True,
+            width="stretch",
+        )
+        total = legs["total"]
+        st.caption(
+            f"Łącznie: {_hits(total['hits'])} z {total['matches']} meczów, model oczekiwał "
+            f"{ins.num(total['expected'], 1)} — {total['sentence']}. "
+            "Każda selekcja raz; nogi jednego meczu w grupie to jedna obserwacja (średnia szansa "
+            "i średni wynik) — jak w ocenie strefy kuponów."
+            + (f" Bez szansy modelu: {legs['without_model']}." if legs["without_model"] else "")
+        )
+    shared = shared_losses(db)
+    if shared["settled_days"]:
+        st.caption(
+            f"Wspólne porażki: w {shared['days_one_leg_2plus']} z {shared['settled_days']} dni "
+            "z rozliczeniami jedna przegrana noga była w 2+ kuponach (przegrało przez nie "
+            f"{shared['coupons_lost_by_shared_leg']} kuponów). Przegrane kupony według liczby "
+            "przegranych nóg: "
+            + (
+                ", ".join(
+                    f"{ins.plural(n, 'noga', 'nogi', 'nóg')}: {k}"
+                    for n, k in shared["lost_coupons_by_lost_legs"].items()
+                )
+                or "—"
+            )
+            + "."
+        )
+
+
 def _builder_performance(db) -> None:
+    expected_panel(db)
     stats = coupon_performance(db)
     if not stats:
         st.info("Brak zapisanych kuponów kreatora — wygeneruj je w zakładce Kupon dnia.")

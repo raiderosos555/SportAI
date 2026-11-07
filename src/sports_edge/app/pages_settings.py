@@ -82,6 +82,20 @@ def _sts() -> None:
         "Standardowy, Wyższa wypłata, Tasiemka); selekcja użyta już w N kuponach nie trafia "
         "do następnych. Progi profili się nie zmieniają. Domyślnie wyłączone.",
     )
+    # TASK 014 §3.2: optional coupon profiles (off by default; built after the four)
+    optional = probability_policy(c.paths()).optional
+    switched = {
+        name: st.toggle(
+            f"Profil {profile['label']} — kupon pojedynczy o wysokiej szansie (opcjonalny)",
+            value=name in settings.enabled_profiles,
+            key=f"profile_on_{name}",
+            help="Domyślnie wyłączony. Po włączeniu kreator buduje go po czterech profilach "
+            "(ich kupony i progi się nie zmieniają): jedna selekcja, ostrożna szansa co "
+            f"najmniej {float(profile['min_leg_probability']):.0%}, kurs od "
+            f"{profile['min_total_odds']}, zysk netto po podatku > 0, walidacja predykcyjna.",
+        )
+        for name, profile in optional.items()
+    }
     st.markdown("**Źródła wyników sportowych** (bezpłatne; płatne nigdy automatycznie)")
     football_data = st.toggle(
         "football-data.org — bieżące wyniki 5 lig (wymaga własnego bezpłatnego klucza)",
@@ -142,6 +156,7 @@ def _sts() -> None:
         settings.max_profiles_per_selection = (
             int(diversity) if int(diversity) != policy_limit else None
         )
+        settings.enabled_profiles = [name for name, on in switched.items() if on]
         save_settings(c.paths(), settings)
         st.success("Zapisano w data/settings.json")
     st.info(

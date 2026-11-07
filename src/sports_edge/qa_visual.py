@@ -251,18 +251,49 @@ def _scenario_day_risk(page, base: str, shot: Path) -> dict:
     found["day_risk_visible"] = page.get_by_text("Ryzyko dnia").count() > 0
     found["official_visible"] = page.get_by_text("Oficjalny kupon dnia").count() > 0
     found["exposure_visible"] = page.get_by_text("ten mecz jest też w").count() > 0
+    # TASK 014 §4.2: the same selection in two coupons — the direct link to the limit
+    found["limit_link_visible"] = page.get_by_text("Ustaw limit").count() > 0
     found["ok"] = (
         found["ok"]
         and found["day_risk_visible"]
         and found["official_visible"]
         and found["exposure_visible"]
+        and found["limit_link_visible"]
     )
     _full_screenshot(page, shot)
     return found
 
 
+def _scenario_expected(page, base: str, shot: Path) -> dict:
+    """TASK 014 §2: Historia — the panel "Oczekiwane kontra faktyczne" (DEMO coupons)."""
+    page.goto(f"{base}/historia?demo=1")
+    _settle(page)
+    found = _assess(page)
+    found["expected_visible"] = page.get_by_text("Oczekiwane kontra faktyczne").count() > 0
+    found["ok"] = found["ok"] and found["expected_visible"]
+    _full_screenshot(page, shot)
+    return found
+
+
+def _scenario_settings(page, base: str, shot: Path) -> dict:
+    """TASK 014 §3.2 / §4.2: the direct link of Ryzyko dnia opens Ustawienia — the limit of
+    one selection in N coupons and the optional profile PEWNY SOLO (off by default)."""
+    page.goto(f"{base}/zrodla?widok=Ustawienia&demo=1")
+    _settle(page)
+    found = _assess(page)
+    found["limit_visible"] = page.get_by_text("Ta sama selekcja najwyżej w N kuponach").count() > 0
+    found["profile_visible"] = page.get_by_text("Profil PEWNY SOLO").count() > 0
+    found["ok"] = found["ok"] and found["limit_visible"] and found["profile_visible"]
+    _full_screenshot(page, shot)
+    return found
+
+
 # TASK 010: checked at every screen size (the other scenarios at 1366 and 390 px only)
-EVERY_VIEW = (("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),)
+EVERY_VIEW = (
+    ("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),
+    ("historia_oczekiwane", "Historia: oczekiwane kontra faktyczne", _scenario_expected),
+    ("ustawienia_profil", "Ustawienia: limit selekcji i profil PEWNY SOLO", _scenario_settings),
+)
 
 SCENARIOS = (
     ("puchary_kategoria", "Analiza meczu: kategoria Europejskie puchary", _scenario_cups),

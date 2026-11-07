@@ -1,6 +1,7 @@
 """Kupon dnia: the coupon builder for today, tomorrow, 3 or 7 days — every day separately."""
 
 import json
+from collections import Counter
 
 import pandas as pd
 import streamlit as st
@@ -12,8 +13,8 @@ from sports_edge.repository import offer_days
 from sports_edge.services import (
     RANGES,
     analysis_days,
+    coupon_rules,
     offer_status,
-    probability_policy,
     proposal_payload,
     refresh_offers,
     run_analysis,
@@ -59,7 +60,7 @@ def coupon_page() -> None:
         )
         return
     settings = c.settings()
-    rules = probability_policy(c.paths())
+    rules = coupon_rules(c.paths(), settings)  # TASK 014: + optional profiles switched on
     choice = (
         st.segmented_control("Zakres analizy", list(RANGES), default="Dziś", key="coupon_range")
         or "Dziś"
@@ -363,6 +364,21 @@ def _day_risk(proposals: dict, exposure: dict, db=None) -> None:
         "selekcja najwyżej w N kuponach”) jest domyślnie wyłączona."
     )
     ui.explanation("Ryzyko dnia", points, tone="warn")
+    if same_leg_shared(exposure):  # TASK 014 §4.2: the default stays; the user decides
+        c.page_link(
+            "zrodla",
+            "Ustaw limit „ta sama selekcja najwyżej w N kuponach dnia” w Ustawieniach",
+            query_params={"widok": "Ustawienia"},
+        )
+
+
+def same_leg_shared(exposure: dict) -> bool:
+    """The SAME selection (not only the same match) is in two or more coupons of the day."""
+    return any(
+        n >= 2
+        for profiles in exposure.values()
+        for n in Counter(pick for _p, _label, pick in profiles).values()
+    )
 
 
 def _no_coupon(explanation: dict | None, day: str, analysed: bool, online: bool) -> None:

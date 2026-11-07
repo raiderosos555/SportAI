@@ -256,6 +256,7 @@ def _coupon() -> None:
             st.error(issue.message, icon=":material/block:")
         else:
             st.warning(issue.message, icon=":material/warning:")
+    _shared_and_weakest(legs, rows, summary)
     with st.container(key="row-mc-actions"):
         buttons = st.columns(2)
     if buttons[0].button(
@@ -314,6 +315,24 @@ def _coupon() -> None:
             st.session_state.pop(key, None)
         st.rerun()
     _saved_note()
+
+
+def _shared_and_weakest(legs: list[dict], rows: list, summary: dict) -> None:
+    """TASK 014 §4.3: a leg that is also in an official coupon of the day, the chance of a
+    long coupon said plainly and the weakest leg (lowest cautious chance)."""
+    db = c.store()
+    official = {day: saved_proposals(db, day) for day in {leg.get("day") for leg in legs} if day}
+    for text in mine.shared_with_official(legs, official):
+        st.warning(text, icon=":material/link:")
+    note = mine.chance_note(summary)
+    if note:
+        st.info(note + ".", icon=":material/casino:")
+    weak = mine.weakest_leg(rows)
+    if weak is not None and len(legs) > 1:
+        st.caption(
+            f"Najsłabsza noga: {legs[weak]['event']} — {legs[weak]['label']} "
+            f"(ostrożnie {ins.pct(rows[weak].p_low)})."
+        )
 
 
 def _leg_card(i: int, leg: dict, row) -> None:

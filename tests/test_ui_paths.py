@@ -40,6 +40,8 @@ def test_main_user_paths_of_the_interface():
         "modele: bramka v3 (stan)",  # TASK 013
         "modele: akceptacja bramki v3 (zapis decyzji)",
         "kupon dnia: najbliżej (WYSOKA TRAFNOŚĆ)",
+        "historia: oczekiwane kontra faktyczne",  # TASK 014
+        "ustawienia: profil PEWNY SOLO (domyślnie wyłączony)",
     ):
         assert expected in names
     assert any(name.startswith("brak danych") for name in names)

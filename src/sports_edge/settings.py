@@ -3,7 +3,7 @@
 import json
 import os
 import tomllib
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 
@@ -72,6 +72,9 @@ class AppSettings:
     stats_requests_per_run: int = 60  # polite cap for match statistics per analysis
     # TASK 010: None = the [builder] value of probability_policy.toml (0 = off)
     max_profiles_per_selection: int | None = None
+    # TASK 014: optional coupon profiles (``enabled = false`` in probability_policy.toml) the
+    # user switched on in Ustawienia — empty by default (e.g. ["safe_solo"] = PEWNY SOLO)
+    enabled_profiles: list[str] = field(default_factory=list)
     # Optional language layer (TASK 007 §7): a free LOCAL model (Ollama), off by default.
     llm_enabled: bool = False
     llm_model: str = "hf.co/speakleash/Bielik-11B-v2.3-Instruct-GGUF:Q4_K_M"

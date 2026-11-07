@@ -27,6 +27,8 @@ PROFILE_TEXT = {
     "higher_payout": "Kurs 2,50–4,00: wyższa wypłata za wyraźnie niższą szansę.",
     "tasiemka": "Kurs 8–12: długi kupon z najmniejszą uzasadnioną liczbą zdarzeń — wysoka "
     "wypłata przy niskiej szansie.",
+    "safe_solo": "Kurs od 1,15: jedna selekcja z ostrożną szansą co najmniej 75% — profil "
+    "opcjonalny, włączony przez Ciebie w Ustawieniach; niska wypłata za wysoką szansę.",
     "safe": "Profil sprzed TASK 007 (Bezpieczny).",
     "balanced": "Profil sprzed TASK 007 (Zrównoważony).",
     "aggressive": "Profil sprzed TASK 007 (Agresywny).",
@@ -58,6 +60,15 @@ def stats(payload: dict) -> str:
             ("Zysk netto", ins.money(payload["net_profit"])),
         ],
         emphasis=(0, 1),
+    )
+
+
+def loss_text(payload: dict) -> str:
+    """TASK 014 §3.3: the chance said plainly — 'Szansa 78% — statystycznie przegrywa 2,2 z
+    10 takich kuponów; wypłata 11,44 zł'."""
+    p = payload.get("probability") or {}
+    return ins.loss_line(
+        p.get("calibrated"), p.get("conservative"), payout=payload.get("payout"), coupons=True
     )
 
 
@@ -371,6 +382,7 @@ def card(
             header_html(name, payload, date_label=c.day_label(day))
             + status_html(status, payload)
             + stats(payload)
+            + f'<p class="se-desc se-num">{ui.esc(loss_text(payload))}</p>'
             + ui.legs_html(_exposed(legs(payload, db), payload, name, exposure)),
             unsafe_allow_html=True,
         )

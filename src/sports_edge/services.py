@@ -1321,7 +1321,7 @@ def run_analysis(
         scopes=by_scope,
     )
 
-    rules = probability_policy(paths)
+    rules = coupon_rules(paths, settings)  # TASK 014: + the optional profiles switched on
     cost = load_profiles(paths.config)["sts"].cost
     runs = {}
     for day in days:
@@ -1816,6 +1816,12 @@ def event_context(
 
 def probability_policy(paths: AppPaths) -> ProbabilityPolicy:
     return load_probability_policy(paths.config / "probability_policy.toml")
+
+
+def coupon_rules(paths: AppPaths, settings: AppSettings) -> ProbabilityPolicy:
+    """TASK 014: the profiles the builder makes coupons for — the profiles of the policy
+    plus the optional ones the user switched on in Ustawienia (built after them)."""
+    return probability_policy(paths).with_profiles(getattr(settings, "enabled_profiles", ()))
 
 
 def elo_walk_forward_forecasts(

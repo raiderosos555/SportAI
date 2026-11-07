@@ -29,9 +29,10 @@ import threading
 import time
 import traceback
 import uuid
+from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -917,7 +918,12 @@ def matchday_plan(store: Store, settings: dict, *, now: datetime) -> list[dict]:
     """Today's planned match-day downloads: ``leads_minutes`` before the first kick-off of
     every hour with a match; two slots closer than 10 minutes become one (the later — it is
     still before the earlier group); at most ``daily_cap`` slots (the leads closest to the
-    kick-off first)."""
+    kick-off first).
+
+    TASK 014 §5.1: the lead of a merged slot is its distance to ITS group (the earlier one).
+    Before, it kept the lead of the later slot (e.g. 120 min for the 45-min download of the
+    earlier group), so the cap ranked it as a far download and cut it: on the Sundays
+    01.11 and 07.11 one group (2 matches) lost its download 45 minutes before the start."""
     cfg = matchday_config(settings)
     leads = sorted({int(x) for x in cfg.get("leads_minutes") or [] if int(x) > 0}, reverse=True)
     slots = sorted(
@@ -931,7 +937,9 @@ def matchday_plan(store: Store, settings: dict, *, now: datetime) -> list[dict]:
     merged: list[dict] = []
     for slot in slots:
         if merged and slot["at"] - merged[-1]["at"] < MIN_FETCH_GAP:
-            merged[-1] = {**slot, "group": min(merged[-1]["group"], slot["group"])}
+            group = min(merged[-1]["group"], slot["group"])
+            lead = int((group - slot["at"]).total_seconds() // 60)
+            merged[-1] = {**slot, "group": group, "lead": lead}
             continue
         merged.append(slot)
     cap = max(0, int(cfg.get("daily_cap") or 0))
@@ -939,6 +947,52 @@ def matchday_plan(store: Store, settings: dict, *, now: datetime) -> list[dict]:
         kept = sorted(merged, key=lambda s: (s["lead"], s["at"]))[:cap]
         merged = sorted(kept, key=lambda s: s["at"])
     return merged
+
+
+def matchday_cap_effect(store: Store, settings: dict, *, day: date) -> dict:
+    """TASK 014 §5.1: what the daily cap does to one day's plan — the groups of matches of
+    the 12 leagues (first kick-off of every hour), the slots with and without the cap, and
+    the groups and matches that LOSE the download closest to the kick-off (a planned slot
+    at most ``min(leads)`` + 10 minutes before the group) because of the cap. Read only."""
+    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+
+    cfg = matchday_config(settings)
+    noon = datetime.combine(day, datetime.min.time(), tzinfo=WARSAW).replace(hour=12)
+    uncapped = {"jobs": {"sts_offer": {"matchday": {**cfg, "daily_cap": 10**6}}}}
+    full = matchday_plan(store, uncapped, now=noon)
+    capped = matchday_plan(store, {"jobs": {"sts_offer": {"matchday": cfg}}}, now=noon)
+    leads = [int(x) for x in cfg.get("leads_minutes") or [] if int(x) > 0]
+    closest = timedelta(minutes=min(leads, default=0)) + MIN_FETCH_GAP
+    groups = matchday_groups(store, now=noon)
+
+    def covered(plan: list[dict], group: datetime) -> bool:
+        return any(group - closest <= s["at"] < group for s in plan)
+
+    hours = {g.astimezone(WARSAW).replace(minute=0, second=0, microsecond=0): g for g in groups}
+    matches: dict[datetime, set] = defaultdict(set)
+    for r in store.rows(
+        "SELECT league, sport, home, away, start_at FROM events WHERE bookmaker_id='sts' "
+        "AND start_at IS NOT NULL AND offer_date IN (?,?,?)",
+        tuple((day + timedelta(days=d)).isoformat() for d in (-1, 0, 1)),
+    ):
+        start = datetime.fromisoformat(r["start_at"])
+        local = start.astimezone(WARSAW)
+        if local.date() != day or league_code(r["league"], r["sport"]) not in RESEARCH_COMPETITIONS:
+            continue
+        group = hours.get(local.replace(minute=0, second=0, microsecond=0))
+        if group is not None:
+            matches[group].add((r["league"], r["home"], r["away"], r["start_at"]))
+    lost = [g for g in groups if covered(full, g) and not covered(capped, g)]
+    return {
+        "day": day.isoformat(),
+        "groups": len(groups),
+        "matches": sum(len(v) for v in matches.values()),
+        "slots_uncapped": len(full),
+        "slots_capped": len(capped),
+        "cap": int(cfg.get("daily_cap") or 0),
+        "groups_losing_closest": len(lost),
+        "matches_losing_closest": sum(len(matches[g]) for g in lost),
+    }
 
 
 def matchday_runs_today(store: Store, *, now: datetime) -> list[datetime]:

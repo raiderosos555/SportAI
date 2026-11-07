@@ -146,9 +146,12 @@ def research(
             rules=tuple(r.strip() for r in rules.split(",")) if rules else None,
         )
         rows = found.pop("rows")
+        bounds = found.pop("bound_rows", [])  # TASK 014 §5.2: one row per selection
         if out is not None:
             out.write_text(
-                json.dumps({**found, "rows": rows}, ensure_ascii=False, default=str),
+                json.dumps(
+                    {**found, "rows": rows, "bound_rows": bounds}, ensure_ascii=False, default=str
+                ),
                 encoding="utf-8",
             )
         _print(found)
@@ -249,6 +252,50 @@ def diversity(days: str | None, at: str) -> None:
     hour, minute = (int(x) for x in at.split(":"))
     found = diversity_replay(store, paths, settings, chosen, decision_time=dtime(hour, minute))
     print(json.dumps(found, ensure_ascii=False, indent=1, default=str))
+
+
+def hit_rate(days: str | None, hours: str, out: Path | None = None) -> None:
+    """TASK 014 (read only): expected against actual hits, the safer coupon variants on the
+    same as-of decisions, shared losses, the age of STS prices, the daily cap of the
+    match-day downloads and — on days with match-day downloads — the WYSOKA TRAFNOŚĆ
+    diagnosis repeated. Nothing is saved."""
+    from datetime import date
+
+    from sports_edge import automation, performance, simulation
+    from sports_edge import prospective_eval as pe
+    from sports_edge.repository import offer_days
+
+    paths, settings, store = _context()
+    now = datetime.now(UTC)
+    today = now.date().isoformat()
+    chosen = days.split(",") if days else [d for d in offer_days(store) if d <= today]
+    hours_t = tuple(int(h) for h in hours.split(","))
+    auto = automation.load_settings(store)
+    age = pe.odds_age_report(store, now=now, since=chosen[0], settings=auto)
+    fresh = [d["day"] for d in age["per_day"] if d["matchday_downloads"]]
+    report = {
+        "expected": performance.expected_vs_actual(store),
+        "legs": performance.legs_expected_vs_actual(store),
+        "shared_losses": performance.shared_losses(store),
+        "variants": simulation.variant_replay(
+            store, paths, settings, chosen, hours=hours_t, until=now
+        ),
+        "odds_age": age,
+        "cap": [
+            automation.matchday_cap_effect(store, auto, day=date.fromisoformat(d)) for d in chosen
+        ],
+        "high_hit_fresh": (
+            simulation.high_hit_diagnosis(store, paths, settings, fresh, hours=hours_t, until=now)
+            if fresh
+            else f"za mało danych (dni z pobraniami w dniu meczu: {len(fresh)})"
+        ),
+    }
+    text = json.dumps(report, ensure_ascii=False, indent=1, default=str)
+    if out is not None:
+        out.write_text(text, encoding="utf-8")
+        print(f"Zapisano raport: {out}")
+    else:
+        print(text)
 
 
 def calibration(scope: str | None, min_prob: float, *, market: bool = False) -> None:
@@ -419,6 +466,14 @@ def main() -> None:
     )
     div.add_argument("--days", help="YYYY-MM-DD,YYYY-MM-DD (default: every past offer day)")
     div.add_argument("--time", default="10:00", help="decision time, Warsaw (default 10:00)")
+    hit = commands.add_parser(
+        "hit-rate",
+        help="TASK 014: expected vs actual hits, safer coupon variants as-of, shared losses, "
+        "odds age (read only, JSON)",
+    )
+    hit.add_argument("--days", help="YYYY-MM-DD,YYYY-MM-DD (default: every offer day until today)")
+    hit.add_argument("--hours", default="10,14,18", help="decision hours, Warsaw (10,14,18)")
+    hit.add_argument("--out", type=Path, help="write the JSON report to this file")
     cal = commands.add_parser(
         "calibration", help="TASK 011: coupon-zone reliability counted on matches (JSON)"
     )
@@ -464,6 +519,8 @@ def main() -> None:
         lineage()
     elif args.command == "diversity":
         diversity(args.days, args.time)
+    elif args.command == "hit-rate":
+        hit_rate(args.days, args.hours, args.out)
     elif args.command == "calibration":
         calibration(args.scope, args.min_prob, market=args.market)
     elif args.command == "market-benchmark":

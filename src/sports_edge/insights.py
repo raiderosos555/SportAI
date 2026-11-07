@@ -68,6 +68,39 @@ def sentence(text: str) -> str:
     return text[:1].upper() + text[1:]
 
 
+def losses_of_ten(p: float) -> str:
+    """How many of 10 such coupons lose on average: '2' or '2,2'."""
+    value = 10 * (1 - float(p))
+    return num(value, 0 if abs(value - round(value)) < 0.05 else 1)
+
+
+def loss_line(
+    p_model: float | None,
+    p_low: float | None = None,
+    *,
+    payout=None,
+    coupons: bool = False,
+    verb: str = "statystycznie przegrywa",
+) -> str:
+    """TASK 014 §3.3 / §4.3: the chance said plainly — 'Szansa 78% (ostrożnie 72%) —
+    statystycznie przegrywa 2,2 z 10 takich kuponów (ostrożnie 2,8); wypłata 11,44 zł'."""
+    if p_model is None:
+        return (
+            "Szansa nieznana (brak modelu dla części typów) — nie da się powiedzieć, ile "
+            "takich kuponów przegrywa"
+        )
+    text = f"Szansa {pct(p_model, 0)}"
+    if p_low is not None:
+        text += f" (ostrożnie {pct(p_low, 0)})"
+    text += f" — {verb} {losses_of_ten(p_model)} z 10"
+    text += " takich kuponów" if coupons else ""
+    if p_low is not None:
+        text += f" (ostrożnie {losses_of_ten(p_low)})"
+    if payout not in (None, "None"):
+        text += f"; wypłata {money(payout)}"
+    return text
+
+
 def selection_label(selection: str) -> str:
     return SELECTIONS.get(selection, selection)
 

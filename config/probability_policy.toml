@@ -3,7 +3,10 @@
 # Thresholds below are STARTING values: they are reviewed on validation data only — never
 # tuned on the final holdout — and the builder never lowers them to produce a coupon.
 [policy]
-version = "2026-11-02.p3"
+version = "2026-11-07.p4"
+# p4 (TASK 014): an OPTIONAL fifth profile (PEWNY SOLO, below) with ``enabled = false`` — it is
+# built only when the user switches it on in Ustawienia, always after the four profiles of p3,
+# whose thresholds, order and coupons are unchanged.
 # p3 (TASK 007): four profiles defined by the range of total odds; a minimum conservative
 # probability of the whole coupon ("don't build a coupon the data cannot justify").
 # p2: up to `per_event` selections of one match enter the search pool (p1: only the best one,
@@ -67,6 +70,20 @@ max_legs = 8                   # the fewest legs win ties; no coupon when the da
 min_leg_probability = 0.60
 min_coupon_probability = 0.07
 min_net_profit_share = 5.00
+require_predictive_validation = true
+
+# TASK 014 §3: the safer coupon chosen on the as-of replay of the archive (docs/task_014_report.md
+# §3): one selection, cautious chance >= 0.75, price from 1.15 (net profit after the 0.88 stake
+# coefficient > 0). OFF by default: the user switches it on in Ustawienia; it never changes
+# the other profiles (built last). Predictive validation as in WYSOKA TRAFNOŚĆ.
+[profiles.safe_solo]
+label = "PEWNY SOLO"
+enabled = false
+min_total_odds = 1.15
+max_legs = 1
+min_leg_probability = 0.75
+min_coupon_probability = 0.75
+min_net_profit_share = 0.0     # with odds >= 1.15 the net profit on a win is > 0 (0.12 zł per 10 zł)
 require_predictive_validation = true
 
 [builder]

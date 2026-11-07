@@ -58,6 +58,7 @@ from sports_edge.probability_lab import (
     INTERVAL_METHOD,
     LINES,
     REFIT_DAYS,
+    TEAM_TOTAL_LINES,
     WINDOW_DAYS,
     ProbabilityPolicy,
     _binary_metrics,
@@ -70,8 +71,11 @@ from sports_edge.probability_lab import (
     _outcome,
     _summary,
     _truth,
+    calibrated_market,
+    derived_double_chance,
     predictive_status,
     served_view,
+    team_total_family,
 )
 from sports_edge.provenance import code_state, data_snapshot
 from sports_edge.results_engine import effective_results, priority
@@ -591,6 +595,29 @@ def _fit_calibrators(rows_by_id: dict, part: dict) -> dict:
     return out
 
 
+def fit_team_total_calibrators(rows_by_id: dict, part: dict) -> dict:
+    """TASK 014 §5.4: isotonic maps of the team totals (lines 0.5, 1.5, 2.5 of each team) on
+    the SAME calibration window as the other markets, both sides of every forecast — the
+    method of ``_fit_calibrators``. Kept apart (``team_total_calibrators``), so the maps of
+    every other market are exactly those of TASK 013."""
+    out = {}
+    for market_key in ("team_total_home", "team_total_away"):
+        for line in TEAM_TOTAL_LINES:
+            pairs = []
+            for result_id, prediction in part.items():
+                probs = prediction.get((market_key, line))
+                if not probs:
+                    continue
+                row = rows_by_id[result_id]
+                h, a = row["home_score"], row["away_score"]
+                pairs += [(probs[s], _team_truth(market_key, line, s, h, a)) for s in probs]
+            if pairs:
+                out[team_total_family(market_key, line)] = calibration.isotonic_fit(
+                    *zip(*pairs, strict=True)
+                )
+    return out
+
+
 def _selection_score(rows_by_id: dict, view: dict) -> float:
     return (
         _multiclass(view, rows_by_id)["log_loss"]
@@ -849,6 +876,10 @@ def dc_report(
         "elo_families_holdout": {},
         "elo_version_id": elo_version_id,
         "calibrators": calibrators,
+        # TASK 014 §5.4: the team totals calibrated like the other markets (new versions)
+        "team_total_calibrators": fit_team_total_calibrators(
+            rows_by_id, trained["calibration_raw"]
+        ),
         "markets_served": served,
         "decision": families["1x2"]["multiclass_calibrated"],
         "holdout": {},
@@ -1062,8 +1093,11 @@ def train_at(
     return {
         "windows": windows,
         "elo": elo["best"],
+        # TASK 014 §5.2: the calibration-window bins and ECE behind the Elo intervals
+        "elo_calibration": _metrics(elo["calibration"]),
         "half_life": first["half_life"],
         "calibrators": first["calibrators"],
+        "team_total_calibrators": fit_team_total_calibrators(rows_by_id, first["calibration_raw"]),
         "goals": {
             rule: {
                 "half_life": found["half_life"],
@@ -1119,12 +1153,15 @@ def _team_truth(market_key: str, line: float, selection: str, h: int, a: int) ->
     return int((goals > line) == (selection == "over"))
 
 
-def _dc_markets(view: dict, row: dict, raw: dict | None = None) -> list[tuple]:
+def _dc_markets(
+    view: dict, row: dict, raw: dict | None = None, team_maps: dict | None = None
+) -> list[tuple]:
     """Markets of one served forecast with their outcomes; with ``raw`` (the uncalibrated
-    markets of the same forecast) also the team totals, which are served raw."""
+    markets of the same forecast) also the team totals — raw (older versions), or calibrated
+    with ``team_maps`` (TASK 014: new versions); ``view`` None: the team totals only."""
     h, a = row["home_score"], row["away_score"]
     out = []
-    for market_key, line in DC_MARKETS:
+    for market_key, line in DC_MARKETS if view is not None else ():
         probs = view.get((market_key, line))
         if not probs:
             continue
@@ -1132,6 +1169,9 @@ def _dc_markets(view: dict, row: dict, raw: dict | None = None) -> list[tuple]:
         out.append((market_key, text, probs, {s: _truth(market_key, line, s, h, a) for s in probs}))
     for market_key, line in TEAM_TOTALS if raw else ():
         probs = raw.get((market_key, line))
+        blocks = (team_maps or {}).get(team_total_family(market_key, line))
+        if probs and blocks:
+            probs = calibrated_market(probs, blocks)[0]
         if probs:
             out.append(
                 (
@@ -1276,6 +1316,206 @@ def range_reliability(
     ]
 
 
+# ---------------------------------------------------------------- TASK 014 §5.2 / §5.4
+
+RAW_TEAM_TOTALS = "v3:surowe"  # the v3 team totals without the new maps ("przed")
+BOUND_BINS = (0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0)
+BOUND_DEFINITIONS = {
+    "elo_dc_sum": "Elo, podwójna szansa: suma dolnych granic dwóch wyników 1X2 (dziś)",
+    "elo_dc_one": "Elo, podwójna szansa: 1 − górna granica wykluczonego wyniku (opcja D)",
+    "dc_double_chance": "Dixon–Coles, podwójna szansa: 1 − górna granica wykluczonego wyniku",
+    "dc_markets": "Dixon–Coles, rynki kuponowe (1X2, podwójna szansa, gole 1,5/2,5/3,5, BTTS)",
+}
+BOUND_NOMINAL = {
+    "elo_dc_sum": "suma dwóch granic, każda: wynik − max(ECE, 1,96·√(p(1−p)/n)) — jednostronnie "
+    "co najmniej 97,5% na wynik, razem ostrożniej niż nominalnie",
+    "elo_dc_one": "jedna granica: 1 − (p + max(ECE, 1,96·√(p(1−p)/n))) — jednostronnie 97,5%",
+    "dc_double_chance": "dolny koniec 90% przedziału Wilsona bloku kalibracji — jednostronnie 95%",
+    "dc_markets": "dolny koniec 90% przedziału Wilsona bloku kalibracji — jednostronnie 95%",
+}
+DC_PARTS = {
+    "home_draw": ("home", "draw"),
+    "draw_away": ("draw", "away"),
+    "home_away": ("home", "away"),
+}
+OPPOSITE = {"home_draw": "away", "draw_away": "home", "home_away": "draw"}
+
+
+def _bound(role, scope, row, definition, market, selection, q, p, y) -> dict:
+    return {
+        "role": role,
+        "scope": scope,
+        "match": row["id"],
+        "definition": definition,
+        "market": market,
+        "selection": selection,
+        "q": q,
+        "p": p,
+        "y": int(y),
+    }
+
+
+def _elo_bounds(role, scope, row, forecast, bins, ece) -> list[dict]:
+    """Elo double chance of one match with both definitions of the cautious chance — the
+    served one (the sum of the lower bounds of two 1X2 outcomes, ``derive_from_1x2``) and
+    option D (1 − the upper bound of the excluded outcome, ``simulation.option_d``)."""
+    from sports_edge.sportsdata import elo_interval
+
+    interval = elo_interval(forecast, bins, ece)
+    h, a = row["home_score"], row["away_score"]
+    out = []
+    for selection, parts in DC_PARTS.items():
+        p = sum(forecast[k] for k in parts)
+        y = _truth("double_chance", None, selection, h, a)
+        total = max(0.0, sum(interval[k][0] for k in parts))
+        # exactly the what-if of ``simulation.option_d``: the larger of the two bounds,
+        # never above the model chance
+        one = max(0.0, 1.0 - interval[OPPOSITE[selection]][1])
+        option_d = max(total, one) if one <= p else total
+        out.append(_bound(role, scope, row, "elo_dc_sum", "double_chance", selection, total, p, y))
+        out.append(
+            _bound(role, scope, row, "elo_dc_one", "double_chance", selection, option_d, p, y)
+        )
+    return out
+
+
+def _dc_bounds(role, scope, row, raw: dict, calibrators: dict) -> list[dict]:
+    """Dixon–Coles cautious chances of one match exactly as served (``calibrated_market``,
+    double chance from the final 1X2): every coupon market."""
+    h, a = row["home_score"], row["away_score"]
+    one, interval = calibrated_market(raw[("1x2", None)], calibrators.get("1x2"))
+    out = []
+    for selection, p in one.items():
+        if selection in interval:
+            y = _truth("1x2", None, selection, h, a)
+            out.append(
+                _bound(
+                    role, scope, row, "dc_markets", "1x2", selection, interval[selection][0], p, y
+                )
+            )
+    double = derived_double_chance(one, interval, "")
+    for selection, p in double["calibrated"].items():
+        bounds = double["interval"].get(selection)
+        if bounds:
+            y = _truth("double_chance", None, selection, h, a)
+            for definition in ("dc_double_chance", "dc_markets"):
+                out.append(
+                    _bound(
+                        role, scope, row, definition, "double_chance", selection, bounds[0], p, y
+                    )
+                )
+    for family, (market_key, line, _sides) in BINARY_FAMILIES.items():
+        if family == "double_chance":
+            continue
+        probs, bounds = calibrated_market(raw[(market_key, line)], calibrators.get(family))
+        for selection, p in probs.items():
+            if selection in bounds:
+                y = _truth(market_key, line, selection, h, a)
+                out.append(
+                    _bound(
+                        role,
+                        scope,
+                        row,
+                        "dc_markets",
+                        family,
+                        selection,
+                        bounds[selection][0],
+                        p,
+                        y,
+                    )
+                )
+    return out
+
+
+def bound_coverage(rows: list[dict], *, bins: tuple[float, ...] = BOUND_BINS) -> list[dict]:
+    """How often the result falls below the cautious bound, per (version, definition, range
+    of the cautious chance), COUNTED ON MATCHES (TASK 011: the selections of one match in a
+    group are one observation with their mean bound, mean chance and mean outcome). The
+    bound holds when the observed frequency is at least the mean bound; the 95% Wilson
+    interval (on matches) says whether a shortfall is beyond chance. Plus the whole zone of
+    a bound >= 0.75 (the leg threshold of WYSOKA TRAFNOŚĆ)."""
+    from sports_edge import prospective_eval as pe
+
+    groups: dict[tuple, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    for item in rows:
+        found = pe._bin(item["q"], bins)
+        if found is None:
+            continue
+        for cell in (found, (0.75, 1.0) if item["q"] >= 0.75 else None):
+            if cell is not None:
+                groups[(item["role"], item["definition"], cell)][item["match"]].append(item)
+    out = []
+    for (role, definition, (lo, hi)), by_match in sorted(groups.items()):
+        means = [
+            (
+                sum(i["q"] for i in part) / len(part),
+                sum(i["p"] for i in part) / len(part),
+                sum(i["y"] for i in part) / len(part),
+            )
+            for part in by_match.values()
+        ]
+        n = len(means)
+        mean_q = sum(m[0] for m in means) / n
+        mean_p = sum(m[1] for m in means) / n
+        freq = sum(m[2] for m in means) / n
+        low, high = calibration.wilson_interval(sum(m[2] for m in means), n)
+        verdict = (
+            "granica dotrzymana z zapasem (cały przedział 95% powyżej granicy)"
+            if low >= mean_q
+            else "granica przekroczona (cały przedział 95% poniżej granicy)"
+            if high < mean_q
+            else "granica dotrzymana"
+            if freq >= mean_q
+            else "poniżej granicy, w granicach losowości"
+        )
+        out.append(
+            {
+                "role": role,
+                "definition": definition,
+                "label": BOUND_DEFINITIONS[definition],
+                "nominal": BOUND_NOMINAL[definition],
+                "range": f"{lo * 100:.0f}–{hi * 100:.0f}%",
+                "zone_75": (lo, hi) == (0.75, 1.0),
+                "matches": n,
+                "selections": sum(len(p) for p in by_match.values()),
+                "mean_bound": round(mean_q, 4),
+                "mean_p": round(mean_p, 4),
+                "freq": round(freq, 4),
+                "ci95": [round(low, 4), round(high, 4)],
+                "margin": round(freq - mean_q, 4),
+                "below_bound": freq < mean_q,
+                "verdict": verdict,
+            }
+        )
+    return out
+
+
+def team_totals_zone(rows: list[dict]) -> list[dict]:
+    """TASK 014 §5.4: match-level reliability of the coupon zone (>= 60%) of the team totals
+    before (``RAW_TEAM_TOTALS``: the v3 forecasts raw) and after (``v3``: with the new maps),
+    next to the champion (``v2``, raw), on the matches all three forecast."""
+    from sports_edge import prospective_eval as pe
+
+    roles = {"v2", "v3", RAW_TEAM_TOTALS}
+    mine = [
+        r
+        for r in rows
+        if r["market_key"] in ("team_total_home", "team_total_away") and r["role"] in roles
+    ]
+    both: dict[tuple, set] = defaultdict(set)
+    for row in mine:
+        both[(row["market"], row["match"])].add(row["role"])
+    common = [r for r in mine if both[(r["market"], r["match"])] >= roles]
+    policy = pe.EvalPolicy()
+    table = pe.reliability(pe.selections(common, policy), policy)
+    keys = ("role", "market", "range", "matches", "mean_p", "freq", "ci95", "gap", "flag_label")
+    return [
+        {k: r[k] for k in keys}
+        for r in table
+        if r["scope"] == "all" and (r["zone_total"] or r["in_zone"])
+    ]
+
+
 def variant_rows(rows: list[dict], rule_role: str) -> list[dict]:
     """The Dixon–Coles rows of one half-life rule (role ``rule_role``) as "v3" next to v2."""
     return [
@@ -1333,6 +1573,8 @@ def walk_forward(
     }
     starts = months or month_starts(rolling.first_month, now)
     forecast_rows: list[dict] = []
+    bound_rows: list[dict] = []  # TASK 014 §5.2: cautious bounds of every match, as-of
+    _margin, v2_bins, v2_ece = elo_parameters(elo_v2)
     trained_months = []
     previous = {rule: float(v2_half_life) for rule in rules}  # sticky: the v2 choice first
     for index, start in enumerate(starts):
@@ -1390,6 +1632,18 @@ def walk_forward(
                     row,
                     _elo_markets(three_way(d2[result_id], v2_margin), row),
                 )
+            if result_id in d3 and result_id in d2:
+                bound_rows += _elo_bounds(
+                    "v2", scope, row, three_way(d2[result_id], v2_margin), v2_bins, v2_ece
+                )
+                bound_rows += _elo_bounds(
+                    "v3",
+                    scope,
+                    row,
+                    three_way(d3[result_id], best["draw_margin"]),
+                    model["elo_calibration"].get("reliability", []),
+                    model["elo_calibration"].get("ece") or 0.0,
+                )
             if result_id in dc3 and result_id in dc2:
                 forecast_rows += _forecast_rows(
                     "v3",
@@ -1397,8 +1651,15 @@ def walk_forward(
                     scope,
                     row,
                     _dc_markets(
-                        served_view(dc3[result_id], model["calibrators"]), row, dc3[result_id]
+                        served_view(dc3[result_id], model["calibrators"]),
+                        row,
+                        dc3[result_id],
+                        model["team_total_calibrators"],  # TASK 014 §5.4: calibrated
                     ),
+                )
+                # TASK 014 §5.4: the same v3 team totals raw ("przed"), apart from "v3"
+                forecast_rows += _forecast_rows(
+                    RAW_TEAM_TOTALS, FAMILY, scope, row, _dc_markets(None, row, dc3[result_id])
                 )
                 forecast_rows += _forecast_rows(
                     "v2",
@@ -1407,6 +1668,8 @@ def walk_forward(
                     row,
                     _dc_markets(served_view(dc2[result_id], v2_calibrators), row, dc2[result_id]),
                 )
+                bound_rows += _dc_bounds("v2", scope, row, dc2[result_id], v2_calibrators)
+                bound_rows += _dc_bounds("v3", scope, row, dc3[result_id], model["calibrators"])
                 for rule, (found, dcx) in extra.items():
                     if result_id in dcx:
                         forecast_rows += _forecast_rows(
@@ -1476,6 +1739,12 @@ def walk_forward(
         "matches": len({r["match"] for r in primary}),
         "comparison": compare(primary, resamples=rolling.resamples, seed=rolling.seed),
         "zone": zone_reliability(primary),
+        # TASK 014 §5.4: team totals before (raw) and after the new maps, on matches
+        "team_totals": team_totals_zone(forecast_rows),
+        # TASK 014 §5.2: how often the result falls below the cautious bound (on matches)
+        "bounds": bound_coverage(bound_rows),
+        "bound_matches": len({r["match"] for r in bound_rows}),
+        "bound_rows": bound_rows,
         "leakage": "parametry miesiąca M (hiperparametry, margines remisu, kalibratory) wyłącznie "
         "z wyników dostępnych przed M; siły drużyn as-of (dni < D) — te same dla v3 i v2",
         "rows": forecast_rows,

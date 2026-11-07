@@ -255,6 +255,51 @@ def summary(
     return out
 
 
+# ---------------------------------------------------------------- TASK 014 §4.3: warnings
+
+
+def _holds(payload: dict, leg: dict) -> bool:
+    return any(
+        (other.get("selection_id") and other.get("selection_id") == leg.get("selection_id"))
+        or other.get("odds_id") == leg.get("odds_id")
+        for other in payload.get("legs", [])
+    )
+
+
+def shared_with_official(cart: list[dict], official: dict[str, dict]) -> list[str]:
+    """A leg already in an official coupon of its day (``official``: {day: {profile:
+    payload}}): one lost leg then loses both coupons — said for every such leg."""
+    out = []
+    for leg in cart:
+        labels = [
+            payload.get("label") or name
+            for name, payload in (official.get(leg.get("day")) or {}).items()
+            if payload and _holds(payload, leg)
+        ]
+        if labels:
+            what = "oba" if len(labels) == 1 else f"wszystkie ({len(labels) + 1})"
+            out.append(
+                f"{leg['event']} — {leg['label']}: ta noga jest też w {', '.join(labels)} — "
+                f"jej porażka przegra {what}"
+            )
+    return out
+
+
+def weakest_leg(rows: list[Candidate | None]) -> int | None:
+    """Index of the leg with the lowest cautious chance (legs without one are not ranked)."""
+    known = [(r.p_low, i) for i, r in enumerate(rows) if r is not None and modelled(r)]
+    return min(known)[1] if known else None
+
+
+def chance_note(summary: dict) -> str | None:
+    """From 4 legs on: 'Szansa X% — przegrywa średnio Y z 10'."""
+    if summary["legs"] < 4:
+        return None
+    return ins.loss_line(
+        summary["probability"], summary["probability_low"], verb="przegrywa średnio"
+    )
+
+
 # ---------------------------------------------------------------- local draft (one file)
 
 

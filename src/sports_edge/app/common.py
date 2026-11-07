@@ -350,8 +350,9 @@ def offers_frame(
     return pd.DataFrame.from_records(records)
 
 
-def page_link(key: str, label: str) -> None:
-    """Link to another page of the navigation (registered by main.py)."""
+def page_link(key: str, label: str, query_params: dict | None = None) -> None:
+    """Link to another page of the navigation (registered by main.py); ``query_params``
+    (TASK 014) opens a chosen view of that page."""
     page = st.session_state.get("pages", {}).get(key)
     if page is not None:
-        st.page_link(page, label=label, icon=":material/arrow_forward:")
+        st.page_link(page, label=label, icon=":material/arrow_forward:", query_params=query_params)

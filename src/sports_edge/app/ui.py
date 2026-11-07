@@ -106,6 +106,7 @@ CSS = Template(
 .se-profile.violet { color: #C4B5FD; border-color: rgba(167,139,250,.65);
   background: rgba(167,139,250,.10); }
 .se-profile.slate { color: #CBD5E1; border-color: #475569; }
+.se-profile.teal { color: #5EEAD4; border-color: rgba(20,184,166,.6); }
 /* ---------------------------------------------------------------- stat strip */
 .se-stats { display: grid; gap: .5rem; margin: .65rem 0;
   grid-template-columns: repeat(auto-fit, minmax(min(128px, 100%), 1fr)); }
@@ -289,6 +290,7 @@ PROFILE_STYLE = {
     "standard": ("Standardowy", "blue"),
     "higher_payout": ("Wyższa wypłata", "amber"),
     "tasiemka": ("Tasiemka", "violet"),
+    "safe_solo": ("Pewny solo", "teal"),  # TASK 014: optional, off by default
     "my_coupon": ("Mój kupon", "slate"),
     "my_coupon_after": ("Mój kupon (po fakcie)", "slate"),
 }

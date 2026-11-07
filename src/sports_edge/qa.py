@@ -189,6 +189,20 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         tomorrow.session_state["coupon_range"] = "Jutro"
         tomorrow.run()
         check("kupon dnia: metoda Ryzyka dnia", tomorrow, ["Założenie: różne mecze są niezależne"])
+        # TASK 014: expected against actual hits and the optional profile (off by default) in
+        # Ustawienia (the link of Ryzyko dnia needs the navigation: checked by qa_visual)
+        history = _app(_page("historia"))
+        history.run()
+        check("historia: oczekiwane kontra faktyczne", history, ["Oczekiwane kontra faktyczne"])
+        view = _app(_page("zrodla"))
+        view.query_params["widok"] = "Ustawienia"
+        view.run()
+        solo = [t for t in view.toggle if t.label.startswith("Profil PEWNY SOLO")]
+        record(
+            "ustawienia: profil PEWNY SOLO (domyślnie wyłączony)",
+            bool(solo) and solo[0].value is False and not _errors(view),
+            "" if solo else "brak przełącznika profilu",
+        )
         # ------------------------------------------------ stale odds: offer received 6 h ago
         os.environ["SPORTS_EDGE_HOME"] = str(_home(config))
         stale = _app(

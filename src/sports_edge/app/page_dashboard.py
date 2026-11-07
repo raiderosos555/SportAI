@@ -20,7 +20,7 @@ from sports_edge import alerts, automation
 from sports_edge import insights as ins
 from sports_edge.app import cart, prematch_ui, ui
 from sports_edge.app import common as c
-from sports_edge.performance import builder_coupons
+from sports_edge.performance import builder_coupons, recent_line
 from sports_edge.repository import imports, offer_days
 from sports_edge.services import (
     MODEL_SCOPES,
@@ -72,6 +72,7 @@ def dashboard_page() -> None:
     _picks(picks, now)
     # 4 and 5 ---------------------------------------------------------------------------
     ui.section("Kupony oczekujące na rozliczenie")
+    st.caption(recent_line(db, now=now))  # TASK 014 §2.3: expected against actual hits
     _pending(db)
     ui.section("Alerty wymagające uwagi", "składy i kupony przed meczem")
     prematch_ui.attention_block(db, now)
@@ -150,7 +151,8 @@ def _proposals(db, day: str, offer: dict) -> None:
         c.page_link("kupon", "Przejdź do Kuponu dnia")
         return
     groups: dict[tuple, list[str]] = defaultdict(list)
-    for name in PROFILE_ORDER:
+    # TASK 014: an optional profile switched on by the user comes after the four
+    for name in [*PROFILE_ORDER, *(n for n in proposals if n not in PROFILE_ORDER)]:
         payload = proposals.get(name)
         if payload:
             # TASK 010: identity = the selections (stable between STS documents), not odds

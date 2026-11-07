@@ -16,7 +16,7 @@ import math
 import random
 import tomllib
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from itertools import combinations
 from pathlib import Path
@@ -57,16 +57,29 @@ class ProbabilityPolicy:
     profiles: dict
     builder: dict
     official_rule: str = "first"  # TASK 010: which saved coupon is the official one of a day
+    # TASK 014: profiles with ``enabled = false`` in the file — never built unless the user
+    # switches them on (``with_profiles``); ``profiles`` holds the profiles that are on.
+    optional: dict = field(default_factory=dict)
+
+    def with_profiles(self, enabled) -> "ProbabilityPolicy":
+        """The policy with the optional profiles the user switched on, AFTER the default
+        ones (profiles are built in order, so the diversity limit of the default profiles
+        and their coupons never change)."""
+        chosen = set(enabled or ())
+        extra = {name: p for name, p in self.optional.items() if name in chosen}
+        return replace(self, profiles={**self.profiles, **extra}) if extra else self
 
 
 def load_probability_policy(path: Path) -> ProbabilityPolicy:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
+    profiles = data["profiles"]
     return ProbabilityPolicy(
         version=data["policy"]["version"],
         validation=data["validation"],
-        profiles=data["profiles"],
+        profiles={k: v for k, v in profiles.items() if v.get("enabled", True)},
         builder=data["builder"],
         official_rule=data["policy"].get("official_rule", "first"),
+        optional={k: v for k, v in profiles.items() if not v.get("enabled", True)},
     )
 
 
@@ -80,6 +93,29 @@ def family_of(market_key: str, line: float | None) -> str | None:
     if market_key == "total" and line in (1.5, 2.5, 3.5):
         return f"total_{line}"
     return None
+
+
+# TASK 014 §5.4: team totals of NEW versions (protocol v3) are calibrated like the other
+# Dixon–Coles markets. Their maps live in their own key ``team_total_calibrators`` of the
+# version's report; a version without it (every older version and champion) serves them raw.
+TEAM_TOTAL_LINES = (0.5, 1.5, 2.5)
+TEAM_TOTAL_SIDES = {"home_to_score": "team_total_home", "away_to_score": "team_total_away"}
+
+
+def team_total_family(market_key: str, line) -> str | None:
+    """'team_total_home_1.5' for a team total; 'gospodarz strzeli' is over 0.5 of that team
+    (its first side 'yes' is the side 'over' of the map)."""
+    if market_key in TEAM_TOTAL_SIDES:
+        market_key, line = TEAM_TOTAL_SIDES[market_key], 0.5
+    if market_key not in ("team_total_home", "team_total_away") or line in (None, ""):
+        return None
+    return f"{market_key}_{float(line):.1f}"
+
+
+def team_total_map(validation: dict, market_key: str, line):
+    """The calibration map of a team total of a version, or None (raw, as before)."""
+    family = team_total_family(market_key, line)
+    return (validation.get("team_total_calibrators") or {}).get(family) if family else None
 
 
 def _outcome(h: int, a: int) -> str:
@@ -1047,7 +1083,10 @@ def predict_offer_goals(
                 kept += 1
                 continue
             family = family_of(market_key, line)
-            blocks = calibrators.get(family) if family else None
+            # TASK 014 §5.4: a team total has a map only in a new (v3) version
+            blocks = (
+                calibrators.get(family) if family else team_total_map(validation, market_key, line)
+            )
             calibrated, interval = calibrated_market(probs, blocks)
             conservative = {sel: (interval.get(sel) or [None])[0] for sel in calibrated}
             status = _served_status(predictive, validation, competition, family)
