@@ -283,7 +283,43 @@ def _scenario_settings(page, base: str, shot: Path) -> dict:
     found = _assess(page)
     found["limit_visible"] = page.get_by_text("Ta sama selekcja najwyżej w N kuponach").count() > 0
     found["profile_visible"] = page.get_by_text("Profil PEWNY SOLO").count() > 0
-    found["ok"] = found["ok"] and found["limit_visible"] and found["profile_visible"]
+    # TASK 015: option D — the definition of the cautious Elo double-chance bound
+    found["option_d_visible"] = (
+        page.get_by_text("Granica „ostrożnie” podwójnej szansy Elo").count() > 0
+    )
+    found["ok"] = (
+        found["ok"]
+        and found["limit_visible"]
+        and found["profile_visible"]
+        and found["option_d_visible"]
+    )
+    _full_screenshot(page, shot)
+    return found
+
+
+def _scenario_decisions(page, base: str, shot: Path) -> dict:
+    """TASK 015 §3: the Dashboard names the open decisions; Modele → "Decyzje do podjęcia"
+    shows all five decisions with their buttons."""
+    page.goto(f"{base}/?demo=1")
+    _settle(page)
+    found = {"dashboard_visible": page.get_by_text("Decyzje do podjęcia").count() > 0}
+    page.goto(f"{base}/modele?widok=Decyzje%20do%20podj%C4%99cia&demo=1")
+    _settle(page)
+    # the panel is computed on a cache miss (live evidence): wait for its last decision
+    page.get_by_text("Challengery czekające na dowody").first.wait_for(timeout=90_000)
+    _settle(page)
+    found.update(_assess(page))
+    titles = (
+        "Bramka protokołu v3",
+        "Opcja D: granica",
+        "Profil PEWNY SOLO",
+        "Limit różnicowania kuponów dnia",
+        "Challengery czekające na dowody",
+    )
+    found["items_visible"] = [t for t in titles if page.get_by_text(t).count() > 0]
+    found["ok"] = (
+        found["ok"] and found["dashboard_visible"] and len(found["items_visible"]) == len(titles)
+    )
     _full_screenshot(page, shot)
     return found
 
@@ -293,6 +329,7 @@ EVERY_VIEW = (
     ("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),
     ("historia_oczekiwane", "Historia: oczekiwane kontra faktyczne", _scenario_expected),
     ("ustawienia_profil", "Ustawienia: limit selekcji i profil PEWNY SOLO", _scenario_settings),
+    ("decyzje", "Dashboard i Modele: Decyzje do podjęcia", _scenario_decisions),  # TASK 015
 )
 
 SCENARIOS = (

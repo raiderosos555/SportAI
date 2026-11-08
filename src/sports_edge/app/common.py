@@ -242,7 +242,9 @@ def candidate_leg(row) -> dict:
 def day_candidates(day: str):
     """(report, candidates) of an offer day — cached per minute and database state."""
     db = store()
-    return cached_day(db, data_version(db), day, minute(), data_kinds())
+    # TASK 015: the definition of the Elo double-chance bound changes the candidates
+    version = data_version(db) + (settings().elo_dc_bound,)
+    return cached_day(db, version, day, minute(), data_kinds())
 
 
 def upcoming_days(days: list[str]) -> list[str]:

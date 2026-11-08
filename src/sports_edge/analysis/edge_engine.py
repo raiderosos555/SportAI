@@ -55,12 +55,53 @@ DERIVED_FROM_1X2 = {
 }
 
 
-def derive_from_1x2(prediction: dict, market_key: str) -> dict:
+# TASK 015 §3.2 (option D): the definition of the cautious bound of an Elo double chance
+BOUND_SUM = "sum"  # the sum of the lower bounds of two 1X2 outcomes (default, as before)
+BOUND_SINGLE = "single"  # one interval: 1 − the upper bound of the excluded outcome
+BOUND_LABELS = {
+    BOUND_SUM: "suma dwóch przedziałów (dzisiejsza definicja)",
+    BOUND_SINGLE: "jeden przedział (opcja D, jak Dixon–Coles)",
+}
+
+
+def bound_of(value) -> str:
+    """A known bound definition (anything else is the default)."""
+    return BOUND_SINGLE if value == BOUND_SINGLE else BOUND_SUM
+
+
+def policy_version_with_bound(version: str, bound: str) -> str:
+    """The policy version stored with a coupon: unchanged under the default definition (no
+    coupon identity changes), ``+D`` under option D — so a change during the day gives a
+    revision of the official coupon, never a new official coupon (TASK 010 rule "first")."""
+    return version if bound_of(bound) == BOUND_SUM else f"{version}+D"
+
+
+def single_interval_low(
+    probabilities: dict, interval: dict, selection: str, current_low: float
+) -> float:
+    """Option D for one Elo double-chance side — exactly the what-if measured in TASK 013 §5
+    and TASK 014 §5.2 (``simulation.option_d``, ``rolling._elo_bounds``): 1 − the upper bound
+    of the excluded outcome, kept only when it is higher than the sum of two lower bounds and
+    not above the model chance."""
+    excluded = EXCLUDED.get(selection)
+    bounds = interval.get(excluded) if excluded else None
+    if not bounds:
+        return current_low
+    one = max(0.0, 1.0 - float(bounds[1]))
+    p = sum(probabilities[k] for k in DERIVED_FROM_1X2["double_chance"][selection])
+    return max(current_low, one) if one <= p else current_low
+
+
+def derive_from_1x2(prediction: dict, market_key: str, *, bound: str = BOUND_SUM) -> dict:
     """Double chance from the same 1X2 forecast; interval bounds are added (conservative).
 
     Dixon–Coles ships its double chance inside the 1X2 row: since TASK 007 it is derived
     from the final 1X2 (P(1X) = 1 − P(2)); older rows calibrated every side separately, so
     their drift from 1 − P(excluded outcome) is measured and too large a drift blocks them.
+
+    TASK 015 (option D): ``bound`` changes ONLY the lower bound of an Elo double chance (no
+    shipped double chance): "sum" — the sum of the lower bounds of two outcomes (default);
+    "single" — ``single_interval_low``. The definition used is named in the uncertainty.
     """
     shipped = (prediction["uncertainty"].get("derived") or {}).get(market_key)
     if shipped:
@@ -102,6 +143,14 @@ def derive_from_1x2(prediction: dict, market_key: str) -> dict:
         for selection, keys in parts.items()
         if all(k in interval for k in keys)
     }
+    bound = bound_of(bound)
+    if bound == BOUND_SINGLE and market_key == "double_chance":
+        for selection, (low, high) in list(derived_i.items()):
+            if all(k in probabilities for k in parts[selection]):
+                derived_i[selection] = [
+                    single_interval_low(probabilities, interval, selection, low),
+                    high,
+                ]
     uncertainty = prediction["uncertainty"]
     return {
         **prediction,
@@ -114,6 +163,7 @@ def derive_from_1x2(prediction: dict, market_key: str) -> dict:
             "predictive_status": (uncertainty.get("derived_status") or {}).get(
                 market_key, "experimental"
             ),
+            "bound_definition": bound,  # TASK 015: which cautious bound was used
         },
         "derived_from": "1x2",
     }
@@ -283,7 +333,10 @@ def evaluate(
     now: datetime,
     max_age: timedelta,
     stake: Decimal,
+    elo_dc_bound: str = BOUND_SUM,
 ) -> list[Candidate]:
+    """``elo_dc_bound`` (TASK 015, option D): the definition of the cautious bound of an Elo
+    double chance — the user's setting; the default keeps every number as before."""
     out: list[Candidate] = []
     fair_1x2 = {(r["event_id"], r["period"]): devig(r)[0] for r in rows if r["market_key"] == "1x2"}
     for row in rows:
@@ -315,7 +368,7 @@ def evaluate(
         if prediction is None and row["market_key"] in DERIVED_FROM_1X2:
             base = predictions.get((row["event_id"], "1x2", row["period"], None))
             if base is not None:
-                prediction = derive_from_1x2(base, row["market_key"])
+                prediction = derive_from_1x2(base, row["market_key"], bound=elo_dc_bound)
         rules_status, payoff = _payoff(row, market_rules)
         for selection, quote in row["selections"].items():
             out.append(

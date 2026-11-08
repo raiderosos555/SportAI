@@ -340,7 +340,24 @@ def save_builder(
             "Kursy zaktualizowane",
             changes_between(store, official_id, coupon_id),
         )
-    coupon_id = create("revision", official_id, "inne nogi tego samego profilu i dnia")
+    stored = store.rows(
+        "SELECT coupon_id FROM coupon_lineage WHERE slot_key=? AND relation IN "
+        "('official','price_update','revision')",
+        (slot,),
+    )
+    same_legs = any(
+        sorted(s for s, _ in _coupon_legs(store, r["coupon_id"])) == sorted(selections)
+        for r in stored
+    )
+    coupon_id = create(
+        "revision",
+        official_id,
+        # TASK 015: the same legs under another policy version (e.g. option D switched on
+        # during the day) — a revision; the official coupon of the day stays
+        "te same nogi, inna wersja polityki lub definicji szansy ostrożnej (zmiana w ciągu dnia)"
+        if same_legs
+        else "inne nogi tego samego profilu i dnia",
+    )
     return SaveResult(
         coupon_id,
         "revision",
@@ -355,12 +372,25 @@ def local_time(value: str) -> str:
     return datetime.fromisoformat(value).astimezone(WARSAW).strftime("%H:%M")
 
 
-def proposal_payload(proposal: Proposal, *, policy_version: str) -> dict:
-    """What the coupon view shows and what is stored with a saved proposal (JSON-safe)."""
+def cautious_definition(bound: str | None) -> dict:
+    """TASK 015 §3.2: the definition of the cautious chance stored with every new proposal."""
+    from sports_edge.analysis.edge_engine import BOUND_LABELS, bound_of
+
+    found = bound_of(bound)
+    return {"elo_double_chance": found, "label": BOUND_LABELS[found]}
+
+
+def proposal_payload(proposal: Proposal, *, policy_version: str, bound: str | None = None) -> dict:
+    """What the coupon view shows and what is stored with a saved proposal (JSON-safe).
+    ``bound`` (TASK 015, option D): the definition of the Elo double-chance bound in use —
+    stored in the proposal; under option D the policy version gets the suffix ``+D``."""
+    from sports_edge.analysis.edge_engine import policy_version_with_bound
+
     return {
         "profile": proposal.profile,
         "label": proposal.label,
-        "policy_version": policy_version,
+        "policy_version": policy_version_with_bound(policy_version, bound or "sum"),
+        "cautious_definition": cautious_definition(bound),
         "level": proposal.level,
         "probability": {
             "calibrated": proposal.p_calibrated,
@@ -407,10 +437,23 @@ def _leg(leg: Candidate) -> dict:
 
 
 def save_proposals(
-    store: Store, paths: AppPaths, built: BuilderReport, *, analysis_id: str, now, day: str
+    store: Store,
+    paths: AppPaths,
+    built: BuilderReport,
+    *,
+    analysis_id: str,
+    now,
+    day: str,
+    bound: str | None = None,
 ) -> dict[str, dict]:
-    """Every proposal under the lineage rules: {profile: SaveResult as dict | {"error"}}."""
+    """Every proposal under the lineage rules: {profile: SaveResult as dict | {"error"}}.
+    ``bound`` (TASK 015): the definition of the cautious Elo double-chance bound in use; it
+    is part of the stored policy version (``+D``), so switching it during a day can only add
+    a revision — the official coupon of the day stays."""
+    from sports_edge.analysis.edge_engine import policy_version_with_bound
+
     rules = load_probability_policy(paths.config / "probability_policy.toml")
+    version = policy_version_with_bound(rules.version, bound or "sum")
     sts = load_profiles(paths.config)["sts"]
     out: dict[str, dict] = {}
     for name, proposal in built.proposals.items():
@@ -422,8 +465,8 @@ def save_proposals(
                 odds_ids=[leg.odds_id for leg in proposal.legs],
                 stake=proposal.stake,
                 profile_name=name,
-                payload=proposal_payload(proposal, policy_version=rules.version),
-                policy_version=rules.version,
+                payload=proposal_payload(proposal, policy_version=rules.version, bound=bound),
+                policy_version=version,
                 day=day,
                 analysis_id=analysis_id,
                 now=now,

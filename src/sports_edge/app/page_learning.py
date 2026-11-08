@@ -369,6 +369,11 @@ def _holdout(entry: dict) -> str:
     return f"n={holdout.get('n')} · log loss {ins.num(holdout.get('log_loss'), 4)}"
 
 
+def _evidence(pro: dict) -> str:
+    needed = pro.get("needed") or pe.load_policy().decision_matches
+    return f"{pro.get('matches', 0)}/{needed}"
+
+
 def _difference(pro: dict) -> str:
     ci = pro.get("ci95")
     if not ci:
@@ -394,6 +399,11 @@ def _decision_table(compared: dict) -> None:
                     "Holdout (tylko raport)": _holdout(version or {}),
                     "Statusy rynków": _statuses(version or {}),
                     "Wspólne rozliczone mecze": str(pro.get("matches", 0)) if challenger else "—",
+                    # TASK 015 §2.4: the evidence clock n/300 and its ESTIMATED date
+                    "Dowody n/300": _evidence(pro) if challenger else "—",
+                    "Szacowana data 300 meczów": (entry.get("estimate") or {}).get("label", "—")
+                    if role == "challenger"
+                    else "—",
                     "Różnica log loss (95%)": _difference(pro) if role == "challenger" else "—",
                     "Stan": entry["state_label"],
                 }
@@ -405,12 +415,16 @@ def _decision_table(compared: dict) -> None:
             for key, entry in compared.items()
         ]
     )
+    for key, entry in compared.items():
+        if entry.get("estimate"):
+            st.caption(f"{FAMILY_LABEL[key]} — {entry['estimate']['label']}")
     st.caption(
         "Różnica: log loss challengera minus aktywnej wersji na tych samych meczach (ujemna = "
         "challenger lepszy); przedział z bootstrapu po meczach. Aktywacja zawsze należy do "
         "Ciebie — system nigdy nie aktywuje modelu sam. Challenger bez wspólnych rozliczonych "
         "meczów po 14 dniach albo zastąpiony nowszym wygasa przy przeglądzie i przestaje "
-        "blokować trening."
+        "blokować trening; identyczny z championem (ten sam protokół) wygasa od razu. "
+        "Szacowana data to szacunek z tempa rozliczeń ostatnich 14 dni, nie termin."
     )
 
 

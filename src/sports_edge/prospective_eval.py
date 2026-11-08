@@ -1000,6 +1000,76 @@ def odds_age_report(
     }
 
 
+def today_odds_age(store: Store, *, now: datetime, settings: dict | None = None) -> dict:
+    """TASK 015 §4.3 (one Dashboard line): how old the newest STS document with a price of
+    today's matches (12 leagues, Warsaw day) is now, and the match-day downloads of today.
+    No match today or no document: said so — never a zero age."""
+    from zoneinfo import ZoneInfo
+
+    from sports_edge import automation
+    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+
+    warsaw = ZoneInfo("Europe/Warsaw")
+    today = now.astimezone(warsaw).date()
+    start = datetime.combine(today, time.min, tzinfo=warsaw).astimezone(UTC)
+    end = start + timedelta(days=1)
+    events = [
+        e
+        for e in store.rows(
+            "SELECT id, league, sport, home, away, start_at FROM events WHERE bookmaker_id='sts' "
+            "AND start_at IS NOT NULL AND start_at>=? AND start_at<?",
+            (iso(start - timedelta(hours=2)), iso(end + timedelta(hours=2))),
+        )
+        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+        and start <= datetime.fromisoformat(e["start_at"]) < end
+    ]
+    cfg = automation.matchday_config(settings or {})
+    runs = len(automation.matchday_runs_today(store, now=now))
+    # one match is one row even when STS listed it on several offer days (as odds_age_report)
+    unique = {
+        (league_code(e["league"], e["sport"]), e["home"], e["away"], e["start_at"]) for e in events
+    }
+    out = {
+        "day": today.isoformat(),
+        "matches": len(unique),
+        "upcoming": sum(datetime.fromisoformat(k[3]) > now for k in unique),
+        "document_at": None,
+        "age_hours": None,
+        "matchday_downloads": runs,
+        "cap": int(cfg.get("daily_cap") or 0),
+    }
+    if not events:
+        out["text"] = "Kursy na dziś: brak meczów 12 lig w ofercie STS na dziś."
+        return out
+    ids = sorted({e["id"] for e in events})
+    newest = None
+    for chunk in range(0, len(ids), 400):
+        part = ids[chunk : chunk + 400]
+        found = store.scalar(
+            f"""SELECT MAX(COALESCE(q.valid_at, q.ingested_at)) FROM quote_sets q
+            JOIN markets m ON m.id=q.market_id JOIN imports i ON i.id=q.import_id
+            WHERE m.event_id IN ({",".join("?" for _ in part)}) AND q.status='ok'
+            AND i.bookmaker_id='sts'""",
+            tuple(part),
+        )
+        if found and (newest is None or found > newest):
+            newest = found
+    downloads = f"pobrania w dniu meczu dziś: {runs}/{out['cap']}"
+    if newest is None:
+        out["text"] = f"Kursy na dziś ({out['matches']} meczów 12 lig): brak danych · {downloads}."
+        return out
+    moment = datetime.fromisoformat(newest)
+    age = max(0.0, (now - moment).total_seconds() / 3600)
+    out.update(document_at=newest, age_hours=round(age, 2))
+    hours = f"{age:.1f}".replace(".", ",")
+    out["text"] = (
+        f"Kursy na dziś ({out['matches']} meczów 12 lig, przed startem {out['upcoming']}): "
+        f"ostatni dokument STS z {moment.astimezone(warsaw):%H:%M} — {hours} h temu · "
+        f"{downloads}."
+    )
+    return out
+
+
 def weekly_report(
     store: Store,
     *,

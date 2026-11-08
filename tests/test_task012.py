@@ -626,8 +626,8 @@ def test_migration_to_v10_backs_up_and_keeps_every_row(tmp_path):
     raw.commit()
     raw.close()
     migrated = Store(path, backup_dir=tmp_path / "backups")
-    assert SCHEMA_VERSION == 10
-    assert migrated.migration_backup.name.startswith("pre-migration-v10_")
+    assert SCHEMA_VERSION >= 10  # TASK 015: v11 adds user_decisions on top of v10
+    assert migrated.migration_backup.name.startswith(f"pre-migration-v{SCHEMA_VERSION}_")
     assert migrated.migration_backup.exists()
     for table, n in counts.items():
         if table != "schema_migrations":
@@ -639,7 +639,9 @@ def test_migration_to_v10_backs_up_and_keeps_every_row(tmp_path):
         "immutable_calibration_reports_UPDATE",
         "immutable_calibration_reports_DELETE",
     } <= triggers
-    note = migrated.rows("SELECT description FROM schema_migrations WHERE version=10")
+    note = migrated.rows(
+        "SELECT description FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
+    )
     assert note and "v10 TASK 012" in note[-1]["description"]
     with pytest.raises(sqlite3.DatabaseError, match="append_only"):
         migrated.connection.execute("DELETE FROM predictions")

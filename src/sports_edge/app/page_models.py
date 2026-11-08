@@ -12,6 +12,8 @@ from sports_edge import prospective_eval as pe
 from sports_edge.app import common as c
 from sports_edge.app import international_ui as iui
 from sports_edge.app import ui
+from sports_edge.app.page_decisions import VIEW as DECISIONS_VIEW
+from sports_edge.app.page_decisions import decisions_panel
 from sports_edge.app.page_learning import gate_text, learning_panel
 from sports_edge.app.pages_models import _data, _forecasts, _models, _results
 from sports_edge.datasources.competitions import COMPETITIONS
@@ -44,11 +46,17 @@ def models_page() -> None:
     # a view switch instead of tabs: only the chosen view is computed (tabs run all bodies)
     views = {
         "Podstawowy": _basic,
+        DECISIONS_VIEW: decisions_panel,  # TASK 015 §3: the decisions waiting for the user
         "Uczenie AI": learning_panel,
         "Pokrycie oferty": _coverage,
         "Puchary i reprezentacje": lambda: iui.models_block(c.store()),
         "Zaawansowany": _advanced,
     }
+    # TASK 015: the Dashboard links to ?widok=Decyzje do podjęcia (opens the view once)
+    wanted = st.query_params.get("widok")
+    if wanted in views:
+        st.session_state["models_view"] = wanted
+        del st.query_params["widok"]
     view = st.segmented_control("Widok", list(views), default="Podstawowy", key="models_view")
     views[view or "Podstawowy"]()
 
@@ -71,7 +79,10 @@ def _basic() -> None:
         "„Zwalidowany” oznacza potwierdzoną trafność i kalibrację na nowych meczach (okno "
         "selekcji protokołu v2). To nie jest gwarancja trafienia ani zysku."
     )
-    st.caption("Decyzję o bramce v3 zapisujesz w widoku „Uczenie AI” (sekcja Bramka protokołu v3).")
+    st.caption(
+        "Decyzję o bramce v3 zapisujesz w widoku „Decyzje do podjęcia” albo „Uczenie AI” "
+        "(sekcja Bramka protokołu v3)."
+    )
     for name, scope in MODEL_SCOPES.items():
         pair = served[name]
         if not (pair["elo"] or pair["goals"]):

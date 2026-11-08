@@ -260,6 +260,34 @@ def ui_paths(config: Path | None = None) -> list[dict]:
         nearest = _app(_page("kupon"))
         nearest.run()
         check("kupon dnia: najbliżej (WYSOKA TRAFNOŚĆ)", nearest, ["najbliżej:"])
+        # ------------------------------------------------ TASK 015: decisions in one place
+        from sports_edge import decisions
+
+        dash = _app(_page("dashboard"))
+        dash.run()
+        check("dashboard: decyzje do podjęcia", dash, ["Decyzje do podjęcia"])
+        board = _app(_page("modele"))
+        board.query_params["widok"] = "Decyzje do podjęcia"
+        board.run()
+        shown = " ".join(m.value for m in board.markdown)
+        missing = [t for t in decisions.TITLES.values() if t not in shown]
+        record(
+            "modele: decyzje do podjęcia (5 pozycji)",
+            not missing and not _errors(board),
+            f"brak: {missing}" if missing else (_errors(board) or [""])[0],
+        )
+        # option D: the decision and its withdrawal are two new rows of the history
+        for value in ("single", "sum"):
+            radio = next(r for r in board.radio if r.label.startswith("Definicja granicy"))
+            radio.set_value(value).run()
+            next(b for b in board.checkbox if b.label.startswith("Potwierdzam definicję")).check()
+            board.run()
+            _button(board, "Zapisz decyzję o opcji D").click().run()
+        check(
+            "decyzje: opcja D i jej cofnięcie (dwa wpisy historii)",
+            board,
+            ["jeden przedział (opcja D"],
+        )
     finally:
         if previous is None:
             os.environ.pop("SPORTS_EDGE_HOME", None)

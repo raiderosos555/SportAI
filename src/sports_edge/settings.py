@@ -75,6 +75,10 @@ class AppSettings:
     # TASK 014: optional coupon profiles (``enabled = false`` in probability_policy.toml) the
     # user switched on in Ustawienia — empty by default (e.g. ["safe_solo"] = PEWNY SOLO)
     enabled_profiles: list[str] = field(default_factory=list)
+    # TASK 015 §3.2 (option D): the cautious bound of an Elo double chance — "sum" (the sum
+    # of the lower bounds of two 1X2 outcomes, the default) or "single" (one interval: 1 − the
+    # upper bound of the excluded outcome, like Dixon–Coles). Changed only by the user.
+    elo_dc_bound: str = "sum"
     # Optional language layer (TASK 007 §7): a free LOCAL model (Ollama), off by default.
     llm_enabled: bool = False
     llm_model: str = "hf.co/speakleash/Bielik-11B-v2.3-Instruct-GGUF:Q4_K_M"

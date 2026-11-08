@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 
 from sports_edge import insights as ins
+from sports_edge.analysis.edge_engine import BOUND_LABELS, bound_of
 from sports_edge.app import cart, coupon_view, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
@@ -82,6 +83,8 @@ def coupon_page() -> None:
         )
         st.caption(
             f"Polityka prawdopodobieństwa {rules.version} · stawka {rules.builder['stake']} zł · "
+            "granica „ostrożnie” podwójnej szansy Elo: "
+            f"{BOUND_LABELS[bound_of(settings.elo_dc_bound)]} · "
             "daty i godziny w strefie Europe/Warsaw."
         )
     if st.button("ANALIZUJ MECZE I GENERUJ KUPONY", type="primary", width="stretch"):
@@ -193,7 +196,9 @@ def _day(db, settings, rules, day, run, online) -> None:
     if run is not None:
         builder = run.coupons
         proposals = {
-            name: proposal_payload(p, policy_version=rules.version) if p else None
+            name: proposal_payload(p, policy_version=rules.version, bound=settings.elo_dc_bound)
+            if p
+            else None
             for name, p in builder.proposals.items()
         }
         refusals = builder.refusals
@@ -256,7 +261,7 @@ def _day(db, settings, rules, day, run, online) -> None:
             exposure=exposure,
             closest=closest if name == HIGH_HIT else None,
             alternatives=[
-                proposal_payload(a, policy_version=rules.version)
+                proposal_payload(a, policy_version=rules.version, bound=settings.elo_dc_bound)
                 for a in alternatives.get(name, ())
             ],
         )

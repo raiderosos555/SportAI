@@ -692,6 +692,95 @@ def job_review(store, paths, *, now, settings) -> JobOutcome:
     )
 
 
+# TASK 015 §2.3: the first review with v3 challengers runs once soon after the worker starts
+# on the new code (a one-off task), not at the weekly date
+FIRST_REVIEW = "first_v3_review"
+FIRST_REVIEW_DELAY = timedelta(minutes=10)  # after the catch-up of the start; < 1 hour
+
+
+def first_review_needed(store: Store) -> bool:
+    """Some scope with a served model has no v3 version yet."""
+    from sports_edge import learning, retraining
+    from sports_edge.services import ELO_FAMILY, MODEL_SCOPES
+
+    return any(
+        learning.champion_id(store, scope, ELO_FAMILY) is not None
+        and not retraining.has_v3(store, scope)
+        for scope in MODEL_SCOPES
+    )
+
+
+def plan_first_review(store: Store, *, now: datetime) -> str | None:
+    """Plan the first v3 review as a one-off task (id) when it is needed and none is
+    pending; a skipped one (offline, training off) is planned again at the next start."""
+    if not first_review_needed(store):
+        return None
+    settings = load_settings(store)
+    done = done_one_offs(store)
+    pending = [
+        t
+        for t in settings.get("one_off") or []
+        if t.get("variant") == FIRST_REVIEW and t["id"] not in done
+    ]
+    if pending:
+        return pending[0]["id"]
+    at = now + FIRST_REVIEW_DELAY
+    task_id = digest(["one_off", FIRST_REVIEW, iso(at), iso(now)])[:16]
+    settings["one_off"] = [
+        *(settings.get("one_off") or []),
+        {
+            "id": task_id,
+            "job": "review",
+            "variant": FIRST_REVIEW,
+            "at": iso(at),
+            "created_at": iso(now),
+            "label": "pierwszy przegląd z challengerami v3 (po starcie workera)",
+        },
+    ]
+    save_settings(store, settings, now=now, by="system")
+    return task_id
+
+
+def job_first_review(store, paths, *, now, settings) -> JobOutcome:
+    """TASK 015 §2.3: the review with the first v3 challengers (identical challengers expire,
+    the first v3 challenger of a scope needs no 150 new matches), then shadow forecasts of
+    the new challengers at once. Skipped with a reason offline or with training off."""
+    from sports_edge import retraining
+
+    app = _app(paths)
+    if app.offline_mode:
+        return JobOutcome(
+            "skipped", "tryb offline — pierwszy przegląd z challengerami v3 pominięty (bez sieci)"
+        )
+    if not (settings["jobs"].get("training") or {}).get("enabled"):
+        return JobOutcome(
+            "skipped",
+            "trening challengera jest wyłączony w automatyzacji — pierwszy przegląd z "
+            "challengerami v3 pominięty (włącz „Trening challengera” w Procesach)",
+        )
+    found = retraining.review(store, paths, now=now, trigger="first_v3", allow_training=True)
+    trained = [k for k, v in found.items() if v["status"] == "trained"]
+    payload = {"detail": found}
+    if trained:
+        from sports_edge.services import run_forecasts
+
+        try:  # the clock starts now: shadow forecasts of the new challengers
+            payload["forecasts"] = {
+                k: v for k, v in run_forecasts(store, paths, app, now=now).items() if k != "detail"
+            }
+        except ValueError as error:
+            payload["forecasts"] = {"error": str(error)}
+    return JobOutcome(
+        "ok" if trained else "skipped",
+        "; ".join(
+            f"{k}: {', '.join(v.get('reasons') or [])}"
+            for k, v in found.items()
+            if v["status"] != "trained"
+        )[:400],
+        payload,
+    )
+
+
 def job_sts_offer(store, paths, *, now, settings) -> JobOutcome:
     """New STS offer: the regular schedule fetches today and tomorrow; a match-day slot
     (TASK 012 §4.1) fetches today's offer only. After a NEW document the automatic
@@ -1271,7 +1360,7 @@ class Worker:
             now=self.clock(),
             settings=settings,
             trigger=trigger,
-            runner=self.runners.get(job) or runner,
+            runner=runner or self.runners.get(job),  # an explicit runner first (TASK 015)
         )
         self.current = None
         processed = (outcome.payload or {}).get("processed") or 0
@@ -1340,7 +1429,8 @@ class Worker:
 
     def _one_offs(self, store: Store, settings: dict) -> None:
         for task in due_one_offs(store, settings, now=self.clock()):
-            self._run(store, task["job"], settings, "one_off")
+            runner = job_first_review if task.get("variant") == FIRST_REVIEW else None
+            self._run(store, task["job"], settings, "one_off", runner=runner)
             event(
                 store,
                 "one_off_done",
@@ -1388,6 +1478,23 @@ class Worker:
             if commands_only:
                 self.handle(store, settings)
                 return "polecenia wykonane"
+            if not once:
+                # TASK 015 §2.3: the first review with v3 challengers within an hour; a failed
+                # planning is logged, never the end of the worker
+                try:
+                    planned_id = plan_first_review(store, now=self.clock())
+                except Exception:  # noqa: BLE001
+                    logger.exception("nie zaplanowano pierwszego przeglądu z challengerami v3")
+                    planned_id = None
+                if planned_id:
+                    event(
+                        store,
+                        "first_review_planned",
+                        now=self.clock(),
+                        worker_id=self.worker_id,
+                        detail=FIRST_REVIEW,
+                        payload={"id": planned_id},
+                    )
             if once:
                 self.handle(store, settings)
                 for job in due_jobs(store, settings, now=self.clock()):

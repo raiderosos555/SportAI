@@ -20,17 +20,37 @@ TASK 012: challengers are trained under protocol v3 (``rolling``: windows counte
 the training date), so a retraining can change the hyperparameters and calibration maps; the
 conditions above are unchanged. Only when the v3 windows are not feasible (too short a
 history) the challenger is trained under protocol v2 as before. Nothing activates a model.
+
+TASK 015 (the evidence clock):
+* a challenger of the SAME protocol as the champion that is identical to it (the same
+  windows, hyperparameters, calibration maps and selection-window metrics; the holdout of v2
+  differs at most by matches played after the champion's training) expires at once — it
+  could never produce a different forecast. A new ``model_events`` row, the old rows stay;
+* while a scope has no v3 version at all, the review trains the first v3 challenger without
+  the "150 new matches" and "7 days" conditions (both count new data within ONE protocol; v3
+  differs from the v2 champion anyway). It still needs at least one new match since the
+  champion's training and no other challenger waiting. Later v3 challengers follow the usual
+  conditions. The v3 gate blocks only the activation — never the training or the shadow mode;
+* the panel shows n/300 with an ESTIMATED date from the settlement pace of the last 14 days.
 """
 
 import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sports_edge import learning
 from sports_edge import prospective_eval as pe
 from sports_edge.collection import last_run, record_job
 from sports_edge.ingestion.types import iso
 from sports_edge.storage import Store
+
+WARSAW = ZoneInfo("Europe/Warsaw")
+ESTIMATE_DAYS = 14  # TASK 015 §2.4: the settlement pace behind the estimated date of n/300
+FIRST_V3_NOTE = (
+    "pierwszy challenger v3 w zakresie — bez warunku {n} nowych meczów i {d} dni od treningu "
+    "(inny protokół niż champion v2)"
+)
 
 EVERY_DAYS = 7
 MIN_NEW_RESULTS = 150
@@ -74,18 +94,36 @@ def new_matches(
     return sum(1 for r in rows if since is None or r["available_at"] > since)
 
 
-def conditions(
+def has_v3(store: Store, scope: str) -> bool:
+    """TASK 015 §2.2: does the scope have any version of protocol v3 (of either family)?"""
+    from sports_edge import rolling
+    from sports_edge.services import ELO_FAMILY, GOALS_FAMILY, newest_protocol_version
+
+    return any(
+        newest_protocol_version(store, scope, family, rolling.PROTOCOL) is not None
+        for family in (ELO_FAMILY, GOALS_FAMILY)
+    )
+
+
+def training_conditions(
     store: Store, scope: str, competitions, *, now: datetime, identities=None
-) -> tuple[bool, list[str]]:
-    """(ready, reasons) for training a new challenger of one scope."""
+) -> dict:
+    """{ready, reasons, first_v3, new} for training a new challenger of one scope.
+
+    TASK 015 §2.2: without any v3 version in the scope (``first_v3``) the "150 new matches"
+    and "7 days since the last training" conditions do not apply — they compare new data
+    within one protocol. At least one new match since the champion's training is still
+    needed (protocol v3 refuses the same data), and a waiting challenger still blocks."""
     from sports_edge.services import ELO_FAMILY, scope_version
 
-    reasons = []
+    reasons, waived = [], []  # ``waived``: the usual conditions the first v3 does not need
     champion = scope_version(store, competitions, ELO_FAMILY)
     since = champion["trained_through"] if champion else None
     new = new_matches(store, competitions, since=since, now=now, identities=identities)
+    first = new > 0 and champion is not None and not has_v3(store, scope)
     if new < MIN_NEW_RESULTS:
-        reasons.append(f"nowych unikalnych meczów od treningu: {new} < {MIN_NEW_RESULTS}")
+        text = f"nowych unikalnych meczów od treningu: {new} < {MIN_NEW_RESULTS}"
+        (waived if first else reasons).append(text)
     leaving = {vid for _family, vid, _why in expiring(store, scope, now=now)}
     if [v for v in learning.challengers(store, scope, ELO_FAMILY) if v not in leaving]:
         reasons.append("challenger tego zakresu czeka już na decyzję (tryb cienia)")
@@ -93,8 +131,23 @@ def conditions(
     if last and now - datetime.fromisoformat(last[-1]["created_at"]) < timedelta(
         days=MIN_DAYS_BETWEEN_TRAININGS
     ):
-        reasons.append(f"ostatni trening mniej niż {MIN_DAYS_BETWEEN_TRAININGS} dni temu")
-    return not reasons, reasons
+        text = f"ostatni trening mniej niż {MIN_DAYS_BETWEEN_TRAININGS} dni temu"
+        (waived if first else reasons).append(text)
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "first_v3": first,
+        "new": new,
+        "waived": waived,  # TASK 015: the usual conditions hold only when this is empty
+    }
+
+
+def conditions(
+    store: Store, scope: str, competitions, *, now: datetime, identities=None
+) -> tuple[bool, list[str]]:
+    """(ready, reasons) for training a new challenger of one scope."""
+    found = training_conditions(store, scope, competitions, now=now, identities=identities)
+    return found["ready"], found["reasons"]
 
 
 def review(
@@ -109,17 +162,36 @@ def review(
     allow_training: bool = True,
 ) -> dict:
     """One weekly review of every scope. ``train`` (scope → report) defaults to protocol v3
-    (TASK 012: rolling windows; v2 only when v3 is not feasible; never an activation)."""
-    from sports_edge.services import MODEL_SCOPES, train_challengers
+    (TASK 012: rolling windows; v2 only when v3 is not feasible; never an activation).
 
-    train = train or (
-        lambda scope: train_challengers(store, paths, now=now, scope=scope, force=force)
-    )
+    TASK 015: identical challengers expire first; the first v3 challenger of a scope is
+    trained without the "150 new matches" and "7 days" conditions — under protocol v3 only
+    (no v2 fallback: a v2 challenger on the same protocol as the champion keeps the usual
+    conditions)."""
+    from sports_edge.services import MODEL_SCOPES, run_protocol_v3, train_challengers
+
+    first: dict[str, dict] = {}
+
+    def default_train(scope: str) -> dict:
+        if not first.get(scope, {}).get("first_v3"):
+            return train_challengers(store, paths, now=now, scope=scope, force=force)
+        try:
+            return run_protocol_v3(store, paths, now=now, scope=scope, force=force)
+        except ValueError as error:
+            # v3 not feasible (too short a history): the usual v2 fallback only when the
+            # usual conditions hold too — never a v2 challenger without them
+            if "oknach protokołu v3" not in str(error) or first[scope]["waived"]:
+                raise
+            return train_challengers(store, paths, now=now, scope=scope, force=force)
+
+    train = train or default_train
     out = {}
     expired: dict[str, list[dict]] = {}
     for scope in scopes or tuple(MODEL_SCOPES):
         expired[scope] = expire_challengers(store, scope, now=now)
-        ready, reasons = conditions(store, scope, MODEL_SCOPES[scope], now=now)
+        found = training_conditions(store, scope, MODEL_SCOPES[scope], now=now)
+        ready, reasons = found["ready"], found["reasons"]
+        first[scope] = found
         if not ready and not force:
             out[scope] = {"status": "skipped", "reasons": reasons}
             learning.record(
@@ -145,11 +217,28 @@ def review(
                 payload={"trigger": trigger},
             )
             continue
+        note = (
+            FIRST_V3_NOTE.format(n=MIN_NEW_RESULTS, d=MIN_DAYS_BETWEEN_TRAININGS)
+            if found["first_v3"]
+            else None
+        )
+        if note:
+            learning.record(
+                store,
+                kind="review",
+                actor="system" if trigger != "manual" else "user",
+                reason="Przegląd: " + note + f"; nowych meczów od treningu: {found['new']}",
+                now=now,
+                scope=scope,
+                payload={"trigger": trigger, "first_v3": True, "new_matches": found["new"]},
+            )
         try:
-            report = train(scope)
+            report = train(scope) or {}
             out[scope] = {"status": "trained", "summary": report.get("summary")}
         except ValueError as error:
             out[scope] = {"status": "failed", "reasons": [str(error)]}
+        if note:
+            out[scope]["first_v3"] = True
     for scope, found in expired.items():
         if found:  # TASK 011: challengers that stopped blocking at this review
             out[scope]["expired"] = found
@@ -289,10 +378,80 @@ def comparison(
             entry["age_days"] = _age_days(
                 store, scope, family, challenger["version_id"], now or datetime.now(UTC)
             )
+            pro = entry["prospective"]
+            entry["estimate"] = evidence_estimate(
+                rows,
+                scope,
+                family,
+                matches=pro.get("matches", 0),
+                needed=pro.get("needed") or policy.decision_matches,
+                now=now or datetime.now(UTC),
+            )
         entry["state"], entry["state_label"] = evidence_state(entry, policy)
         entry["conclusion"] = conclusion(entry)
         out[key] = entry
     return out
+
+
+def evidence_estimate(
+    rows: list[dict],
+    scope: str,
+    family: str,
+    *,
+    matches: int,
+    needed: int,
+    now: datetime,
+    days: int = ESTIMATE_DAYS,
+) -> dict:
+    """TASK 015 §2.4: when n/300 common settled matches may be reached — an ESTIMATE.
+
+    The pace is the number of settled matches of the SERVED versions of this scope and
+    family (shadow forecasts of a challenger are made for the same matches) that started in
+    the last ``days`` days; when the prospective record is younger than that, its own span
+    (from the first settled match) is used and named. No settled match in that period: "za
+    mało danych" — never a guessed pace."""
+    start = now - timedelta(days=days)
+    starts: dict[str, datetime] = {}
+    first = None
+    for r in rows:
+        if r["role"] != "active" or r["family"] != family or r["scope"] != scope:
+            continue
+        if r["market_key"] == "double_chance":  # counted through 1X2, as in paired_matches
+            continue
+        kickoff = datetime.fromisoformat(r["start_at"])
+        first = kickoff if first is None or kickoff < first else first
+        if start <= kickoff < now:
+            starts[r["match"]] = kickoff
+    out = {"matches": matches, "needed": needed, "pace_matches": len(starts), "days": days}
+    if matches >= needed:
+        return {**out, "state": "reached", "eta": None, "label": f"{matches}/{needed} — osiągnięto"}
+    if not starts or first is None:
+        return {
+            **out,
+            "state": "insufficient",
+            "eta": None,
+            "label": f"za mało danych (brak rozliczonych meczów w ostatnich {days} dniach)",
+        }
+    span = min(float(days), max(1.0, (now - max(first, start)).total_seconds() / 86400))
+    per_day = len(starts) / span
+    eta = (now + timedelta(days=(needed - matches) / per_day)).astimezone(WARSAW).date()
+    basis = (
+        f"tempo z ostatnich {days} dni"
+        if span >= days
+        else f"tempo z {span:.0f} dni (od pierwszego rozliczenia)"
+    )
+    per_week = per_day * 7
+    return {
+        **out,
+        "state": "estimated",
+        "eta": eta.isoformat(),
+        "span_days": round(span, 1),
+        "per_week": round(per_week, 1),
+        "label": (
+            f"szacunek: ok. {eta:%d.%m.%Y} ({basis}: {len(starts)} rozliczonych meczów, "
+            f"ok. {per_week:.0f} tygodniowo)"
+        ),
+    }
 
 
 def _age_days(store: Store, scope: str, family: str, version_id: str, now: datetime):
@@ -386,15 +545,102 @@ def _ready_at(store: Store, scope: str, family: str, version_id: str) -> datetim
     return datetime.fromisoformat(found[0]) if found else None
 
 
+# TASK 015 §2.1: the parts of a version report that decide its forecasts. Two versions of
+# the same protocol with all of them equal give the same forecast for every match (team
+# strengths are computed from the same results at the time of the forecast).
+MODEL_PARTS = (
+    "protocol",
+    "split",
+    "hyperparameters",
+    "decision",
+    "calibration",
+    "calibrators",
+    "team_total_calibrators",
+    "half_life_days",
+    "window_days",
+    "refit_days",
+    "markets_served",
+    "predictive",
+    "elo_predictive",
+)
+IDENTICAL_REASON = (
+    "identyczny z championem (ten sam protokół {protocol}: te same okna, hiperparametry, "
+    "kalibratory i miary okna selekcji{holdout}) — nie może dać innej prognozy"
+)
+
+
+def _holdout_same(old: dict, new: dict) -> tuple[bool, str]:
+    """The holdout of both versions: the same numbers, or (protocol v2: the holdout runs up
+    to the training date and is only reported) the same window extended by matches played
+    after the champion's training — never fewer matches."""
+    a, b = old.get("holdout"), new.get("holdout")
+    if a == b:
+        return True, "" if not a else ", ten sam holdout"
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return False, ""
+    same_start = (old.get("split") or {}).get("holdout_from") == (new.get("split") or {}).get(
+        "holdout_from"
+    )
+    if same_start and (b.get("n") or 0) >= (a.get("n") or 0) > 0:
+        return True, (
+            f", holdout od {(old.get('split') or {}).get('holdout_from')} poszerzony tylko o "
+            f"nowsze mecze: n {a.get('n')} → {b.get('n')}"
+        )
+    return False, ""
+
+
+def _shadow_differs(store: Store, champion: str, challenger: str) -> bool:
+    """A guard: stored forecasts of both versions for the same match, market and data state
+    (the same ``data_snapshot``) that differ — then the versions are NOT identical."""
+    rows = store.rows(
+        """SELECT a.probabilities_json pa, b.probabilities_json pb, a.inputs_json ia,
+        b.inputs_json ib FROM predictions a JOIN predictions b ON b.event_id=a.event_id
+        AND b.market_key=a.market_key AND b.period=a.period AND b.line IS a.line
+        WHERE a.model_version_id=? AND b.model_version_id=? AND a.kind='prospective'
+        AND b.kind='prospective' LIMIT 5000""",
+        (champion, challenger),
+    )
+    for r in rows:
+        if json.loads(r["ia"] or "{}").get("data_snapshot") != json.loads(r["ib"] or "{}").get(
+            "data_snapshot"
+        ):
+            continue
+        pa, pb = json.loads(r["pa"]), json.loads(r["pb"])
+        if set(pa) != set(pb) or any(abs(float(pa[k]) - float(pb[k])) > 1e-9 for k in pa):
+            return True
+    return False
+
+
+def identical_to_champion(store: Store, champion: dict | None, challenger: dict) -> str | None:
+    """TASK 015 §2.1: why the challenger is identical to the champion (None: it is not).
+    Only versions of the SAME protocol; v1 versions (holdout used) are never compared."""
+    if champion is None or champion["version_id"] == challenger["version_id"]:
+        return None
+    old = json.loads(champion["validation_json"] or "{}")
+    new = json.loads(challenger["validation_json"] or "{}")
+    protocol = old.get("protocol")
+    if protocol not in ("v2", "v3") or new.get("protocol") != protocol:
+        return None
+    if not old.get("decision") or any(old.get(k) != new.get(k) for k in MODEL_PARTS):
+        return None
+    same, holdout = _holdout_same(old, new)
+    if not same or _shadow_differs(store, champion["version_id"], challenger["version_id"]):
+        return None
+    return IDENTICAL_REASON.format(protocol=protocol, holdout=holdout)
+
+
 def expiring(
     store: Store, scope: str, *, now: datetime, rows: list[dict] | None = None
 ) -> list[tuple[str, str, str]]:
     """(family, version id, reason) of the waiting challengers that stop blocking the review:
-    replaced by a newer challenger of the same scope and family, or older than
-    ``expiry_days`` without any settled match in common with the champion."""
+    replaced by a newer challenger of the same scope and family, older than ``expiry_days``
+    without any settled match in common with the champion, or (TASK 015) identical to the
+    champion — at once, without waiting."""
+    from sports_edge.models.registry import model_overview
     from sports_edge.services import ELO_FAMILY, GOALS_FAMILY, MODEL_SCOPES, scope_version
 
     policy = pe.load_policy()
+    versions = None
     out = []
     for family in (ELO_FAMILY, GOALS_FAMILY):
         waiting = learning.challengers(store, scope, family)
@@ -405,22 +651,28 @@ def expiring(
                 )
                 out.append((family, version_id, why))
                 continue
-            ready = _ready_at(store, scope, family, version_id)
-            if ready is None or now - ready < timedelta(days=policy.expiry_days):
-                continue
             champion = scope_version(store, MODEL_SCOPES[scope], family)
             if champion is None:
                 continue
-            if rows is None:
-                rows = pe.market_forecasts(store)
-            found = pe.paired_matches(
-                store, champion["version_id"], version_id, policy=policy, rows=rows
-            )
-            if found["matches"] == 0:
-                why = (
-                    "brak wspólnych rozliczonych meczów z aktywną wersją po "
-                    f"{policy.expiry_days} dniach"
+            ready = _ready_at(store, scope, family, version_id)
+            if ready is not None and now - ready >= timedelta(days=policy.expiry_days):
+                if rows is None:
+                    rows = pe.market_forecasts(store)
+                found = pe.paired_matches(
+                    store, champion["version_id"], version_id, policy=policy, rows=rows
                 )
+                if found["matches"] == 0:
+                    why = (
+                        "brak wspólnych rozliczonych meczów z aktywną wersją po "
+                        f"{policy.expiry_days} dniach"
+                    )
+                    out.append((family, version_id, why))
+                    continue
+            if versions is None:
+                versions = {r["version_id"]: r for r in model_overview(store)}
+            row = versions.get(version_id)
+            why = identical_to_champion(store, champion, row) if row else None
+            if why:
                 out.append((family, version_id, why))
     return out
 
@@ -430,19 +682,23 @@ def expire_challengers(store: Store, scope: str, *, now: datetime) -> list[dict]
     rows stay as they were; an expired challenger is never activated."""
     out = []
     for family, version_id, why in expiring(store, scope, now=now):
+        identical = why.startswith("identyczny")
+        prefix = "Wygasły: " if identical else "Wygasły (brak dowodów): "
         learning.record(
             store,
             kind="expired",
             actor="system",
-            reason="Wygasły (brak dowodów): " + why,
+            reason=prefix + why,
             now=now,
             version_id=version_id,
             scope=scope,
             family=family,
-            payload={"reason": why},
+            payload={"reason": why, "identical": identical},
             key=["expired", scope, family, version_id],
         )
-        out.append({"family": family, "version_id": version_id, "reason": why})
+        out.append(
+            {"family": family, "version_id": version_id, "reason": why, "identical": identical}
+        )
     return out
 
 

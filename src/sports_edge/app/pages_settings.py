@@ -5,7 +5,8 @@ from dataclasses import asdict, replace
 import pandas as pd
 import streamlit as st
 
-from sports_edge import llm
+from sports_edge import decisions, llm
+from sports_edge.analysis.edge_engine import BOUND_LABELS, BOUND_SINGLE, BOUND_SUM, bound_of
 from sports_edge.app import common as c
 from sports_edge.backup import create_backup, list_backups
 from sports_edge.bookmakers import load_profiles, load_rules
@@ -96,6 +97,19 @@ def _sts() -> None:
         )
         for name, profile in optional.items()
     }
+    # TASK 015 §3.2 (option D): the definition of the cautious Elo double-chance bound
+    bounds = [BOUND_SUM, BOUND_SINGLE]
+    bound = st.radio(
+        "Granica „ostrożnie” podwójnej szansy Elo",
+        bounds,
+        index=bounds.index(bound_of(settings.elo_dc_bound)),
+        format_func=lambda v: BOUND_LABELS[v],
+        key="settings_elo_dc_bound",
+        help="Domyślnie suma dolnych granic dwóch wyników 1X2. Opcja D: 1 − górna granica "
+        "wykluczonego wyniku (jak Dixon–Coles). Progi profili się nie zmieniają; definicja "
+        "zapisuje się w propozycji, a zmiana w ciągu dnia daje rewizję kuponu oficjalnego. "
+        "Dowody: Modele i statystyki → Decyzje do podjęcia.",
+    )
     st.markdown("**Źródła wyników sportowych** (bezpłatne; płatne nigdy automatycznie)")
     football_data = st.toggle(
         "football-data.org — bieżące wyniki 5 lig (wymaga własnego bezpłatnego klucza)",
@@ -146,6 +160,7 @@ def _sts() -> None:
         usable, why = llm.available(probe)
         (st.success if usable else st.info)("Lokalny model gotowy." if usable else why)
     if st.button("Zapisz ustawienia"):
+        before = replace(settings, enabled_profiles=list(settings.enabled_profiles or []))
         settings.llm_enabled, settings.llm_model = llm_on, model
         settings.offline_mode, settings.sts_download_enabled = offline, sts
         settings.retain_raw_pdf, settings.nominal_stake = retain, stake
@@ -157,8 +172,15 @@ def _sts() -> None:
             int(diversity) if int(diversity) != policy_limit else None
         )
         settings.enabled_profiles = [name for name, on in switched.items() if on]
+        settings.elo_dc_bound = bound_of(bound)
         save_settings(c.paths(), settings)
-        st.success("Zapisano w data/settings.json")
+        # TASK 015 §3.3: a changed decision (option D, PEWNY SOLO, limit) is a history row
+        logged = decisions.log_settings_change(c.store(), c.paths(), before, settings, now=c.now())
+        st.cache_data.clear()
+        st.success(
+            "Zapisano w data/settings.json"
+            + (f" · zapisane decyzje: {len(logged)} (historia decyzji)" if logged else "")
+        )
     st.info(
         "Harmonogram automatycznego pobierania jest wyłączony: STS publikuje linki PDF dla "
         "użytkowników (sts.pl/oferta-pdf), ale dopuszczalności cyklicznych odczytów nie "

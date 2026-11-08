@@ -42,6 +42,9 @@ def test_main_user_paths_of_the_interface():
         "kupon dnia: najbliżej (WYSOKA TRAFNOŚĆ)",
         "historia: oczekiwane kontra faktyczne",  # TASK 014
         "ustawienia: profil PEWNY SOLO (domyślnie wyłączony)",
+        "dashboard: decyzje do podjęcia",  # TASK 015
+        "modele: decyzje do podjęcia (5 pozycji)",
+        "decyzje: opcja D i jej cofnięcie (dwa wpisy historii)",
     ):
         assert expected in names
     assert any(name.startswith("brak danych") for name in names)

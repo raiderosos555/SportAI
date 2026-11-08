@@ -38,7 +38,13 @@ Funkcje:
   Poissona-dwumianowy: pech czy błąd modelu) i linia na Dashboardzie, pomiar bezpieczniejszych
   wariantów kuponu na tych samych decyzjach as-of, opcjonalny profil PEWNY SOLO (domyślnie
   wyłączony), odnośnik do limitu wspólnych nóg w „Ryzyku dnia”, ostrzeżenia w Moim kuponie,
-  pokrycie dolnej granicy na historii (dane do opcji D) i kalibracja team totals w nowych wersjach.
+  pokrycie dolnej granicy na historii (dane do opcji D) i kalibracja team totals w nowych wersjach;
+- zegar dowodów i decyzje w jednym miejscu (TASK 015): challengery identyczne z championem
+  wygasają od razu, pierwszy challenger v3 powstaje bez czekania na 150 nowych meczów (przegląd
+  jednorazowy po starcie workera), n/300 z szacowaną datą, panel „Decyzje do podjęcia” (bramka
+  v3, opcja D, PEWNY SOLO, limit różnicowania, challengery) z historią decyzji append-only,
+  opcja D jako przełącznik definicji granicy „ostrożnie” (domyślnie dzisiejsza), wiek kursu na
+  Dashboardzie.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
@@ -49,7 +55,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 014](docs/task_014_report.md).
+Stan i ograniczenia: [raport TASK 015](docs/task_015_report.md).
 
 ## Uruchomienie na Windows
 
@@ -193,7 +199,7 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-436 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+456 testów (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
@@ -218,8 +224,14 @@ rozkład Poissona-dwumianowy i oznaczenia, panel tylko z kuponów liczonych w st
 na meczach, replay wariantów na tych samych decyzjach bez przecieku, profil PEWNY SOLO domyślnie
 wyłączony i regresja czterech profili, ostrzeżenia Mojego kuponu, scalony slot pobrań w dniu
 meczu, pokrycie dolnej granicy as-of, mapy team totals tylko w nowych wersjach, Historia i
-Ustawienia w AppTest).
-Ścieżki interfejsu: `python -m sports_edge.qa` (34 ścieżki). Zrzuty ekranu:
+Ustawienia w AppTest; 20 z TASK 015: wygaszanie challengera identycznego z championem i
+tylko w tym samym protokole, pierwszy v3 bez 150 nowych meczów i zwykłe warunki dla drugiego,
+bramka blokująca tylko aktywację, zapasowy v2 tylko przy zwykłych warunkach, jednorazowy przegląd po starcie workera (offline i przy
+wyłączonym treningu pominięty), szacunek n/300 z tempa 14 dni, opcja D domyślnie bez zmian i
+po przełączeniu równa zmierzonemu wariantowi, rewizja przy zmianie w ciągu dnia, historia
+decyzji append-only bez zmian bez kliknięcia, wiek kursów dziś, migracja v11, Dashboard i panel
+decyzji w AppTest).
+Ścieżki interfejsu: `python -m sports_edge.qa` (37 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
 768, 390 px) z asercjami układu (brak poziomego przewijania, niełamane kursy, procenty i daty,
@@ -279,6 +291,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 015](docs/task_015_report.md) | Zegar dowodów i decyzje w jednym miejscu: wygaszanie challengerów identycznych z championem, pierwsze challengery v3 bez warunku 150 meczów i przegląd po starcie workera, n/300 z szacowaną datą, panel „Decyzje do podjęcia” z historią decyzji (schemat v11), opcja D jako przełącznik i jej skutki na kopii, wiek kursów (za mało danych) |
 | [Raport TASK 014](docs/task_014_report.md) | Trafność kuponów: oczekiwane kontra faktyczne (pech czy błąd modelu), pomiar bezpieczniejszego kuponu i opcjonalny profil PEWNY SOLO, mniej wspólnych porażek, wiek kursów i pułap w niedziele, pokrycie dolnej granicy (opcja D), kalibracja team totals |
 | [Raport TASK 013](docs/task_013_report.md) | Od challengera do decyzji: scalona poprawka workera, warianty okresu połowicznego zaniku Dixon–Coles i wybrana reguła, identyfikator prognozy w nodze kuponu, diagnoza WYSOKIEJ TRAFNOŚCI z opcjami do decyzji, zapisana bramka v3, wiek kursów |
 | [Raport TASK 012](docs/task_012_report.md) | Modele, które się uczą: protokół v3 z oknami ruchomymi i jego bramka decyzji, walk-forward v3 vs v2, automatyczne prognozy oferty, raport tygodniowy kalibracji, kursy STS w dniu meczu, Ryzyko dnia z macierzy wyników |

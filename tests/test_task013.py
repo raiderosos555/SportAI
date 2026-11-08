@@ -622,8 +622,14 @@ def test_the_system_never_accepts_the_gate_nor_activates_a_model():
         text = path.read_text(encoding="utf-8")
         if "accept_gate(" in text:
             calls.append(path.relative_to(SRC).as_posix())
-    # defined in learning, called ONLY by the user's button in the Models panel
-    assert sorted(calls) == ["sports_edge/app/page_learning.py", "sports_edge/learning.py"]
+    # defined in learning, called ONLY by the user's button in the Models panel — TASK 015:
+    # also by ``decisions.decide_gate``, which only the button of the panel "Decyzje do
+    # podjęcia" calls (checked in test_task015)
+    assert sorted(calls) == [
+        "sports_edge/app/page_learning.py",
+        "sports_edge/decisions.py",
+        "sports_edge/learning.py",
+    ]
     source = (SRC / "sports_edge" / "learning.py").read_text(encoding="utf-8")
     assert source.count('kind="protocol_gate_accepted",\n        actor="user"') == 1
     for module in ("rolling.py", "retraining.py", "automation.py"):
@@ -702,7 +708,7 @@ def test_no_schema_change_is_needed(tmp_path):
     coupon_legs.prediction_id, the odds age in the weekly report entry (schema stays v10)."""
     from sports_edge.storage import SCHEMA_VERSION, Store
 
-    assert SCHEMA_VERSION == 10
+    assert SCHEMA_VERSION >= 10  # TASK 015: v11 adds user_decisions (TASK 013 added none)
     db = Store(tmp_path / "x.db")
     columns = {r[1] for r in db.connection.execute("PRAGMA table_info(coupon_legs)")}
     assert "prediction_id" in columns

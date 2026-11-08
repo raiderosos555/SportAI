@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -40,6 +40,7 @@ MIGRATIONS = {
     8: "TASK 010: coupon lineage — one official coupon per profile and day, versions linked",
     9: "TASK 011: prospective STS market benchmark of the models (append-only snapshots)",
     10: "TASK 012: weekly prospective calibration reports (append-only history entries)",
+    11: "TASK 015: the user's decisions (v3 gate, option D, profiles, limit) — append-only",
 }
 
 SCHEMA = """
@@ -319,6 +320,13 @@ CREATE TABLE IF NOT EXISTS calibration_reports (
  flags INTEGER NOT NULL, verdicts INTEGER NOT NULL, payload_json TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS calibration_report_time ON calibration_reports(kind, created_at);
+CREATE TABLE IF NOT EXISTS user_decisions (
+ id TEXT PRIMARY KEY, created_at TEXT NOT NULL, decision TEXT NOT NULL,
+ actor TEXT NOT NULL CHECK(actor IN ('user')), previous_json TEXT NOT NULL,
+ new_json TEXT NOT NULL, summary TEXT NOT NULL, source TEXT NOT NULL,
+ payload_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS user_decision_time ON user_decisions(decision, created_at);
 CREATE INDEX IF NOT EXISTS fixture_event ON provider_fixtures(event_id, provider);
 CREATE INDEX IF NOT EXISTS lineup_event ON lineup_observations(event_id, side, observed_at);
 CREATE INDEX IF NOT EXISTS absence_event ON player_absence_observations(event_id, team_name);
@@ -408,6 +416,9 @@ class Store:
         v10: one new append-only table (``calibration_reports``: the weekly report of the
         coupon-zone calibration and the STS market comparison, TASK 012); no existing row is
         touched (old forecasts and model versions stay as they were).
+        v11: one new append-only table (``user_decisions``: every decision of the user from
+        the panel "Decyzje do podjęcia" or Ustawienia — who, when, what, the previous and the
+        new state; a withdrawal is a new row, TASK 015); no existing row is touched.
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

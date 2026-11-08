@@ -50,6 +50,7 @@ def dashboard_page() -> None:
     freshness = c.cached_freshness(db, c.data_version(db), c.minute())
     if not days:
         _status_strip(db, None, freshness, now)
+        _decisions()
         ui.empty_state(
             "Brak oferty STS",
             "Zaimportuj PDF z ofertą STS (Wydarzenia i wyniki) albo włącz pobieranie oficjalnych "
@@ -62,6 +63,8 @@ def dashboard_page() -> None:
     cart.flash()
     # 1 -------------------------------------------------------------------------------
     _status_strip(db, offer, freshness, now)
+    _odds_age_line(db, now)
+    _decisions()
     # 2 -------------------------------------------------------------------------------
     label = "dziś" if day == today else c.day_label(day)
     ui.section("Propozycje kuponów", f"{label} · identyczne propozycje pokazane raz")
@@ -126,6 +129,24 @@ def _status_strip(db, offer: dict | None, freshness: list[dict], now) -> None:
         "kontrola składów i kuponów",
     )
     ui.status_strip([sts, sport, robot, alert])
+
+
+def _odds_age_line(db, now) -> None:
+    """TASK 015 §4.3: the age of the newest STS document with prices of today's matches."""
+    from sports_edge.prospective_eval import today_odds_age
+
+    try:
+        settings = {} if c.demo_mode() else automation.load_settings(db)
+        st.caption(today_odds_age(db, now=now, settings=settings)["text"])
+    except Exception:  # noqa: BLE001 — one information line must never break the Dashboard
+        st.caption("Kursy na dziś: brak danych.")
+
+
+def _decisions() -> None:
+    """TASK 015 §3.1: the number of open decisions and a link to the full panel."""
+    from sports_edge.app.page_decisions import dashboard_block
+
+    dashboard_block()
 
 
 def _offer_hint(offer: dict) -> str:

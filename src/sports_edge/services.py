@@ -1491,7 +1491,15 @@ def _analyse_one_day(
     pipeline = {"stages": stages, "run_at": now.astimezone(UTC).isoformat()}
     analysis_id = save_analysis(store, report, candidates, policy(paths), pipeline=pipeline)
     saves = (
-        save_proposals(store, paths, built, analysis_id=analysis_id, now=now, day=day)
+        save_proposals(
+            store,
+            paths,
+            built,
+            analysis_id=analysis_id,
+            now=now,
+            day=day,
+            bound=getattr(settings, "elo_dc_bound", "sum"),
+        )
         if save_coupons
         else {}
     )
@@ -1658,6 +1666,8 @@ def day_candidates_at(
         now=now,
         max_age=timedelta(minutes=settings.max_quote_age_minutes),
         stake=Decimal(settings.nominal_stake),
+        # TASK 015 (option D): the user's definition of the Elo double-chance bound
+        elo_dc_bound=getattr(settings, "elo_dc_bound", "sum"),
     )
     from sports_edge.international import gate_candidates
 
