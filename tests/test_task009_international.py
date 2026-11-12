@@ -190,8 +190,13 @@ def test_only_observed_sts_headers_map_and_sport_and_suffix_keep_competitions_ap
     assert for_sts_league("KLUBOWE - LIGA EUROPY", "football").code == "uefa.el"
     assert for_sts_league("KLUBOWE - LIGA KONFERENCJI", "football").code == "uefa.ecl"
     assert for_sts_league("FRANCJA - PUCHAR", "football") is None  # no verified source
+    assert for_sts_league("MIĘDZYNARODOWE - LIGA NARODÓW UEFA", "football").code == "uefa.nl"
+    assert for_sts_league("MIĘDZYNARODOWE - MECZE TOWARZYSKIE", "football").code == "fifa.friendly"
     for code in by_category("national"):
-        assert COMPETITIONS[code].sts_leagues == ()  # nothing observed, nothing guessed
+        if code in {"uefa.nl", "fifa.friendly"}:
+            assert COMPETITIONS[code].sts_leagues  # the only observed national headers
+        else:
+            assert COMPETITIONS[code].sts_leagues == ()  # nothing guessed for other events
 
 
 # 4 ---------------------------------------------------------------- club identity

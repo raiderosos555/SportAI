@@ -205,7 +205,7 @@ użytkownika (do tego czasu: „Wydarzenie dostępne — model predykcyjny jeszc
 .\.venv\Scripts\python -m ruff format --check .
 ```
 
-484 testy (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
+503 testy (268 z TASK 001–007 + 31 z TASK 008: worker automatyzacji, składy i absencje,
 kontrola kuponów, Advanced Football Prediction Engine, prognozy challengera w trybie cienia;
 9 z TASK 009: harmonogram przez WWW, typy kuponów w historii, komponenty interfejsu, checker
 wizualny; 17 z TASK 009 International: puchary UEFA, dwumecze, dogrywki i karne, tożsamość
@@ -241,7 +241,8 @@ pełnego, rynek wydrukowany dwa razy w dokumencie, kupon z potwierdzonego kursu,
 przy zajętej bazie, kopia cykliczna z retencją, brakiem miejsca i uszkodzoną kopią, alerty
 zgrupowane, uszeregowane i zwinięte po starcie meczu, „oznacz wszystkie”, brak źródła absencji
 raz dziennie, ręczna absencja ze źródłem i jej wycofanie, decyzja bez zmian bez wpisu,
-migracja v12, Dashboard, Źródła i Analiza meczów w AppTest).
+migracja v12, Dashboard, Źródła i Analiza meczów w AppTest; 19 z TASK 017: prognozy cieniowe
+reprezentacji, aliasy nazw, bramka i decyzja dla 1X2 reprezentacji, brak zmian kuponów).
 Ścieżki interfejsu: `python -m sports_edge.qa` (40 ścieżek). Zrzuty ekranu:
 `python -m sports_edge.qa_browser` (Playwright). Testy wizualne TASK 009:
 `python -m sports_edge.qa_visual <katalog>` — 14 stron w 5 rozdzielczościach (1920, 1366, 1024,
@@ -302,6 +303,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 017](docs/task_017_report.md) | Prognozy reprezentacji w trybie cienia (wykonane przez Codex, zweryfikowane na TASK 016): nagłówki STS Ligi Narodów i meczów towarzyskich, walk-forward 1X2, worker cieniowy, decyzja „1X2 reprezentacji” zablokowana do czasu walidacji; kuponów reprezentacji nadal nie ma |
 | [Raport TASK 016](docs/task_016_report.md) | Higiena danych: co naprawdę zajmuje bazę (pomiar na kopii), potwierdzenia zamiast powtórzonych kursów (schemat v12) i zgodność odczytów, lżejsze analizy, WAL, kopia cykliczna z retencją, alerty bez szumu, tabela darmowych API dla kontuzji i statystyk, ręczny wpis absencji, stan modeli reprezentacji i pucharów z opcjami |
 | [Raport TASK 015](docs/task_015_report.md) | Zegar dowodów i decyzje w jednym miejscu: wygaszanie challengerów identycznych z championem, pierwsze challengery v3 bez warunku 150 meczów i przegląd po starcie workera, n/300 z szacowaną datą, panel „Decyzje do podjęcia” z historią decyzji (schemat v11), opcja D jako przełącznik i jej skutki na kopii, wiek kursów (za mało danych) |
 | [Raport TASK 014](docs/task_014_report.md) | Trafność kuponów: oczekiwane kontra faktyczne (pech czy błąd modelu), pomiar bezpieczniejszego kuponu i opcjonalny profil PEWNY SOLO, mniej wspólnych porażek, wiek kursów i pułap w niedziele, pokrycie dolnej granicy (opcja D), kalibracja team totals |

@@ -299,7 +299,7 @@ def _scenario_settings(page, base: str, shot: Path) -> dict:
 
 def _scenario_decisions(page, base: str, shot: Path) -> dict:
     """TASK 015 §3: the Dashboard names the open decisions; Modele → "Decyzje do podjęcia"
-    shows all five decisions with their buttons."""
+    shows all six decisions with their buttons."""
     page.goto(f"{base}/?demo=1")
     _settle(page)
     found = {"dashboard_visible": page.get_by_text("Decyzje do podjęcia").count() > 0}
@@ -315,6 +315,7 @@ def _scenario_decisions(page, base: str, shot: Path) -> dict:
         "Profil PEWNY SOLO",
         "Limit różnicowania kuponów dnia",
         "Challengery czekające na dowody",
+        "1X2 reprezentacji w Kuponie dnia",
     )
     found["items_visible"] = [t for t in titles if page.get_by_text(t).count() > 0]
     found["ok"] = (

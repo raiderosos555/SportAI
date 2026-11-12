@@ -1,4 +1,4 @@
-"""DECYZJE DO PODJĘCIA (TASK 015 §3): the five decisions waiting for the user in one place.
+"""DECYZJE DO PODJĘCIA (TASK 015 §3): the decisions waiting for the user in one place.
 
 Modele i statystyki → widok „Decyzje do podjęcia” (the Dashboard shows the number of open
 decisions and a link here). Every decision: what it changes, the evidence in numbers, the
@@ -43,7 +43,7 @@ def settings_version() -> tuple:
 
 
 def items(*, live: bool = True) -> list[dict]:
-    """The five decisions (cached per data state, settings and minute)."""
+    """The decisions (cached per data state, settings and minute)."""
     db = c.store()
     version = (
         c.evaluation_version(db)
@@ -205,6 +205,8 @@ def _item(db, item: dict) -> None:
         _safe_solo(db, item)
     elif key == dec.LIMIT:
         _limit(db, item)
+    elif key == dec.NATIONAL_1X2:
+        _national_1x2(db, item)
     else:
         st.caption(
             "Bez przycisku aktywacji przed progiem 300 wspólnych meczów — aktywacja (po progu) "
@@ -295,3 +297,30 @@ def _limit(db, item: dict) -> None:
         icon=":material/filter_alt:",
     ):
         _done(dec.decide_limit(db, c.paths(), c.settings(), value=int(value), now=c.now()))
+
+
+def _national_1x2(db, item: dict) -> None:
+    accepted = bool(item["value"])
+    choice = st.radio(
+        "national · 1X2 po 90 minutach · konkretna wersja z okna selekcji",
+        ["Akceptuję tę wersję national 1X2", "Nie akceptuję / wycofuję zgodę"],
+        index=0 if accepted else 1,
+        key="decide_national_1x2_choice",
+    )
+    sure = st.checkbox(
+        "Potwierdzam decyzję tylko dla national · 1X2 (90 min)",
+        key="decide_national_1x2_sure",
+    )
+    accepting = choice.startswith("Akceptuję")
+    st.caption(
+        "Akceptacja nie zmienia progów kuponu. Każdy mecz nadal wymaga zamrożonej prognozy, "
+        "świeżego kursu STS i potwierdzonych zasad rozliczenia."
+    )
+    if st.button(
+        "Zapisz decyzję o reprezentacjach",
+        key="decide_national_1x2_go",
+        disabled=not sure or (accepting and not item.get("validated")),
+        icon=":material/verified:",
+    ):
+        dec.decide_national_1x2(db, c.paths(), accept=accepting, now=c.now())
+        _done()

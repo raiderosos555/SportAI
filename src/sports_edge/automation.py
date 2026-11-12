@@ -58,6 +58,7 @@ FREQUENCIES = {
     # TASK 009: international football (own sources, own limits)
     "uefa_results": [180, 360, 720, 1440],
     "national_results": [1440, 4320, 10080],
+    "national_shadow": [180, 360, 720, 1440],
     "cup_monitor": [60, 180, 360],
     "intl_completeness": [1440, 4320, 10080],
     "cup_training": [1440, 4320, 10080],
@@ -80,6 +81,7 @@ JOB_LABELS = {
     "training": "Trening challengera (po spełnieniu kryteriów)",
     "uefa_results": "Wyniki i terminarz pucharów UEFA (LM, LE, LK)",
     "national_results": "Wyniki reprezentacji (Liga Narodów, eliminacje, turnieje)",
+    "national_shadow": "Prognozy cieniowe i ocena 1X2 reprezentacji",
     "cup_monitor": "Nowe mecze pucharowe w ofercie STS i prognozy cieniowe",
     "intl_completeness": "Kontrola kompletności danych międzynarodowych",
     "cup_training": "Eksperymenty modeli pucharowych (po spełnieniu warunków)",
@@ -108,6 +110,7 @@ DEFAULTS = {
         "training": {"enabled": False},
         "uefa_results": {"enabled": True, "every_minutes": 360},
         "national_results": {"enabled": True, "every_minutes": 4320},
+        "national_shadow": {"enabled": True, "every_minutes": 360},
         "cup_monitor": {"enabled": True, "every_minutes": 180},
         "intl_completeness": {"enabled": True, "every_minutes": 1440},
         "cup_training": {"enabled": True, "every_minutes": 4320},
@@ -896,6 +899,50 @@ def job_national_results(store, paths, *, now, settings) -> JobOutcome:
     return _international(store, paths, now=now, cups=False, national=True)
 
 
+def job_national_shadow(store, paths, *, now, settings) -> JobOutcome:
+    """Forecast and evaluate from cached data only; this task never fetches a source."""
+    from sports_edge import international
+
+    forecast = international.national_shadow_forecasts(store, paths, now=now)
+    evaluation = international.national_shadow_evaluation(store, now=now)
+    offline = _app(paths).offline_mode
+    no_experiment = bool((forecast.get("skipped") or {}).get("no_experiment"))
+    skips = forecast.get("skipped") or {}
+    error_skips = {
+        "unmapped_competition",
+        "missing_start_time",
+        "invalid_start_time",
+        "incomplete_participants",
+        "ambiguous_fixture",
+    }
+    errors = bool(
+        forecast.get("unmatched")
+        or forecast.get("invalid")
+        or any(skips.get(name) for name in error_skips)
+    )
+    status = "skipped" if no_experiment else "partial" if errors else "ok"
+    reasons = [
+        "tryb offline — użyto tylko wcześniej zapisanych danych; bez pobierania źródeł"
+        if offline
+        else "zadanie lokalne — bez zapytań do zewnętrznych źródeł",
+    ]
+    reasons.extend(f"{key}: {value}" for key, value in skips.items())
+    return JobOutcome(
+        status,
+        "; ".join(reasons)[:300],
+        {
+            "processed": forecast.get("events", 0),
+            "new": forecast.get("stored", 0),
+            "kept": forecast.get("kept", 0),
+            "unmatched": forecast.get("unmatched", 0),
+            "invalid": forecast.get("invalid", 0),
+            "skipped": skips,
+            "evaluation": evaluation,
+            "source_status": "offline_cached_only" if offline else "no_external_fetch",
+        },
+    )
+
+
 def job_cup_monitor(store, paths, *, now, settings) -> JobOutcome:
     from sports_edge.international import shadow_forecasts
     from sports_edge.international_data import cup_monitor
@@ -1220,6 +1267,7 @@ JOBS: dict[str, Callable] = {
     "sts_offer": job_sts_offer,
     "uefa_results": job_uefa_results,
     "national_results": job_national_results,
+    "national_shadow": job_national_shadow,
     "cup_monitor": job_cup_monitor,
     "intl_completeness": job_intl_completeness,
     "cup_training": job_cup_training,

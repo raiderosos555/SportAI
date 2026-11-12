@@ -29,13 +29,15 @@ OPTION_D = "option_d"
 SAFE_SOLO = "safe_solo"
 LIMIT = "diversity_limit"
 CHALLENGERS = "challengers"
-KEYS = (GATE, OPTION_D, SAFE_SOLO, LIMIT, CHALLENGERS)
+NATIONAL_1X2 = "national_1x2"
+KEYS = (GATE, OPTION_D, SAFE_SOLO, LIMIT, CHALLENGERS, NATIONAL_1X2)
 TITLES = {
     GATE: "Bramka protokołu v3",
     OPTION_D: "Opcja D: granica „ostrożnie” podwójnej szansy Elo",
     SAFE_SOLO: "Profil PEWNY SOLO",
     LIMIT: "Limit różnicowania kuponów dnia",
     CHALLENGERS: "Challengery czekające na dowody",
+    NATIONAL_1X2: "1X2 reprezentacji w Kuponie dnia",
 }
 WARSAW = ZoneInfo("Europe/Warsaw")
 SAFE_PROFILE = "safe_solo"
@@ -82,6 +84,8 @@ RISKS = {
     "zmienić (progi nie). Mniej wspólnych porażek, ale czasem niższa szansa kuponu.",
     CHALLENGERS: "Aktywacja przed zebraniem 300 wspólnych meczów nie jest możliwa — za mało "
     "dowodów, by odróżnić lepszy model od przypadku.",
+    NATIONAL_1X2: "Po akceptacji 1X2 reprezentacji może pojawić się w puli kuponu. Błędne "
+    "mapowanie, nieaktualny kurs albo przyszła zmiana modelu ponownie ją zablokują.",
 }
 CHANGES = {
     GATE: "Po akceptacji challenger v3 może zostać aktywowany — osobnym kliknięciem w Uczeniu AI "
@@ -97,6 +101,8 @@ CHANGES = {
     LIMIT: "Ta sama selekcja najwyżej w N kuponach dnia (0 = bez limitu).",
     CHALLENGERS: "Stan dowodów challengerów w trybie cienia — decyzja o aktywacji pojawi się "
     "dopiero po progu.",
+    NATIONAL_1X2: "Użycie wyłącznie prognoz 1X2 po 90 minutach dla wersji reprezentacyjnej, "
+    "która spełnia bramki walidacji historycznej. Prognozy cieniowe pozostają poza kuponami.",
 }
 SOURCES = {"panel": "panel Decyzje do podjęcia", "settings": "Ustawienia"}
 # TASK 016 §7: saving a decision that changes nothing adds no row — the panel says so
@@ -331,6 +337,66 @@ def decide_limit(
     )
 
 
+def decide_national_1x2(
+    store: Store,
+    paths: AppPaths,
+    *,
+    accept: bool,
+    now: datetime,
+    source: str = "panel",
+) -> str:
+    """Append the user's decision for national 1X2 after 90 minutes and one exact version."""
+    from sports_edge import international
+
+    previous_row = last(store, NATIONAL_1X2)
+    previous = (previous_row.get("new") or {}) if previous_row else {"accepted": False}
+    report = international.latest(store)
+    status = international.market_status(report, "national")["1x2"]
+    if accept:
+        if not report or not status["validated"] or not status.get("best"):
+            raise ValueError("Akceptacja niemożliwa: 1X2 reprezentacji nie spełnia walidacji")
+        registered = international.register_national_model_version(store, paths, now=now)
+        new = {
+            "accepted": True,
+            "competition": "national",
+            "market": "1x2",
+            "period": "FT_90",
+            "experiment_id": report["experiment_id"],
+            "variant": status["best"],
+            "model_version_id": registered["model_version_id"],
+        }
+        summary = (
+            "Akceptacja national 1X2 po 90 minutach — "
+            f"wersja {new['model_version_id']} ({new['variant']}); osobna bramka kursu i kuponu"
+        )
+    else:
+        new = {
+            "accepted": False,
+            "competition": "national",
+            "market": "1x2",
+            "period": "FT_90",
+            "experiment_id": (report or {}).get("experiment_id"),
+            "variant": status.get("best"),
+            "model_version_id": previous.get("model_version_id"),
+        }
+        summary = "Wycofanie zgody na national 1X2 po 90 minutach — nowe użycie zablokowane"
+    return record(
+        store,
+        decision=NATIONAL_1X2,
+        previous={
+            "accepted": bool(previous.get("accepted")),
+            "experiment_id": previous.get("experiment_id"),
+            "variant": previous.get("variant"),
+            "model_version_id": previous.get("model_version_id"),
+        },
+        new=new,
+        summary=summary,
+        now=now,
+        source=source,
+        payload={"competition": "national", "market": "1x2", "period": "FT_90"},
+    )
+
+
 def log_settings_change(
     store: Store, paths: AppPaths, before: AppSettings, after: AppSettings, *, now: datetime
 ) -> list[str]:
@@ -554,6 +620,77 @@ def _challengers_item(compared: dict) -> dict:
     }
 
 
+def _national_1x2_item(store: Store, paths: AppPaths, *, now: datetime) -> dict:
+    from sports_edge import international
+
+    report = international.latest(store)
+    status = international.market_status(report, "national")["1x2"]
+    registry = international.national_registry_status(store, paths)
+    mine = last(store, NATIONAL_1X2)
+    previous = mine["new"] if mine else {}
+    experiment_id = (report or {}).get("experiment_id")
+    variant = status.get("best")
+    current = bool(
+        status["validated"]
+        and experiment_id
+        and previous.get("accepted")
+        and previous.get("experiment_id") == experiment_id
+        and previous.get("variant") == variant
+        and previous.get("model_version_id")
+        and international.active_national_version_id(store) == previous.get("model_version_id")
+    )
+    if not report:
+        state, opened = "brak eksperymentu — aktywacja zablokowana", False
+        evidence = ["Uruchom eksperymenty międzynarodowe po imporcie danych."]
+    elif not status["validated"]:
+        state, opened = "model niezwalidowany — aktywacja zablokowana", False
+        entry = report["national"].get("markets", {}).get("1x2", {})
+        evidence = [status["verdict"]]
+        for criterion in entry.get("decision", {}).get("criteria", []):
+            evidence.append(
+                f"{criterion['name']}: {'spełnione' if criterion['passed'] else 'niespełnione'}"
+                + (f" ({criterion['value']})" if criterion.get("value") is not None else "")
+            )
+    elif registry["status"] != "validated":
+        opened = False
+        state = "rejestr modelu nie spełnia polityki — aktywacja zablokowana"
+        evidence = [status["verdict"], *registry["reasons"]]
+    else:
+        opened = True
+        state = "aktywne po Twojej decyzji" if current else "czeka na Twoją decyzję"
+        evidence = [status["verdict"], f"Wariant wybrany w oknie selekcji: {variant}."]
+        if previous.get("accepted") and not current:
+            evidence.append(
+                "Poprzednia decyzja dotyczy innej wersji eksperymentu i nie jest użyta."
+            )
+    if report:
+        block = report["national"].get("markets", {}).get("1x2", {})
+        selection = (block.get("windows") or {}).get("selection") or {}
+        chosen = selection.get(variant or "", {})
+        evidence.append(
+            f"Okno selekcji: {chosen.get('n', 0)} meczów; ECE {chosen.get('ece', 'brak danych')}."
+        )
+        from sports_edge.international import national_shadow_evaluation
+
+        shadow = national_shadow_evaluation(store, now=now)
+        variant_shadow = shadow["by_variant"].get(variant or "", {})
+        evidence.append(
+            f"Cień prospektywny {variant or '—'}: {variant_shadow.get('n', 0)} rozliczonych "
+            "meczów; dane nie aktywują modelu automatycznie."
+        )
+    return {
+        "key": NATIONAL_1X2,
+        "title": TITLES[NATIONAL_1X2],
+        "value": current,
+        "state": state,
+        "open": opened,
+        "changes": CHANGES[NATIONAL_1X2],
+        "evidence": evidence,
+        "risk": RISKS[NATIONAL_1X2],
+        "validated": bool(status["validated"] and registry["status"] == "validated"),
+    }
+
+
 def panel(
     store: Store,
     paths: AppPaths,
@@ -563,7 +700,7 @@ def panel(
     compared: dict | None = None,
     live_option_d: dict | None = None,
 ) -> list[dict]:
-    """The five decisions with their state, evidence and risk — read only. ``compared``:
+    """The six decisions with their state, evidence and risk — read only. ``compared``:
     scope → ``retraining.comparison`` (computed when not given)."""
     from sports_edge import retraining
     from sports_edge.services import MODEL_SCOPES
@@ -576,6 +713,7 @@ def panel(
         _safe_solo_item(store, settings),
         _limit_item(store, paths, settings),
         _challengers_item(compared),
+        _national_1x2_item(store, paths, now=now),
     ]
 
 

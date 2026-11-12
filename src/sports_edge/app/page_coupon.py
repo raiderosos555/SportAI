@@ -8,7 +8,7 @@ import streamlit as st
 
 from sports_edge import insights as ins
 from sports_edge.analysis.edge_engine import BOUND_LABELS, bound_of
-from sports_edge.app import cart, coupon_view, ui
+from sports_edge.app import cart, coupon_view, international_ui, ui
 from sports_edge.app import common as c
 from sports_edge.repository import offer_days
 from sports_edge.services import (
@@ -126,12 +126,13 @@ def _run(db, settings, days, refresh_offer, refresh_results):
             box.write(phase)
 
     try:
+        analysis_time = c.now()
         run = run_analysis(
             db,
             c.paths(),
             settings,
             days,
-            now=c.now(),
+            now=analysis_time,
             refresh_offer=refresh_offer,
             refresh_results=refresh_results,
             data_kinds=c.data_kinds(),
@@ -141,6 +142,18 @@ def _run(db, settings, days, refresh_offer, refresh_results):
         box.update(label="Analiza przerwana", state="error", expanded=True)
         ui.error_state("Analiza nie powiodła się", f"{type(error).__name__}: {error}")
         return None
+    # Make today's national research forecasts visible immediately after analysis; they remain
+    # append-only shadow observations and never enter coupon candidates. A shadow failure does
+    # not invalidate a completed coupon analysis.
+    try:
+        from sports_edge import international
+
+        international.national_shadow_forecasts(db, c.paths(), now=analysis_time)
+    except Exception as error:  # noqa: BLE001 — report shadow failure without losing analysis
+        st.warning(
+            "Analiza kuponu się zakończyła, ale prognozy reprezentacji nie zostały odświeżone: "
+            f"{type(error).__name__}."
+        )
     made = sum(
         1
         for r in run.runs.values()
@@ -232,6 +245,7 @@ def _day(db, settings, rules, day, run, online) -> None:
             st.caption(
                 "Ostatnio zapisane propozycje dla tego dnia — kliknij „Analizuj”, aby odświeżyć."
             )
+    international_ui.national_coupon_block(db, day, now, candidates)
     # TASK 013 §5.3: the selection nearest to a WYSOKA TRAFNOŚĆ coupon (read only)
     high = rules.profiles.get(HIGH_HIT)
     closest = (

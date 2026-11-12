@@ -713,7 +713,7 @@ def test_migration_to_v11_backs_up_and_keeps_every_row(tmp_path):
 # 9 ---------------------------------------------------------------- interface (AppTest)
 
 
-def test_dashboard_shows_the_decisions_and_the_panel_has_all_five(app_paths):
+def test_dashboard_shows_the_decisions_and_the_panel_has_all_six(app_paths):
     pytest.importorskip("streamlit")
     from streamlit.testing.v1 import AppTest
 
@@ -725,7 +725,7 @@ def test_dashboard_shows_the_decisions_and_the_panel_has_all_five(app_paths):
     dashboard.run()
     assert not dashboard.exception, dashboard.exception
     text = " ".join(m.value for m in dashboard.markdown)
-    assert "Decyzje do podjęcia" in text and "otwarte: 4 z 5" in text
+    assert "Decyzje do podjęcia" in text and "otwarte: 4 z 6" in text
     models = AppTest.from_string(
         "from sports_edge.app.page_models import models_page; models_page()",
         default_timeout=90,

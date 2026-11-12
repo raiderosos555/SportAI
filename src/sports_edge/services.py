@@ -392,12 +392,18 @@ def challenger_versions(store: Store) -> dict[str, dict[str, dict]]:
 
 
 def active_version_ids(store: Store) -> set[str]:
-    return {
+    found = {
         row["version_id"]
         for pair in active_versions(store).values()
         for row in pair.values()
         if row is not None
     }
+    from sports_edge.international import active_national_version_id
+
+    national = active_national_version_id(store)
+    if national:
+        found.add(national)
+    return found
 
 
 def scope_has_data(store: Store, scope: tuple[str, ...], minimum: int = 500) -> bool:
@@ -452,7 +458,17 @@ def generate_predictions(
                 identities=team_identities(paths),
             )
             out["shadow"][name] = {k: found[k] for k in ("saved", "kept")}
-    if not out["scopes"]:
+    from sports_edge.international import national_serving_predictions
+
+    national = national_serving_predictions(store, paths, now=now)
+    out["scopes"]["national"] = {k: national.get(k, 0) for k in ("saved", "kept")}
+    out["national"] = national
+    out["saved"] += national.get("saved", 0)
+    out["kept"] += national.get("kept", 0)
+    out["skipped"].extend(national.get("unmatched", []))
+    if not any(scope != "national" for scope in out["scopes"]) and not (
+        national.get("saved") or national.get("kept")
+    ):
         raise ValueError("Brak zarejestrowanego modelu — uruchom eksperyment")
     return out
 
@@ -2032,6 +2048,11 @@ def prediction_preference(store: Store, *, goals: dict[str, dict] | None = None)
         out.update({("1x2", code): family for code in scope})
         if name == "core" or "1x2" not in out:
             out["1x2"] = family
+    from sports_edge.international import FRIENDLY, NATIONAL_OFFICIAL, active_national_version_id
+
+    if active_national_version_id(store):
+        for competition in (*NATIONAL_OFFICIAL, FRIENDLY):
+            out[("1x2", competition)] = "national_1x2"
     return out
 
 

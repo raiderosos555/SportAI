@@ -171,6 +171,7 @@ def save_fixtures(store: Store, family: str, competition: str, records, *, now: 
                 "status": r.status,
                 "source_event_id": r.source_event_id,
                 "stage": r.details.get("stage"),
+                "venue_country": r.details.get("venue_country"),
             }
             for r in records
             if r.status == "scheduled" and r.start_at is not None and r.start_at > now
@@ -373,6 +374,11 @@ def unmapped_headers(store: Store) -> list[dict]:
         "EURO",
         "REPREZENTAC",
         "TOWARZYSKIE",
+        "MIĘDZYNARODOWE",
+        "KING'S CUP",
+        "SAFF",
+        "CONCACAF",
+        "AFRYKI",
     )
     return [
         {"header": r["league"], "events": r["n"], "first": r["first"], "last": r["last"]}
