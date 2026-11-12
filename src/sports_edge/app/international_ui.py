@@ -68,18 +68,18 @@ def event_block(db, event_id: str, now: datetime) -> None:
     ui.section(view["name"], f"{view['category_label']} · wyniki w bazie: {view['results']}")
     shadow = view.get("shadow")
     validated = [m for m, v in view["status"].items() if v["validated"]]
-    if shadow and view["category"] == "national":
-        p = shadow["probabilities"]
-        points = [
-            f"1X2 (90 min): 1 {p['home']:.0%} · X {p['draw']:.0%} · 2 {p['away']:.0%}",
-            f"Wariant cieniowy: {international.VARIANT_LABELS.get(shadow.get('variant'), shadow.get('variant', 'brak danych'))}.",
-            f"Boisko: {shadow.get('venue_status', 'brak danych')}.",
-        ]
-        points.append(
-            "Prognoza cieniowa — pozostaje poza kuponami. Walidacja historyczna i decyzja "
-            "użytkownika są osobnymi bramkami."
+    if view["category"] == "national":
+        # TASK 018: the forecast above comes from the national scope of the league path
+        ui.explanation(
+            "Reprezentacje — ta sama ścieżka co ligi",
+            [
+                "Prognoza modelu (Elo / Dixon–Coles zakresu „reprezentacje”), bramka per rynek "
+                "i progi profili są takie same jak w ligach.",
+                "Boisko: przewaga gospodarza tylko wtedy, gdy terminarz jednoznacznie wskazuje "
+                "gospodarza; w przeciwnym razie miejsce meczu jest nieznane i bez przewagi.",
+            ],
+            tone="info",
         )
-        ui.explanation("Prognoza reprezentacji w trybie cienia", points, tone="info")
     elif shadow:
         markets = shadow["markets"]
         points = []
@@ -414,7 +414,8 @@ def models_block(db) -> None:
 
 
 def national_coupon_block(db, day: str, now: datetime, candidates=()) -> None:
-    """National STS matches as analysis only; shadow observations never enter a coupon pool."""
+    """International STS matches of competitions WITHOUT data (TASK 018: the others follow
+    the league path and are shown with the leagues)."""
     from sports_edge import international
 
     codes = (*international.NATIONAL_OFFICIAL, international.FRIENDLY)
@@ -436,86 +437,30 @@ def national_coupon_block(db, day: str, now: datetime, candidates=()) -> None:
         ORDER BY start_at,id""",
         (day, day, *headers),
     )
-    if not events:
-        return
-    ui.section(
-        "Reprezentacje — analiza poza kuponami",
-        "prognozy cieniowe są eksperymentalne i nie wchodzą do kuponu; wynik 1X2 po 90 minutach",
-    )
+    # TASK 018: matches of national competitions with history follow the league path (their
+    # forecasts and selections are in "Najlepsze typy" and the coupons); only competitions
+    # without data in the catalogue are listed here, with the reason.
     statuses = []
     for event in events:
         league = for_sts_league(event.get("league") or "", event.get("sport"))
-        candidates_for_event = [
-            item for item in candidates if item.event_id == event["id"] and item.market_key == "1x2"
-        ]
-        if league is None or league.category != "national":
-            statuses.append(
-                [
-                    event.get("name_raw")
-                    or f"{event.get('home') or 'brak danych'} – {event.get('away') or 'brak danych'}",
-                    "wymaga mapowania rozgrywek",
-                    f"Nagłówek STS „{event.get('league') or 'brak danych'}” nie ma potwierdzonego wpisu w katalogu.",
-                    "—",
-                ]
-            )
+        if league is not None and league.category == "national":
             continue
-        view = international.event_view(db, c.paths(), event, now=now)
-        shadow_text = "brak prognozy cieniowej"
-        shadow = (view or {}).get("shadow")
-        probabilities = (shadow or {}).get("probabilities") or {}
-        if all(key in probabilities for key in ("home", "draw", "away")):
-            shadow_text = (
-                f"{shadow.get('variant', 'wariant')} · "
-                f"1 {probabilities['home']:.0%} / "
-                f"X {probabilities['draw']:.0%} / "
-                f"2 {probabilities['away']:.0%}"
-            )
-        if view is None:
-            state, detail = "brak mapowania", "Nie udało się sklasyfikować rozgrywek."
-        elif view.get("note"):
-            state, detail = "wymaga mapowania drużyn", view["note"]
-        else:
-            report = international.latest(db)
-            market = international.market_status(report, "national")["1x2"]
-            readiness = (
-                international.national_registry_status(db, c.paths())
-                if report and market["validated"]
-                else None
-            )
-            if not report:
-                state, detail = "brak eksperymentu", "Brak raportu walk-forward reprezentacji."
-            elif not market["validated"]:
-                state, detail = "model niezwalidowany", market["verdict"]
-            elif readiness["status"] != "validated":
-                state = "zablokowane przez politykę rejestru modelu"
-                detail = "; ".join(readiness["reasons"])
-            elif not international.active_national_version_id(db):
-                state, detail = (
-                    "czeka na decyzję",
-                    "Walidacja przeszła; brak zgody dla tej wersji national · 1X2 (90 min).",
-                )
-            else:
-                candidate = next(
-                    (item for item in candidates_for_event if item.p_model is not None), None
-                )
-                if candidate is None:
-                    state = "brak prognozy lub kursu 1X2"
-                    detail = next(
-                        (warning for item in candidates_for_event for warning in item.warnings),
-                        "Brak pasującej prognozy przedmeczowej lub oferty rynku 1X2.",
-                    )
-                elif candidate.reasons:
-                    state, detail = "zablokowane przez warunki kuponu", "; ".join(candidate.reasons)
-                else:
-                    state, detail = (
-                        "kandydat po bramce modelu",
-                        "Nadal obowiązują świeżość kursu, reguła STS i progi profilu.",
-                    )
-        title = f"{event.get('home') or 'brak danych'} – {event.get('away') or 'brak danych'}"
-        if event.get("start_at"):
-            title += f" · {event['start_at']}"
-        statuses.append([title, state, detail, shadow_text])
-    _table(ui.table(["Mecz", "Status", "Przyczyna", "Prognoza cieniowa (1/X/2)"], statuses))
+        statuses.append(
+            [
+                event.get("name_raw")
+                or f"{event.get('home') or 'brak danych'} – {event.get('away') or 'brak danych'}",
+                "brak danych — bez prognozy",
+                f"Nagłówek STS „{event.get('league') or 'brak danych'}” nie ma historii wyników "
+                "w katalogu rozgrywek (tak samo jak liga bez danych).",
+            ]
+        )
+    if not statuses:
+        return
+    ui.section(
+        "Reprezentacje — rozgrywki bez danych",
+        "mecze reprezentacji z historią są analizowane jak ligi (Najlepsze typy i kupony)",
+    )
+    _table(ui.table(["Mecz", "Status", "Przyczyna"], statuses))
 
 
 def _national_coverage(db, rows: list[dict], now: datetime) -> None:

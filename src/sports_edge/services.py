@@ -60,6 +60,7 @@ from sports_edge.paper import (
     settle_coupon,
 )
 from sports_edge.pdf.engine import ParseError, parse_pdf
+from sports_edge.pools import NATIONAL_CODES
 from sports_edge.probability_lab import (
     FAMILY as GOALS_FAMILY,
 )
@@ -107,9 +108,24 @@ WARSAW = ZoneInfo("Europe/Warsaw")
 # model for all 12 leagues was worse calibrated (TASK 006 experiment, 01.11.2026).
 CORE_COMPETITIONS = ("en.1", "de.1", "es.1", "it.1", "fr.1")
 EXTENDED_COMPETITIONS = ("en.2", "nl.1", "pt.1", "be.1", "de.2", "tr.1", "pl.1")
-MODEL_SCOPES = {"core": CORE_COMPETITIONS, "extended": EXTENDED_COMPETITIONS}
-SCOPE_LABELS = {"core": "5 czołowych lig", "extended": "7 lig dodanych w TASK 006"}
+# TASK 018: national teams follow the same path as the leagues — one more scope with its own
+# Elo and Dixon–Coles versions, the same registry, protocol, calibration, per-market gate and
+# coupon builder. Its competitions form ONE rating pool (``pools``); friendlies are part of
+# it (TASK 017: the variants using friendlies had the lower selection log loss).
+NATIONAL_SCOPE = NATIONAL_CODES
+MODEL_SCOPES = {
+    "core": CORE_COMPETITIONS,
+    "extended": EXTENDED_COMPETITIONS,
+    "national": NATIONAL_SCOPE,
+}
+SCOPE_LABELS = {
+    "core": "5 czołowych lig",
+    "extended": "7 lig dodanych w TASK 006",
+    "national": "reprezentacje",
+}
+# club leagues (freshness, sources); MODELLED_COMPETITIONS: everything a served model covers
 RESEARCH_COMPETITIONS = CORE_COMPETITIONS + EXTENDED_COMPETITIONS
+MODELLED_COMPETITIONS = RESEARCH_COMPETITIONS + NATIONAL_SCOPE
 RESEARCH_SPLIT = Split(validation_from="2022-07-01", holdout_from="2024-07-01")
 # TASK 007 protocol v2: the final holdout (from 2024-07-01) never decides anything. The
 # added leagues have results only from 2021/22 (Poland and Turkey from 2022/23), so their
@@ -126,6 +142,15 @@ PROTOCOLS = {
         calibration_from="2023-01-01",
         selection_from="2023-07-01",
         holdout_from="2024-07-01",
+    ),
+    # TASK 018: national teams play ~250–350 matches a year, so every window spans one and
+    # a half to two years (each has at least 300 matches); the selection window is the one
+    # of TASK 017 (2023–2024) and the final holdout (from 2025) never decides anything.
+    "national": Split(
+        validation_from="2019-07-01",
+        calibration_from="2021-07-01",
+        selection_from="2023-01-01",
+        holdout_from="2025-01-01",
     ),
 }
 # What the registered Elo model forecasts (double chance follows from the same 1X2).
@@ -398,11 +423,6 @@ def active_version_ids(store: Store) -> set[str]:
         for row in pair.values()
         if row is not None
     }
-    from sports_edge.international import active_national_version_id
-
-    national = active_national_version_id(store)
-    if national:
-        found.add(national)
     return found
 
 
@@ -458,17 +478,7 @@ def generate_predictions(
                 identities=team_identities(paths),
             )
             out["shadow"][name] = {k: found[k] for k in ("saved", "kept")}
-    from sports_edge.international import national_serving_predictions
-
-    national = national_serving_predictions(store, paths, now=now)
-    out["scopes"]["national"] = {k: national.get(k, 0) for k in ("saved", "kept")}
-    out["national"] = national
-    out["saved"] += national.get("saved", 0)
-    out["kept"] += national.get("kept", 0)
-    out["skipped"].extend(national.get("unmatched", []))
-    if not any(scope != "national" for scope in out["scopes"]) and not (
-        national.get("saved") or national.get("kept")
-    ):
+    if not out["scopes"]:
         raise ValueError("Brak zarejestrowanego modelu — uruchom eksperyment")
     return out
 
@@ -1412,7 +1422,7 @@ def forecast_coverage(store: Store, *, now: datetime, days: Sequence[str]) -> di
             "AND start_at IS NOT NULL AND start_at > ?",
             (*days, now.isoformat()),
         )
-        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+        if league_code(e["league"], e["sport"]) in MODELLED_COMPETITIONS
     ]
     served = active_version_ids(store)
     covered = set()
@@ -2048,11 +2058,6 @@ def prediction_preference(store: Store, *, goals: dict[str, dict] | None = None)
         out.update({("1x2", code): family for code in scope})
         if name == "core" or "1x2" not in out:
             out["1x2"] = family
-    from sports_edge.international import FRIENDLY, NATIONAL_OFFICIAL, active_national_version_id
-
-    if active_national_version_id(store):
-        for competition in (*NATIONAL_OFFICIAL, FRIENDLY):
-            out[("1x2", competition)] = "national_1x2"
     return out
 
 

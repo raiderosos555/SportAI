@@ -51,6 +51,16 @@ from sports_edge.models import calibration
 from sports_edge.models.elo import Elo, fit_draw_margin, rating_differences
 from sports_edge.models.goals import GoalsMatch, fit, markets
 from sports_edge.models.registry import register_version
+from sports_edge.pools import (
+    NATIONAL_CODES,
+    NATIONAL_POOL,
+    dc_window_days,
+    elo_grid,
+    group_by_pool,
+    neutral_of,
+    pools,
+)
+from sports_edge.pools import half_lives as national_half_lives
 from sports_edge.probability_lab import (
     BINARY_FAMILIES,
     FAMILY,
@@ -66,7 +76,6 @@ from sports_edge.probability_lab import (
     _family_report,
     _items,
     _league_gates,
-    _league_matches,
     _multiclass,
     _outcome,
     _summary,
@@ -349,6 +358,8 @@ def elo_train(matches, windows: RollingWindows, grid: dict = GRID) -> dict:
     on the calibration window, 1X2 log loss on the selection window; the lowest wins.
     ``matches`` must be the results known at T (scoped team keys)."""
     candidates, best = [], None
+    if grid is GRID:  # TASK 018: national teams have their own grid (config/national_scope)
+        grid = elo_grid({m.competition for m in matches}, GRID)
     for k in grid["k"]:
         for hfa in grid["home_advantage"]:
             parts = _parts(rating_differences(matches, Elo(k=k, home_advantage=hfa)), windows)
@@ -525,7 +536,7 @@ def refit_date(match_date: str) -> str:
 def prepare(rows: list[dict]) -> dict[str, dict]:
     """Results of every league sorted by date, with the running maximum of availability."""
     out = {}
-    for code, mine in _league_matches(rows).items():
+    for code, mine in group_by_pool(rows).items():  # TASK 018: national teams = one pool
         mine = sorted(mine, key=lambda r: (r["match_date"], r["id"]))
         available = [datetime.fromisoformat(r["available_at"]) for r in mine]
         running, top = [], None
@@ -536,7 +547,14 @@ def prepare(rows: list[dict]) -> dict[str, dict]:
             "rows": mine,
             "dates": [r["match_date"] for r in mine],
             "goals": [
-                GoalsMatch(r["match_date"], r["home"], r["away"], r["home_score"], r["away_score"])
+                GoalsMatch(
+                    r["match_date"],
+                    r["home"],
+                    r["away"],
+                    r["home_score"],
+                    r["away_score"],
+                    neutral_of(r),
+                )
                 for r in mine
             ],
             "available": available,
@@ -557,7 +575,12 @@ def _league_fit(league: dict, code: str, fit_date: str, half_life: float, cutoff
         key = (code, fit_date, half_life, keep)
         used = [league["goals"][i] for i in keep]
     if key not in cache:
-        cache[key] = fit(used, fit_date=fit_date, half_life_days=half_life)
+        cache[key] = fit(
+            used,
+            fit_date=fit_date,
+            half_life_days=half_life,
+            window_days=dc_window_days(code, WINDOW_DAYS),  # TASK 018: national pool
+        )
     return key, cache[key]
 
 
@@ -578,7 +601,7 @@ def dc_forecasts(
                 continue
             memo = ("markets", row["id"], key)
             if memo not in cache:
-                matrix = model.score_matrix(row["home"], row["away"])
+                matrix = model.score_matrix(row["home"], row["away"], neutral_of(row))
                 cache[memo] = None if matrix is None else markets(matrix, LINES)
             if cache[memo] is not None:
                 out[row["id"]] = cache[memo]
@@ -705,6 +728,8 @@ def dc_train(
     from sports_edge import prospective_eval as pe
 
     rolling = rolling or RollingPolicy()
+    if half_lives is HALF_LIVES and set(prepared) == {NATIONAL_POOL}:
+        half_lives = national_half_lives(NATIONAL_CODES, HALF_LIVES)  # TASK 018: own grid
     if rule not in HALF_LIFE_RULES:
         raise ValueError(f"Nieznana reguła okresu połowicznego zaniku: {rule}")
     if rule == "fixed" and previous is None:
@@ -865,7 +890,7 @@ def dc_report(
         "selection": trained["tuning"],
         "refit_days": REFIT_DAYS,
         "refit_anchor": REFIT_ANCHOR,
-        "window_days": WINDOW_DAYS,
+        "window_days": dc_window_days(pools(competitions)[0], WINDOW_DAYS),
         "n": {"calibration": len(trained["calibration_raw"]), "selection": len(view)},
         "families": families,
         "predictive": predictive,

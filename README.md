@@ -61,7 +61,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 016](docs/task_016_report.md).
+Stan i ograniczenia: [raport TASK 018](docs/task_018_report.md).
 
 ## Uruchomienie na Windows
 
@@ -303,6 +303,7 @@ src/sports_edge/
 
 | Dokument | Zawartość |
 |---|---|
+| [Raport TASK 018](docs/task_018_report.md) | Reprezentacje dokładnie tak jak ligi: zakres modelu „reprezentacje” (Elo i Dixon–Coles tym samym protokołem v2, kalibracja i bramka per rynek z tymi samymi progami), prognozy w `predictions`, kandydaci i kupony w kreatorze; usunięta dodatkowa bramka rejestru z TASK 017; miejsce meczu z terminarza, inaczej bez przewagi gospodarza; regresja lig bez zmian |
 | [Raport TASK 017](docs/task_017_report.md) | Prognozy reprezentacji w trybie cienia (wykonane przez Codex, zweryfikowane na TASK 016): nagłówki STS Ligi Narodów i meczów towarzyskich, walk-forward 1X2, worker cieniowy, decyzja „1X2 reprezentacji” zablokowana do czasu walidacji; kuponów reprezentacji nadal nie ma |
 | [Raport TASK 016](docs/task_016_report.md) | Higiena danych: co naprawdę zajmuje bazę (pomiar na kopii), potwierdzenia zamiast powtórzonych kursów (schemat v12) i zgodność odczytów, lżejsze analizy, WAL, kopia cykliczna z retencją, alerty bez szumu, tabela darmowych API dla kontuzji i statystyk, ręczny wpis absencji, stan modeli reprezentacji i pucharów z opcjami |
 | [Raport TASK 015](docs/task_015_report.md) | Zegar dowodów i decyzje w jednym miejscu: wygaszanie challengerów identycznych z championem, pierwsze challengery v3 bez warunku 150 meczów i przegląd po starcie workera, n/300 z szacowaną datą, panel „Decyzje do podjęcia” z historią decyzji (schemat v11), opcja D jako przełącznik i jej skutki na kopii, wiek kursów (za mało danych) |

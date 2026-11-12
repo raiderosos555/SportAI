@@ -9,13 +9,12 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from sports_edge import automation, decisions, international, services
-from sports_edge.analysis.coupon_builder import eligibility
 from sports_edge.analysis.edge_engine import Candidate
 from sports_edge.datasources.competitions import for_sts_league
 from sports_edge.ingestion.types import canonical, digest, iso
 from sports_edge.models.registry import latest_predictions
 from sports_edge.offers.model import OfferKind, OfferRow, OfferSelection, ParseResult
-from sports_edge.repository import event_id, import_offer, offer_table
+from sports_edge.repository import event_id, import_offer
 from sports_edge.results_engine import effective_results
 
 NOW = datetime(2026, 11, 6, 12, tzinfo=UTC)
@@ -517,7 +516,9 @@ def test_conflicting_approved_alias_targets_require_manual_mapping(store, app_pa
     monkeypatch.setattr(international_ui, "_table", captured.append)
     international_ui.national_coupon_block(store, day, NOW, [])
     shown = " ".join(map(str, captured))
-    assert "niejednoznaczne mapowanie drużyny" in shown
+    # TASK 018: competitions with history follow the league path; the block lists only
+    # competitions without data
+    assert shown == ""
     assert (
         international.national_shadow_of(store, event_id, before=NOW + timedelta(hours=4)) is None
     )
@@ -609,19 +610,17 @@ def test_decision_is_specific_to_national_1x2_and_model_version_then_withdrawn(s
     _seed_history(store)
     _valid_report(store)
     assert international.active_national_version_id(store) is None
+    # TASK 018: no extra registry gate — national markets follow the league gates
     allowed, reason = international.generator_allowed(store, "fifa.friendly", "1x2")
-    assert not allowed and "czeka na decyzję" in reason
+    assert allowed and "jak w ligach" in reason
 
     decision_id = decisions.decide_national_1x2(store, app_paths, accept=True, now=NOW)
     active = international.active_national_version_id(store)
     assert active
     assert decisions.last(store, decisions.NATIONAL_1X2)["id"] == decision_id
     assert international.generator_allowed(store, "uefa.nl", "1x2", model_version_id=active)[0]
-    assert not international.generator_allowed(
+    assert international.generator_allowed(
         store, "uefa.nl", "double_chance", model_version_id=active
-    )[0]
-    assert not international.generator_allowed(
-        store, "uefa.nl", "1x2", model_version_id="wrong-version"
     )[0]
     previous_rows = store.scalar("SELECT COUNT(*) FROM user_decisions")
     predictions_before = store.scalar("SELECT COUNT(*) FROM predictions")
@@ -642,26 +641,19 @@ def test_market_benchmark_policy_is_not_relaxed_for_national_activation(store, a
     assert decisions.last(store, decisions.NATIONAL_1X2) is None
 
 
-def test_only_approved_frozen_90_minute_prediction_reaches_existing_coupon_checks(
-    store, app_paths, profiles, rules
-):
+def test_legacy_approved_national_version_is_not_a_second_serving_path(store, app_paths):
+    """TASK 018: national forecasts are served by the national scope of the league path; the
+    TASK 017 approval path still records its frozen forecasts, but they are not served."""
     _seed_history(store)
     _valid_report(store)
     event_id, day = _sts_offer(store)
     assert international.national_serving_predictions(store, app_paths, now=NOW)["stored"] == 0
-    assert international.generator_allowed(store, "uefa.nl", "1x2")[0] is False
     decisions.decide_national_1x2(store, app_paths, accept=True, now=NOW)
     version_id = international.active_national_version_id(store)
     found = international.national_serving_predictions(store, app_paths, now=NOW)
     assert found["stored"] == 1
     assert international.national_serving_predictions(store, app_paths, now=NOW)["kept"] == 1
-    assert (
-        store.scalar(
-            "SELECT COUNT(*) FROM stat_observations WHERE kind=?",
-            (international.NATIONAL_SHADOW_KIND,),
-        )
-        == 0
-    )
+    assert version_id not in services.active_version_ids(store)
     predictions = latest_predictions(
         store,
         as_of=NOW,
@@ -669,59 +661,7 @@ def test_only_approved_frozen_90_minute_prediction_reaches_existing_coupon_check
         prefer=services.prediction_preference(store),
         offer_dates=[day],
     )
-    assert (event_id, "1x2", "FT", None) in predictions
-    prediction = predictions[(event_id, "1x2", "FT", None)]
-    assert prediction["model_version_id"] == version_id
-    assert prediction["inputs"]["period_scope"] == "FT_90"
-    assert prediction["prediction_id"] if "prediction_id" in prediction else prediction["id"]
-    evaluated = services.with_predictive_status(store, predictions)
-    rows = offer_table(store, day=day)
-    from sports_edge.analysis.edge_engine import evaluate
-    from sports_edge.services import policy
-
-    candidates = evaluate(
-        rows,
-        predictions=evaluated,
-        profile=profiles["sts"],
-        market_rules=rules,
-        policy=policy(app_paths),
-        now=NOW,
-        max_age=timedelta(minutes=180),
-        stake=Decimal("10"),
-    )
-    national = international.gate_candidates(store, candidates)
-    chosen = [item for item in national if item.event_id == event_id]
-    assert chosen and all(
-        item.p_model is not None and item.prediction_id == prediction["id"] for item in chosen
-    )
-
-    # Even an approved forecast is blocked by existing freshness and rule gates.
-    stale_event, stale_day = _sts_offer(store, home=TEAMS[2], away=TEAMS[3], stale=True)
-    assert international.national_serving_predictions(store, app_paths, now=NOW)["stored"] == 1
-    stale_rows = offer_table(store, day=stale_day)
-    stale_prediction = latest_predictions(
-        store,
-        as_of=NOW,
-        versions=services.active_version_ids(store),
-        prefer=services.prediction_preference(store),
-        offer_dates=[stale_day],
-    )
-    stale_candidates = evaluate(
-        stale_rows,
-        predictions=services.with_predictive_status(store, stale_prediction),
-        profile=profiles["sts"],
-        market_rules=rules,
-        policy=policy(app_paths),
-        now=NOW,
-        max_age=timedelta(minutes=180),
-        stake=Decimal("10"),
-    )
-    stale = next(item for item in stale_candidates if item.event_id == stale_event)
-    assert stale.prediction_id
-    assert eligibility(stale, 10.0) == "kurs niepotwierdzony (stara migawka)"
-    assert not international.generator_allowed(
-        store, "uefa.nl", "1x2", model_version_id="another-version"
-    )[0]
+    assert (event_id, "1x2", "FT", None) not in predictions
 
 
 def test_unknown_competitions_and_names_are_not_fuzzy_matched(store, app_paths, monkeypatch):
@@ -762,7 +702,7 @@ def test_unknown_competitions_and_names_are_not_fuzzy_matched(store, app_paths, 
     monkeypatch.setattr(international_ui, "_table", captured.append)
     international_ui.national_coupon_block(store, unsupported_day, NOW, [])
     shown = " ".join(map(str, captured))
-    assert "wymaga mapowania rozgrywek" in shown
+    assert "brak danych — bez prognozy" in shown
     assert "KING'S CUP" in shown
     assert any(
         item["header"] == "MIĘDZYNARODOWE - KING'S CUP"
@@ -791,11 +731,8 @@ def test_synthetic_coupon_status_ui_shows_shadow_and_missing_decision(
     )
     monkeypatch.setattr(international_ui, "_table", captured.append)
     international_ui.national_coupon_block(store, day, NOW, [])
-    shown = " ".join(map(str, captured))
-    assert "czeka na decyzję" in shown
-    assert "brak zgody" in shown
-    assert "Prognoza cieniowa (1/X/2)" in shown
-    assert "N1 · 1 44% / X 28% / 2 28%" in shown
+    # TASK 018: no separate "outside the coupons" table for competitions with history
+    assert " ".join(map(str, captured)) == ""
 
     captured.clear()
     monkeypatch.setattr(international_ui.st, "markdown", captured.append)
@@ -823,7 +760,7 @@ def test_synthetic_coupon_status_ui_shows_shadow_and_missing_decision(
         NOW,
         [_candidate(event_id=_event_id, model_version_id=version_id, prediction_id="p-1")],
     )
-    assert "kandydat po bramce modelu" in " ".join(map(str, captured))
+    assert " ".join(map(str, captured)) == ""
 
 
 def test_no_schema_migration_or_user_state_changes_are_needed(store):

@@ -26,6 +26,7 @@ class GoalsMatch:
     away: str
     home_goals: int
     away_goals: int
+    neutral: bool = False  # TASK 018: no home advantage (neutral or unknown venue)
 
 
 @dataclass(frozen=True)
@@ -40,16 +41,17 @@ class GoalsFit:
     fit_date: str
     games: dict[str, int]
 
-    def rates(self, home: str, away: str) -> tuple[float, float] | None:
+    def rates(self, home: str, away: str, neutral: bool = False) -> tuple[float, float] | None:
         if home not in self.teams or away not in self.teams:
             return None
         i, j = self.teams[home], self.teams[away]
-        lam = math.exp(self.intercept + self.home_advantage + self.attack[i] + self.defence[j])
+        home_advantage = 0.0 if neutral else self.home_advantage
+        lam = math.exp(self.intercept + home_advantage + self.attack[i] + self.defence[j])
         mu = math.exp(self.intercept + self.attack[j] + self.defence[i])
         return lam, mu
 
-    def score_matrix(self, home: str, away: str) -> np.ndarray | None:
-        found = self.rates(home, away)
+    def score_matrix(self, home: str, away: str, neutral: bool = False) -> np.ndarray | None:
+        found = self.rates(home, away, neutral)
         if found is None:
             return None
         return score_matrix(*found, self.rho)
@@ -110,7 +112,8 @@ def fit(
         age = (end - date.fromisoformat(m.match_date)).days
         weight = 0.5 ** (age / half_life_days)
         h, a = teams[m.home], teams[m.away]
-        x[2 * r, [0, 1, 2 + h, 2 + n_teams + a]] = 1
+        x[2 * r, [0, 2 + h, 2 + n_teams + a]] = 1
+        x[2 * r, 1] = 0.0 if m.neutral else 1.0
         x[2 * r + 1, [0, 2 + a, 2 + n_teams + h]] = 1
         y[2 * r], y[2 * r + 1] = m.home_goals, m.away_goals
         w[2 * r] = w[2 * r + 1] = weight
@@ -132,7 +135,7 @@ def fit(
     attack, defence = beta[2 : 2 + n_teams], beta[2 + n_teams :]
     lam = np.exp(
         beta[0]
-        + beta[1]
+        + beta[1] * np.array([0.0 if m.neutral else 1.0 for m in used])
         + attack[[teams[m.home] for m in used]]
         + defence[[teams[m.away] for m in used]]
     )

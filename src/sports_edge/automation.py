@@ -1065,7 +1065,7 @@ def download_allowed(paths: AppPaths | None = None) -> bool:
 def matchday_groups(store: Store, *, now: datetime) -> list[datetime]:
     """The first kick-off of every hour (Warsaw time) of today with a match of the
     supported leagues in the STS offer."""
-    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+    from sports_edge.services import MODELLED_COMPETITIONS, league_code
 
     today = now.astimezone(WARSAW).date()
     days = [(today + timedelta(days=d)).isoformat() for d in (-1, 0, 1)]
@@ -1078,7 +1078,7 @@ def matchday_groups(store: Store, *, now: datetime) -> list[datetime]:
         {
             datetime.fromisoformat(r["start_at"])
             for r in rows
-            if league_code(r["league"], r["sport"]) in RESEARCH_COMPETITIONS
+            if league_code(r["league"], r["sport"]) in MODELLED_COMPETITIONS
             and datetime.fromisoformat(r["start_at"]).astimezone(WARSAW).date() == today
         }
     )
@@ -1129,7 +1129,7 @@ def matchday_cap_effect(store: Store, settings: dict, *, day: date) -> dict:
     the 12 leagues (first kick-off of every hour), the slots with and without the cap, and
     the groups and matches that LOSE the download closest to the kick-off (a planned slot
     at most ``min(leads)`` + 10 minutes before the group) because of the cap. Read only."""
-    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+    from sports_edge.services import MODELLED_COMPETITIONS, league_code
 
     cfg = matchday_config(settings)
     noon = datetime.combine(day, datetime.min.time(), tzinfo=WARSAW).replace(hour=12)
@@ -1152,7 +1152,7 @@ def matchday_cap_effect(store: Store, settings: dict, *, day: date) -> dict:
     ):
         start = datetime.fromisoformat(r["start_at"])
         local = start.astimezone(WARSAW)
-        if local.date() != day or league_code(r["league"], r["sport"]) not in RESEARCH_COMPETITIONS:
+        if local.date() != day or league_code(r["league"], r["sport"]) not in MODELLED_COMPETITIONS:
             continue
         group = hours.get(local.replace(minute=0, second=0, microsecond=0))
         if group is not None:

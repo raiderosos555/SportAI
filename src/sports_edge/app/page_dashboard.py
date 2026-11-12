@@ -372,7 +372,8 @@ def _limitations(db, freshness: list[dict]) -> None:
             + ("modele aktywne" if pair["elo"] or pair["goals"] else "brak modelu")
             for name, pair in served.items()
         ],
-        f"Modele obejmują {sum(len(s) for s in MODEL_SCOPES.values())} lig piłkarskich; inne "
+        f"Modele obejmują {len(MODEL_SCOPES['core']) + len(MODEL_SCOPES['extended'])} lig "
+        "piłkarskich i reprezentacje (Liga Narodów, eliminacje, turnieje, towarzyskie); inne "
         "sporty nie mają jeszcze modelu.",
         "Prognozy nie uwzględniają składów, kontuzji ani motywacji.",
         "Szansa trafienia to oszacowanie modelu, nie gwarancja wygranej.",

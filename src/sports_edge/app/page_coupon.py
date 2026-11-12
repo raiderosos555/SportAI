@@ -142,18 +142,6 @@ def _run(db, settings, days, refresh_offer, refresh_results):
         box.update(label="Analiza przerwana", state="error", expanded=True)
         ui.error_state("Analiza nie powiodła się", f"{type(error).__name__}: {error}")
         return None
-    # Make today's national research forecasts visible immediately after analysis; they remain
-    # append-only shadow observations and never enter coupon candidates. A shadow failure does
-    # not invalidate a completed coupon analysis.
-    try:
-        from sports_edge import international
-
-        international.national_shadow_forecasts(db, c.paths(), now=analysis_time)
-    except Exception as error:  # noqa: BLE001 — report shadow failure without losing analysis
-        st.warning(
-            "Analiza kuponu się zakończyła, ale prognozy reprezentacji nie zostały odświeżone: "
-            f"{type(error).__name__}."
-        )
     made = sum(
         1
         for r in run.runs.values()

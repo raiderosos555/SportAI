@@ -29,6 +29,18 @@ from sports_edge.models import calibration
 from sports_edge.models.goals import MAX_GOALS, GoalsMatch, fit, markets
 from sports_edge.models.registry import register_version, save_prediction
 from sports_edge.offers.text import NameNormalizer
+from sports_edge.pools import (
+    NATIONAL_CODES,
+    dc_window_days,
+    event_venue,
+    group_by_pool,
+    half_lives,
+    is_national,
+    max_gap_days,
+    neutral_of,
+    pool_of,
+    pools,
+)
 from sports_edge.provenance import code_state, data_snapshot
 from sports_edge.results_engine import effective_results, known_names, priority
 from sports_edge.sportsdata import MAX_DATA_GAP_DAYS, MIN_TEAM_GAMES, Split
@@ -157,7 +169,7 @@ def dc_walk_forward(
     for row, model in _dc_fits(
         rows, half_life=half_life, from_date=from_date, refit_days=refit_days
     ):
-        matrix = model.score_matrix(row["home"], row["away"])
+        matrix = model.score_matrix(row["home"], row["away"], neutral_of(row))
         if matrix is None:
             continue  # a team without history in the window: no forecast
         out[row["id"]] = markets(matrix, LINES)
@@ -173,18 +185,26 @@ def dc_walk_forward_rates(
     for row, model in _dc_fits(
         rows, half_life=half_life, from_date=from_date, refit_days=refit_days
     ):
-        found = model.rates(row["home"], row["away"])
+        found = model.rates(row["home"], row["away"], neutral_of(row))
         if found is not None:
             out[row["id"]] = (found[0], found[1], model.rho)
     return out
 
 
 def _dc_fits(rows: list[dict], *, half_life: float, from_date: str, refit_days: int):
-    """(match, latest weekly as-of fit) of every match on/after ``from_date``."""
-    for _code, mine in _league_matches(rows).items():
+    """(match, latest weekly as-of fit) of every match on/after ``from_date``; one fit per
+    pool (a league, or all national teams — TASK 018)."""
+    for _pool, mine in group_by_pool(rows).items():
         mine.sort(key=lambda r: (r["match_date"], r["id"]))
         goals = [
-            GoalsMatch(r["match_date"], r["home"], r["away"], r["home_score"], r["away_score"])
+            GoalsMatch(
+                r["match_date"],
+                r["home"],
+                r["away"],
+                r["home_score"],
+                r["away_score"],
+                neutral_of(r),
+            )
             for r in mine
         ]
         start = date.fromisoformat(from_date)
@@ -195,7 +215,12 @@ def _dc_fits(rows: list[dict], *, half_life: float, from_date: str, refit_days: 
             offset = (date.fromisoformat(row["match_date"]) - start).days // refit_days
             fit_date = (start + timedelta(days=offset * refit_days)).isoformat()
             if fit_date not in cache:
-                cache[fit_date] = fit(goals, fit_date=fit_date, half_life_days=half_life)
+                cache[fit_date] = fit(
+                    goals,
+                    fit_date=fit_date,
+                    half_life_days=half_life,
+                    window_days=dc_window_days(_pool, WINDOW_DAYS),
+                )
             model = cache[fit_date]
             if model is not None:
                 yield row, model
@@ -312,7 +337,7 @@ def run_probability_experiment(
     # 1. half-life chosen on validation (1X2 + total 2.5 + BTTS log loss)
     selection = []
     best = None
-    for half_life in HALF_LIVES:
+    for half_life in half_lives(competitions, HALF_LIVES):  # TASK 018: per scope
         preds = dc_walk_forward(rows, half_life=half_life, from_date=split.validation_from)
         val = {k: v for k, v in preds.items() if k in validation_ids}
         score = (
@@ -429,7 +454,9 @@ def run_probability_experiment(
         "half_life_days": half_life,
         "selection": selection,
         "refit_days": REFIT_DAYS,
-        "window_days": WINDOW_DAYS,
+        "window_days": dc_window_days(pools(competitions)[0], WINDOW_DAYS)
+        if is_national(competitions)
+        else WINDOW_DAYS,
         "n": {"validation": len(val), "holdout": len(hold)},
         "families": families,
         "predictive": predictive,
@@ -581,7 +608,7 @@ def _run_dc_v2(
         )
     # 1. half-life chosen on the validation window
     tuning, best = [], None
-    for half_life in HALF_LIVES:
+    for half_life in half_lives(competitions, HALF_LIVES):  # TASK 018: per scope
         preds = dc_walk_forward(rows, half_life=half_life, from_date=split.validation_from)
         val = {k: v for k, v in preds.items() if k in windows["validation"]}
         score = (
@@ -657,7 +684,9 @@ def _run_dc_v2(
         "half_life_days": half_life,
         "selection": tuning,
         "refit_days": REFIT_DAYS,
-        "window_days": WINDOW_DAYS,
+        "window_days": dc_window_days(pools(competitions)[0], WINDOW_DAYS)
+        if is_national(competitions)
+        else WINDOW_DAYS,
         "n": {name: len(part[name]) for name in part}
         | {"validation": sum(1 for k in preds if k in windows["validation"])},
         "families": families,
@@ -856,8 +885,8 @@ def _league_gates(
     """Per-league gates. ``served``: ``hold`` already holds the served probabilities
     (protocol v2); otherwise every side is calibrated here (v1)."""
     out: dict[str, dict] = {}
-    for code in competitions:
-        ids = [k for k in hold if rows_by_id[k]["competition"] == code]
+    for code in pools(competitions):  # TASK 018: the national pool is gated as one "league"
+        ids = [k for k in hold if pool_of(rows_by_id[k]["competition"]) == code]
         if not ids:
             continue
         subset = {k: hold[k] for k in ids}
@@ -896,9 +925,9 @@ def league_status(validation: dict, competition: str | None, model: str, family:
     """Per-league gate of a family (``model``: "dc" or "elo"); {} when not evaluated."""
     if not competition:
         return {}
-    return (((validation.get("by_league") or {}).get(competition) or {}).get(model) or {}).get(
-        family
-    ) or {}
+    gates = validation.get("by_league") or {}
+    found = gates.get(competition) or gates.get(pool_of(competition)) or {}
+    return (found.get(model) or {}).get(family) or {}
 
 
 def _double_chance(probs: dict[str, float]) -> dict[str, float]:
@@ -1015,16 +1044,28 @@ def predict_offer_goals(
     state = code_state()
     info_cutoff = iso(max(datetime.fromisoformat(r["available_at"]) for r in rows))
     aliases = alias_map(store, team_aliases)
-    by_league = _league_matches(rows)
+    by_pool = group_by_pool(rows)
     fit_date = (now.date() + timedelta(days=1)).isoformat()
     fits, known, last = {}, {}, {}
-    for code in competitions:
-        mine = sorted(by_league.get(code, []), key=lambda r: r["match_date"])
+    for code in pools(competitions):  # TASK 018: a league, or all national teams
+        mine = sorted(by_pool.get(code, []), key=lambda r: r["match_date"])
         goals = [
-            GoalsMatch(r["match_date"], r["home"], r["away"], r["home_score"], r["away_score"])
+            GoalsMatch(
+                r["match_date"],
+                r["home"],
+                r["away"],
+                r["home_score"],
+                r["away_score"],
+                neutral_of(r),
+            )
             for r in mine
         ]
-        fits[code] = fit(goals, fit_date=fit_date, half_life_days=validation["half_life_days"])
+        fits[code] = fit(
+            goals,
+            fit_date=fit_date,
+            half_life_days=validation["half_life_days"],
+            window_days=int(validation.get("window_days") or dc_window_days(code, WINDOW_DAYS)),
+        )
         known[code] = known_names(mine, "football", normalizer)
         last[code] = mine[-1]["match_date"] if mine else None
     saved, kept, skipped = 0, 0, []
@@ -1038,19 +1079,21 @@ def predict_offer_goals(
         if not event.get("start_at") or datetime.fromisoformat(event["start_at"]) <= now:
             skipped.append(f"{label}: wydarzenie rozpoczęte lub bez godziny")
             continue
-        model = fits.get(competition)
+        pool = pool_of(competition)
+        model = fits.get(pool)
         if model is None:
             skipped.append(f"{label}: za mało danych do dopasowania modelu")
             continue
-        gap = last[competition]
+        gap = last[pool]
         event_day = datetime.fromisoformat(event["start_at"]).date()
-        if gap is None or (event_day - date.fromisoformat(gap)).days > MAX_DATA_GAP_DAYS:
+        limit = max_gap_days(pool, MAX_DATA_GAP_DAYS)
+        if gap is None or (event_day - date.fromisoformat(gap)).days > limit:
             skipped.append(f"{label}: nieaktualne dane (ostatni wynik {gap})")
             continue
         pair = []
         for side in ("home", "away"):
             found = match_participant(
-                event[side] or "", "football", known[competition], normalizer, aliases
+                event[side] or "", "football", known[pool], normalizer, aliases
             )
             if found.status in {"exact", "alias"}:
                 pair.append(found.target)
@@ -1061,11 +1104,12 @@ def predict_offer_goals(
         if min(games) < MIN_TEAM_GAMES:
             skipped.append(f"{label}: za mało meczów w oknie modelu ({min(games)})")
             continue
-        matrix = model.score_matrix(*pair)
+        neutral, venue, venue_status = event_venue(store, competition, event, *pair, now=now)
+        matrix = model.score_matrix(*pair, neutral)
         if matrix is None:
             skipped.append(f"{label}: drużyna poza modelem")
             continue
-        lam, mu = model.rates(*pair)
+        lam, mu = model.rates(*pair, neutral)
         # TASK 012 §5.1: the parameters of the score matrix travel with every NEW forecast, so
         # the joint chance of several markets of one match can be read again later
         rates = {
@@ -1127,6 +1171,11 @@ def predict_offer_goals(
                     "fit_date": fit_date,
                     "data": "wyniki as-of: " + ", ".join(providers),
                     "score_matrix": rates,
+                    **(
+                        {"venue_country": venue, "venue_status": venue_status}
+                        if competition in NATIONAL_CODES
+                        else {}
+                    ),
                 },
                 kind="prospective",
                 created_at=now,

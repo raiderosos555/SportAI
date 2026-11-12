@@ -55,7 +55,12 @@ ELO = "elo_ordered_draw"
 GOALS = "dixon_coles_goals"
 FAMILY_LABELS = {ELO: "Elo", GOALS: "Dixon–Coles"}
 ROLE_LABELS = {"active": "aktywna wersja", "shadow": "challenger (tryb cienia)"}
-SCOPE_LABELS = {"all": "wszystkie ligi", "core": "5 czołowych lig", "extended": "7 lig"}
+SCOPE_LABELS = {
+    "all": "wszystkie ligi",
+    "core": "5 czołowych lig",
+    "extended": "7 lig",
+    "national": "reprezentacje",
+}
 MARKET_LABELS = {
     "1x2": "1X2",
     "double_chance": "Podwójna szansa",
@@ -653,7 +658,7 @@ def market_comparison(
         for scope in ("all", item["scope"]):
             for market in (item["market"], *pooled):
                 groups[(scope, item["family"], market)].append(item)
-    for scope in ("all", "core", "extended"):
+    for scope in ("all", "core", "extended", "national"):  # TASK 018: national like leagues
         for family, markets in COUPON_MARKETS.items():
             for market in (*markets, POOLED):
                 groups.setdefault((scope, family, market), [])
@@ -872,7 +877,7 @@ def odds_age_report(
     from zoneinfo import ZoneInfo
 
     from sports_edge import automation
-    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+    from sports_edge.services import MODELLED_COMPETITIONS, league_code
 
     warsaw = ZoneInfo("Europe/Warsaw")
     today = now.astimezone(warsaw).date()
@@ -887,7 +892,7 @@ def odds_age_report(
             "AND start_at IS NOT NULL AND start_at>=? AND start_at<?",
             (iso(start - timedelta(days=1)), iso(now + timedelta(days=1))),
         )
-        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+        if league_code(e["league"], e["sport"]) in MODELLED_COMPETITIONS
         and start <= datetime.fromisoformat(e["start_at"]) < now
     ]
     observed: dict[str, list[datetime]] = defaultdict(list)
@@ -1008,7 +1013,7 @@ def today_odds_age(store: Store, *, now: datetime, settings: dict | None = None)
     from zoneinfo import ZoneInfo
 
     from sports_edge import automation
-    from sports_edge.services import RESEARCH_COMPETITIONS, league_code
+    from sports_edge.services import MODELLED_COMPETITIONS, league_code
 
     warsaw = ZoneInfo("Europe/Warsaw")
     today = now.astimezone(warsaw).date()
@@ -1021,7 +1026,7 @@ def today_odds_age(store: Store, *, now: datetime, settings: dict | None = None)
             "AND start_at IS NOT NULL AND start_at>=? AND start_at<?",
             (iso(start - timedelta(hours=2)), iso(end + timedelta(hours=2))),
         )
-        if league_code(e["league"], e["sport"]) in RESEARCH_COMPETITIONS
+        if league_code(e["league"], e["sport"]) in MODELLED_COMPETITIONS
         and start <= datetime.fromisoformat(e["start_at"]) < end
     ]
     cfg = automation.matchday_config(settings or {})

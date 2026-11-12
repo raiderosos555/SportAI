@@ -23,6 +23,8 @@ class HistoricalMatch:
     start_at: datetime | None = None
     competition: str = ""
     result_id: str = ""
+    # TASK 018: no home advantage (national match on a neutral or unknown venue)
+    neutral: bool = False
 
     def __post_init__(self) -> None:
         if self.available_at.date().isoformat() < self.match_date:
@@ -44,13 +46,15 @@ class Elo:
     ratings: dict[str, float] = field(default_factory=dict)
     games: dict[str, int] = field(default_factory=dict)
 
-    def diff(self, home: str, away: str) -> float:
+    def diff(self, home: str, away: str, neutral: bool = False) -> float:
         rh = self.ratings.get(home, self.initial)
         ra = self.ratings.get(away, self.initial)
-        return (rh + self.home_advantage - ra) / 400
+        return (rh + (0.0 if neutral else self.home_advantage) - ra) / 400
 
-    def probabilities(self, home: str, away: str, *, three_way: bool) -> dict[str, float]:
-        d = self.diff(home, away)
+    def probabilities(
+        self, home: str, away: str, *, three_way: bool, neutral: bool = False
+    ) -> dict[str, float]:
+        d = self.diff(home, away, neutral)
         if not three_way:
             p_home = 1 / (1 + 10 ** (-d))
             return {"home": p_home, "away": 1 - p_home}
@@ -60,7 +64,7 @@ class Elo:
         return {"home": p_home, "draw": max(0.0, 1 - p_home - p_away), "away": p_away}
 
     def update(self, match: HistoricalMatch) -> None:
-        expected = 1 / (1 + 10 ** (-self.diff(match.home, match.away)))
+        expected = 1 / (1 + 10 ** (-self.diff(match.home, match.away, match.neutral)))
         actual = {"home": 1.0, "draw": 0.5, "away": 0.0}[match.outcome]
         change = self.k * (actual - expected)
         self.ratings[match.home] = self.ratings.get(match.home, self.initial) + change
@@ -81,7 +85,9 @@ def walk_forward(matches: Iterable[HistoricalMatch], model: Elo, *, three_way: b
     for day in _days(matches):
         for match in day:
             experience = min(model.games.get(match.home, 0), model.games.get(match.away, 0))
-            forecast = model.probabilities(match.home, match.away, three_way=three_way)
+            forecast = model.probabilities(
+                match.home, match.away, three_way=three_way, neutral=match.neutral
+            )
             out.append({"match": match, "forecast": forecast, "experience": experience})
         for match in day:
             model.update(match)
@@ -110,7 +116,7 @@ def rating_differences(matches: Iterable[HistoricalMatch], model: Elo) -> list[d
     """Pre-match rating differences (same as-of grouping) for draw-margin fitting."""
     out = []
     for day in _days(matches):
-        out.extend({"match": m, "d": model.diff(m.home, m.away)} for m in day)
+        out.extend({"match": m, "d": model.diff(m.home, m.away, m.neutral)} for m in day)
         for match in day:
             model.update(match)
     return out

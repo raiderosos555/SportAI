@@ -117,21 +117,23 @@ def training_conditions(
     from sports_edge.services import ELO_FAMILY, scope_version
 
     reasons, waived = [], []  # ``waived``: the usual conditions the first v3 does not need
+    from sports_edge.pools import retraining_rules
+
+    # TASK 018: national teams play only in FIFA windows (config/national_scope.toml)
+    min_new, min_days = retraining_rules(scope, MIN_NEW_RESULTS, MIN_DAYS_BETWEEN_TRAININGS)
     champion = scope_version(store, competitions, ELO_FAMILY)
     since = champion["trained_through"] if champion else None
     new = new_matches(store, competitions, since=since, now=now, identities=identities)
     first = new > 0 and champion is not None and not has_v3(store, scope)
-    if new < MIN_NEW_RESULTS:
-        text = f"nowych unikalnych meczów od treningu: {new} < {MIN_NEW_RESULTS}"
+    if new < min_new:
+        text = f"nowych unikalnych meczów od treningu: {new} < {min_new}"
         (waived if first else reasons).append(text)
     leaving = {vid for _family, vid, _why in expiring(store, scope, now=now)}
     if [v for v in learning.challengers(store, scope, ELO_FAMILY) if v not in leaving]:
         reasons.append("challenger tego zakresu czeka już na decyzję (tryb cienia)")
     last = [e for e in learning.events(store, scope=scope) if e["kind"] == "challenger_ready"]
-    if last and now - datetime.fromisoformat(last[-1]["created_at"]) < timedelta(
-        days=MIN_DAYS_BETWEEN_TRAININGS
-    ):
-        text = f"ostatni trening mniej niż {MIN_DAYS_BETWEEN_TRAININGS} dni temu"
+    if last and now - datetime.fromisoformat(last[-1]["created_at"]) < timedelta(days=min_days):
+        text = f"ostatni trening mniej niż {min_days} dni temu"
         (waived if first else reasons).append(text)
     return {
         "ready": not reasons,

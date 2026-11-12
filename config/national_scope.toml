@@ -1,0 +1,34 @@
+# TASK 018 — rules of the national-team scope that depend on HOW OFTEN teams play.
+#
+# User (12.11.2026): "te reżimy musimy zmienić dla reprezentacji bo przecież oni nie grają tak
+# często jak liga". Club leagues play every week; national teams only in the FIFA windows
+# (about 10 matches a team per year, ~300 matches a year in the data). Only the rules below
+# change for the scope "national"; the quality gate (predictive_status: ECE, base rates,
+# 300 forecasts) and the coupon profiles are the same as for the leagues
+# (probability_policy.toml), and the leagues keep every value they had.
+
+[freshness]
+# The newest result of the national pool may be at most this old at kick-off (leagues: 21
+# days). The longest regular break between FIFA windows (June → September) is ~100 days; one
+# summer break plus one missed window = 150 days. Older data: "nieaktualne dane", no forecast.
+max_gap_days = 150
+
+[elo]
+# Hyperparameter grid of protocol v2/v3, chosen on the validation window (leagues: k 15/20/30,
+# home advantage 40/60/80). A national team plays ~10 matches a year, so each result has to
+# move the rating more; the league grid chose its largest k (30) for national teams.
+k = [20.0, 30.0, 40.0, 50.0, 60.0]
+home_advantage = [40.0, 60.0, 80.0, 100.0]
+
+[dixon_coles]
+# Half-lives chosen on the validation window (leagues: 120/240/480 days; the league grid chose
+# its longest value, 480, for national teams) and the fitting window (leagues: 730 days ≈ 70
+# league matches a team; 730 days are only ~20 matches of a national team).
+half_life_days = [240.0, 480.0, 720.0, 1080.0]
+window_days = 1460
+
+[retraining]
+# Conditions of a new challenger (leagues: 150 new matches and 7 days). ~60 national matches
+# are played in one FIFA window: a review after every window, at most one training a window.
+min_new_results = 60
+min_days_between_trainings = 28

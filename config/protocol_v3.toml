@@ -35,6 +35,13 @@ selection_months = 6
 [windows.scopes.core]
 calibration_months = 24
 
+# TASK 018: national teams play ~300 matches a year (leagues: ~1 900 in the 5 top leagues), so
+# 12 months would give ~300 matches and miss whole FIFA windows; 24-month calibration and
+# selection windows give ~600 each.
+[windows.scopes.national]
+calibration_months = 24
+selection_months = 24
+
 # Activation gate of v3 (there is no untouched historical holdout any more): the prospective
 # comparison with the champion in shadow mode (TASK 011, common settled MATCHES). The selection
 # window result is information only.

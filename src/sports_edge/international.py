@@ -999,6 +999,10 @@ def generator_allowed(
     category = category_of(competition)
     if category == "domestic":
         return True, "liga krajowa — obowiązują bramki modeli ligowych"
+    if category == "national":
+        # TASK 018: national teams follow the league path — the per-market gate
+        # (predictive_status) and the profile rules decide, with no extra registry gate
+        return True, "reprezentacje — obowiązują bramki modeli jak w ligach"
     status = market_status(latest(store), category).get(market)
     if not status or not status["validated"]:
         if category == "national":

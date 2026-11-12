@@ -30,6 +30,15 @@ from sports_edge.models.elo import (
 )
 from sports_edge.models.registry import register_version, save_prediction
 from sports_edge.offers.text import NameNormalizer
+from sports_edge.pools import (
+    NATIONAL_CODES,
+    elo_grid,
+    event_venue,
+    group_by_pool,
+    max_gap_days,
+    neutral_of,
+    pool_of,
+)
 from sports_edge.provenance import code_state, data_snapshot
 from sports_edge.results_engine import effective_results, known_names, priority
 from sports_edge.storage import Store
@@ -258,6 +267,7 @@ def _to_match(row: dict) -> HistoricalMatch:
         start_at=datetime.fromisoformat(row["start_at"]) if row["start_at"] else None,
         competition=row["competition"],
         result_id=row["id"],
+        neutral=neutral_of(row),
     )
 
 
@@ -348,18 +358,20 @@ class Split:
 
 
 def _scoped(matches: list[HistoricalMatch]) -> list[HistoricalMatch]:
-    """Separate rating pools per competition: team keys are prefixed with the league code."""
+    """Separate rating pools per competition: team keys are prefixed with the league code
+    (TASK 018: all national competitions share one pool, ``pools.pool_of``)."""
     return [
         HistoricalMatch(
             available_at=m.available_at,
             match_date=m.match_date,
-            home=f"{m.competition}|{m.home}",
-            away=f"{m.competition}|{m.away}",
+            home=f"{pool_of(m.competition)}|{m.home}",
+            away=f"{pool_of(m.competition)}|{m.away}",
             home_score=m.home_score,
             away_score=m.away_score,
             start_at=m.start_at,
             competition=m.competition,
             result_id=m.result_id,
+            neutral=m.neutral,
         )
         for m in matches
     ]
@@ -484,8 +496,9 @@ def run_elo_experiment(
             f"holdout {len(holdout)}"
         )
     candidates = []
-    for k in GRID["k"]:
-        for hfa in GRID["home_advantage"]:
+    grid = elo_grid(competitions, GRID)  # TASK 018: national teams have their own grid
+    for k in grid["k"]:
+        for hfa in grid["home_advantage"]:
             items, margin = _forecasts(
                 train + validation, k=k, home_advantage=hfa, margin_until=split.validation_from
             )
@@ -616,8 +629,9 @@ def _run_elo_v2(
             f"selekcja {len(selection)}"
         )
     candidates = []
-    for k in GRID["k"]:
-        for hfa in GRID["home_advantage"]:
+    grid = elo_grid(competitions, GRID)  # TASK 018: national teams have their own grid
+    for k in grid["k"]:
+        for hfa in grid["home_advantage"]:
             items, margin = _forecasts(
                 train + validation, k=k, home_advantage=hfa, margin_until=split.validation_from
             )
@@ -809,16 +823,21 @@ def predict_offer(
     model = Elo(k=params["k"], home_advantage=params["home_advantage"], draw_margin=draw_margin)
     walk_forward(scoped, model, three_way=True)
     aliases = alias_map(store, team_aliases)
-    known = {
-        code: known_names([r for r in rows if r["competition"] == code], "football", normalizer)
-        for code in competitions
+    # TASK 018: names, freshness and ratings are per pool (a league, or all national teams)
+    known_pool = {
+        pool: known_names(mine, "football", normalizer)
+        for pool, mine in group_by_pool(rows).items()
     }
+    known = {code: known_pool.get(pool_of(code), {}) for code in competitions}
     bins = {(row["low"], row["high"]): row for row in reliability}
     info_cutoff = max(m.available_at for m in matches)
     snapshot = data_snapshot(m.result_id for m in matches)
     state = code_state()
     last_result = {
-        code: max((m.match_date for m in matches if m.competition == code), default=None)
+        code: max(
+            (m.match_date for m in matches if pool_of(m.competition) == pool_of(code)),
+            default=None,
+        )
         for code in competitions
     }
     saved, kept, considered, skipped, unmatched = 0, 0, 0, [], []
@@ -851,13 +870,14 @@ def predict_offer(
             continue
         event_day = datetime.fromisoformat(event["start_at"]).date()
         last = last_result[code]
-        if last is None or (event_day - date.fromisoformat(last)).days > MAX_DATA_GAP_DAYS:
+        limit = max_gap_days(pool_of(code), MAX_DATA_GAP_DAYS)
+        if last is None or (event_day - date.fromisoformat(last)).days > limit:
             skipped.append(
                 f"{label}: nieaktualne dane niezależne (ostatni wynik w źródle: {last}) — "
                 "prognoza oparta na przestarzałych rankingach byłaby niewiarygodna"
             )
             continue
-        home, away = (f"{code}|{team}" for team in pair)
+        home, away = (f"{pool_of(code)}|{team}" for team in pair)
         games = (model.games.get(home, 0), model.games.get(away, 0))
         if min(games) < MIN_TEAM_GAMES:
             skipped.append(f"{label}: za mało meczów w historii ({min(games)})")
@@ -865,7 +885,8 @@ def predict_offer(
         if _already_forecast(store, version_id, event["id"], snapshot):
             kept += 1  # same model and the same data: the stored forecast stays valid
             continue
-        forecast = model.probabilities(home, away, three_way=True)
+        neutral, venue, venue_status = event_venue(store, code, event, *pair, now=now)
+        forecast = model.probabilities(home, away, three_way=True, neutral=neutral)
         interval = elo_interval(forecast, bins, ece)
         save_prediction(
             store,
@@ -885,6 +906,11 @@ def predict_offer(
                 "games": list(games),
                 "data": "wyniki as-of: " + ", ".join(providers),
                 "last_result": last,
+                **(
+                    {"venue_country": venue, "venue_status": venue_status}
+                    if code in NATIONAL_CODES
+                    else {}
+                ),
             },
             kind="prospective",
             created_at=now,
