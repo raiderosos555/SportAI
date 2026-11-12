@@ -82,9 +82,13 @@ def attention_block(db, now) -> None:
                 tone="warn",
             )
         )
-    unread = alerts.recent(db, limit=50, unread_only=True)
-    important = [a for a in unread if a["priority"] in ("high", "medium")]
-    minor = [a for a in unread if a["priority"] not in ("high", "medium")]
+    # TASK 016 §4: important first (coupons, then lineups of coupon matches); the rest and
+    # the alerts of matches that already started are one line with a link
+    overview = alerts.overview(db, now=now)
+    unread = [a for a in overview["items"] if not a["read"]]
+    important = [a for a in unread if a["rank"] <= 1 and not a["stale"]]
+    minor = [a for a in unread if a["rank"] > 1 and not a["stale"]]
+    stale = [a for a in unread if a["stale"]]
     for a in important[:5]:
         rows.append(
             ui.list_row(
@@ -94,12 +98,22 @@ def attention_block(db, now) -> None:
                 tone=PRIORITY_TONE.get(a["priority"], "info"),
             )
         )
-    if minor:
+    if len(important) > 5:
+        rows.append(
+            ui.list_row(
+                title=f"Kolejne ważne alerty: {len(important) - 5}",
+                meta="pełna lista w Automatyzacji AI → Alerty",
+                badges=[ui.pill("ważne", "warn")],
+            )
+        )
+    if minor or stale:
         kinds = sorted({a["label"] for a in minor})
         rows.append(
             ui.list_row(
-                title=f"Informacje o niższym priorytecie: {len(minor)}",
-                meta=", ".join(kinds[:3]) + " — lista w Automatyzacji AI → Alerty",
+                title=f"Pozostałe alerty: {len(minor)} · nieaktualne (mecz już się rozpoczął): "
+                f"{len(stale)}",
+                meta=(", ".join(kinds[:3]) + " — " if kinds else "")
+                + "lista i „Oznacz wszystkie jako przeczytane” w Automatyzacji AI → Alerty",
                 badges=[ui.pill("informacja", "info")],
             )
         )
@@ -225,10 +239,10 @@ def lineups_panel(db, event_id: str, *, start_at: str | None, now, started: bool
                         "Zawodnik": a["player_name"],
                         "Drużyna": a["team_name"],
                         "Powód": prematch.ABSENCE_REASON.get(a["reason"], a["reason"]),
-                        "Źródło": a["source"],
-                        "Weryfikacja": "zweryfikowany"
-                        if a["match_status"] == "verified"
-                        else "do sprawdzenia",
+                        "Źródło": a["source"]
+                        + (f" ({a['source_url']})" if a.get("source_url") else ""),
+                        "Data informacji": a.get("published_at") or "—",
+                        "Weryfikacja": prematch.verification_label(a),
                         "Znane przed meczem": "tak" if a["known_before_start"] else "nie",
                     }
                     for a in absences
@@ -240,7 +254,81 @@ def lineups_panel(db, event_id: str, *, start_at: str | None, now, started: bool
     else:
         st.caption(
             "Kontuzje i zawieszenia: brak zweryfikowanego, bezpłatnego źródła — aplikacja nie "
-            "zgaduje absencji."
+            "zgaduje absencji. Możesz wpisać absencję ręcznie, podając źródło."
         )
+    absence_form(db, event_id, absences, now=now)
     st.info(MODEL_NOTE)
     return bool(sides or check)
+
+
+ABSENCE_REASONS = ("kontuzja", "zawieszenie", "inne")
+
+
+def absence_form(db, event_id: str, absences: list[dict], *, now) -> None:
+    """TASK 016 §5.3: a manual absence — team, player, reason, obligatory source, date. The
+    entry is append-only; withdrawing it adds another row. A warning, never a model input."""
+    event = db.get("events", event_id)
+    if event is None or not event.get("home") or not event.get("away"):
+        return
+    with ui.details("Dodaj absencję ręcznie (ze źródłem)", icon=":material/person_off:"):
+        with st.form(f"absence_form_{event_id}", clear_on_submit=True):
+            cols = st.columns(2)
+            team = cols[0].selectbox(
+                "Drużyna", [event["home"], event["away"]], key=f"absence_team_{event_id}"
+            )
+            player = cols[1].text_input("Zawodnik", key=f"absence_player_{event_id}")
+            cols = st.columns(2)
+            reason = cols[0].selectbox("Powód", ABSENCE_REASONS, key=f"absence_reason_{event_id}")
+            day = cols[1].date_input(
+                "Data informacji",
+                value=now.astimezone(c.WARSAW).date(),
+                format="DD.MM.YYYY",
+                key=f"absence_date_{event_id}",
+            )
+            source = st.text_input(
+                "Źródło (obowiązkowe)",
+                key=f"absence_source_{event_id}",
+                placeholder="np. komunikat klubu, konferencja trenera, oficjalna strona ligi",
+            )
+            link = st.text_input(
+                "Adres źródła (opcjonalnie)", key=f"absence_url_{event_id}", placeholder="https://…"
+            )
+            sent = st.form_submit_button("Zapisz absencję", icon=":material/save:")
+        if sent:
+            try:
+                prematch.add_user_absence(
+                    db,
+                    event,
+                    team=team,
+                    player=player,
+                    reason=reason,
+                    source=source,
+                    source_url=link,
+                    information_date=day.isoformat() if day else None,
+                    now=now,
+                )
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.cache_data.clear()
+                st.success(
+                    "Absencja zapisana — widoczna w kontroli przedmeczowej i w ocenie kuponu "
+                    "jako zweryfikowana przez użytkownika. Nie zmienia żadnej prognozy."
+                )
+                st.rerun()
+        mine = [a for a in absences if a["entered_by"] == "user"]
+        for row in mine:
+            cols = st.columns([4, 1], vertical_alignment="center")
+            cols[0].caption(
+                f"{row['player_name']} ({row['team_name']}) — "
+                f"{prematch.ABSENCE_REASON.get(row['reason'], row['reason'])} · źródło: "
+                f"{row['source']} · wpis {c.local_time(row['observed_at'], '%d.%m %H:%M')}"
+            )
+            if cols[1].button("Wycofaj", key=f"absence_withdraw_{row['id']}"):
+                prematch.withdraw_absence(db, row["id"], now=now)
+                st.cache_data.clear()
+                st.rerun()
+        st.caption(
+            "Wpis jest dopisywany (nic nie jest nadpisywane); wycofanie to kolejny wpis. "
+            "Absencje są ostrzeżeniem — nie wchodzą do modelu."
+        )

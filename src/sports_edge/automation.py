@@ -64,6 +64,8 @@ FREQUENCIES = {
     # TASK 012: automatic forecasts of the offer and the weekly calibration report
     "forecasts": [180, 360, 720, 1440],
     "calibration_report": [1440, 4320, 10080],
+    # TASK 016: the cyclic backup (default: daily at a fixed time at night)
+    "backup": [1440, 4320, 10080],
 }
 JOB_LABELS = {
     "results": "Aktualizacja wyników sportowych",
@@ -83,6 +85,7 @@ JOB_LABELS = {
     "cup_training": "Eksperymenty modeli pucharowych (po spełnieniu warunków)",
     "forecasts": "Automatyczne prognozy meczów z oferty (dziś i jutro, bez kuponów)",
     "calibration_report": "Raport tygodniowy: kalibracja strefy kuponów i porównanie z rynkiem",
+    "backup": "Kopia zapasowa bazy (cykliczna, z kontrolą integralności i retencją)",
 }
 DEFAULTS = {
     "auto_resume": False,
@@ -112,6 +115,9 @@ DEFAULTS = {
         # morning (fallback): every match of the offer gets a forecast before its start
         "forecasts": {"enabled": True, "every_minutes": 720, "morning": "07:30", "after_sts": True},
         "calibration_report": {"enabled": True, "every_minutes": 10080},
+        # TASK 016: once a day at night (a missed time runs once after the next start);
+        # retention and the free-space rule are in config/app.toml [backup]
+        "backup": {"enabled": True, "mode": "daily", "times": ["03:30"], "every_minutes": 1440},
     },
     "checkpoints_minutes": [2880, 1440, 360, 90, 60, 30, 15],
     "max_candidates": 30,
@@ -815,7 +821,40 @@ def job_sts_offer(store, paths, *, now, settings) -> JobOutcome:
             store, paths, "forecasts", now=now, settings=settings, trigger="sts_offer"
         )
         payload["forecasts"] = outcome.status
+    if fresh:  # TASK 016 §2.3: after a big import the write-ahead log goes back to the file
+        from sports_edge import maintenance
+
+        payload["wal_checkpoint"] = maintenance.checkpoint(store)["status"]
     return JobOutcome("ok", "", payload)
+
+
+def job_backup(store, paths, *, now, settings) -> JobOutcome:
+    """TASK 016 §3: the cyclic backup — WAL checkpoint (skipped when the database is busy),
+    free-space check, copy through SQLite's backup API, integrity check of the copy,
+    retention of cyclic copies. No space or a copy that fails its check: an alert."""
+    from sports_edge import alerts, backup, maintenance
+
+    wal = maintenance.checkpoint(store)
+    size = maintenance.size_report(store, paths, now=now)
+    found = backup.run_cyclic(paths, now=now)
+    payload = {
+        **{k: v for k, v in found.items() if k not in ("status", "reason")},
+        "wal_checkpoint": wal["status"],
+        "logical_bytes": size["logical_bytes"],
+        "processed": 1 if found["status"] == "ok" else 0,
+    }
+    if found.get("problem"):
+        kind = "backup_skipped" if found["problem"] == "space" else "backup_failed"
+        alerts.create(
+            store,
+            kind=kind,
+            message=f"Kopia zapasowa: {found['reason']}",
+            source="Sports Edge AI",
+            now=now,
+            identity=[kind, now.astimezone(WARSAW).date().isoformat(), found.get("folder")],
+            payload={k: v for k, v in payload.items() if isinstance(v, int | str | float)},
+        )
+    return JobOutcome(found["status"], found["reason"], payload)
 
 
 def _international(store, paths, *, now, cups: bool, national: bool) -> JobOutcome:
@@ -1186,6 +1225,7 @@ JOBS: dict[str, Callable] = {
     "cup_training": job_cup_training,
     "forecasts": job_forecasts,
     "calibration_report": job_calibration_report,
+    "backup": job_backup,
 }
 
 

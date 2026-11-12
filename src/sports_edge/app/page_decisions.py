@@ -95,8 +95,12 @@ def decisions_panel() -> None:
             "podanym źródłem). To nie jest rekomendacja zysku.",
         ],
     )
+    notice = st.session_state.pop("decision_notice", None)
+    if notice:  # TASK 016 §7: the last save changed nothing, so nothing was recorded
+        st.info(f"Decyzja: {notice}.")
     for key in dec.KEYS:
         _item(db, by_key[key])
+    _names_link(db)
     ui.section("Historia decyzji", "każdy wpis zostaje — cofnięcie to kolejny wpis")
     rows = dec.history(db)
     if rows:
@@ -120,6 +124,42 @@ def decisions_panel() -> None:
         )
     else:
         st.caption("Brak zapisanych decyzji.")
+
+
+def _names_link(db) -> None:
+    """TASK 016 §6.2: the STS club names of the cups (e.g. the Conference League) that wait
+    for the user's confirmation live in Źródła → Puchary i reprezentacje; here is the way."""
+    ui.section(
+        "Nazwy drużyn STS do potwierdzenia",
+        "puchary UEFA (m.in. Liga Konferencji) — bez potwierdzenia mecz nie łączy się z wynikami",
+    )
+    count = None
+    if not c.demo_mode():
+        try:
+            count = len(_pending_names(db, c.data_version(db), ten_minutes()))
+        except Exception:  # noqa: BLE001 — the link must work even when the list cannot be built
+            count = None
+    st.caption(
+        (
+            f"Czeka na Twoje potwierdzenie: {count}. "
+            if count is not None
+            else "Liczba czekających nazw: brak danych. "
+        )
+        + "Nazwę potwierdzasz jednym przyciskiem przy dowodzie (ten sam mecz w źródle: dzień, "
+        "godzina i rozpoznany przeciwnik). System nie łączy nazw sam."
+    )
+    c.page_link(
+        "zrodla",
+        "Przejdź do nazw do potwierdzenia (Źródła → Puchary i reprezentacje)",
+        query_params={"widok": "Puchary i reprezentacje"},
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=4)
+def _pending_names(_db, version: tuple, bucket) -> list[dict]:
+    from sports_edge import international_data as data
+
+    return data.sts_suggestions(_db, c.paths(), now=c.now())
 
 
 def _state(value: dict) -> str:
@@ -175,7 +215,13 @@ def _item(db, item: dict) -> None:
         )
 
 
-def _done() -> None:
+def _done(saved: str | None = "") -> None:
+    """After a button: a decision that changed nothing was not recorded (TASK 016 §7) —
+    the panel says so instead of adding a "bez zmian" row to the history."""
+    if saved is None:
+        st.session_state["decision_notice"] = dec.UNCHANGED
+    else:
+        st.session_state.pop("decision_notice", None)
     st.cache_data.clear()
     st.rerun()
 
@@ -196,8 +242,7 @@ def _gate(db, item: dict) -> None:
         disabled=not sure,
         icon=":material/verified:",
     ):
-        dec.decide_gate(db, c.paths(), accept=choice.startswith("Akceptuję"), now=c.now())
-        _done()
+        _done(dec.decide_gate(db, c.paths(), accept=choice.startswith("Akceptuję"), now=c.now()))
 
 
 def _option_d(db, item: dict) -> None:
@@ -219,8 +264,7 @@ def _option_d(db, item: dict) -> None:
         disabled=not sure,
         icon=":material/rule:",
     ):
-        dec.decide_option_d(db, c.paths(), c.settings(), value=choice, now=c.now())
-        _done()
+        _done(dec.decide_option_d(db, c.paths(), c.settings(), value=choice, now=c.now()))
 
 
 def _safe_solo(db, item: dict) -> None:
@@ -232,8 +276,7 @@ def _safe_solo(db, item: dict) -> None:
         disabled=not sure,
         icon=":material/looks_one:",
     ):
-        dec.decide_safe_solo(db, c.paths(), c.settings(), enabled=on, now=c.now())
-        _done()
+        _done(dec.decide_safe_solo(db, c.paths(), c.settings(), enabled=on, now=c.now()))
 
 
 def _limit(db, item: dict) -> None:
@@ -251,5 +294,4 @@ def _limit(db, item: dict) -> None:
         disabled=not sure,
         icon=":material/filter_alt:",
     ):
-        dec.decide_limit(db, c.paths(), c.settings(), value=int(value), now=c.now())
-        _done()
+        _done(dec.decide_limit(db, c.paths(), c.settings(), value=int(value), now=c.now()))

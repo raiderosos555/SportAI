@@ -99,6 +99,8 @@ CHANGES = {
     "dopiero po progu.",
 }
 SOURCES = {"panel": "panel Decyzje do podjęcia", "settings": "Ustawienia"}
+# TASK 016 §7: saving a decision that changes nothing adds no row — the panel says so
+UNCHANGED = "bez zmian — nic nie zapisano"
 
 
 # ---------------------------------------------------------------- the history
@@ -132,6 +134,13 @@ def record(
         payload_json=canonical(payload or {}),
     )
     return decision_id
+
+
+def unchanged(store: Store, decision: str, previous, new) -> bool:
+    """The state stays as it was AND the decision is already taken (it has a row of the
+    user): nothing to record. The first confirmation of a default still closes an open
+    decision — that is a change of the decision's state (open → taken)."""
+    return previous == new and last(store, decision) is not None
 
 
 def history(store: Store, decision: str | None = None) -> list[dict]:
@@ -201,12 +210,16 @@ def _limit_text(value: int) -> str:
 
 def decide_gate(
     store: Store, paths: AppPaths, *, accept: bool, now: datetime, source: str = "panel"
-) -> str:
+) -> str | None:
     """The USER accepts the v3 gate, keeps it blocked or withdraws the acceptance (the gate's
-    own model events of TASK 013 + a row of this history). Nothing is activated."""
+    own model events of TASK 013 + a row of this history). Nothing is activated. ``None``:
+    nothing changed and nothing was recorded (an accepted gate is a taken decision even when
+    it was accepted in Uczenie AI, before this history existed)."""
     from sports_edge import rolling
 
     previous = gate_value(store)
+    if accept == previous and (accept or last(store, GATE) is not None):
+        return None
     n = rolling.load_policy(paths.config).shadow_matches
     if accept and not previous:
         learning.accept_gate(store, now=now, shadow_matches=n, note=SOURCES.get(source, source))
@@ -241,9 +254,12 @@ def decide_option_d(
     value: str,
     now: datetime,
     source: str = "panel",
-) -> str:
-    """The USER chooses the definition of the cautious Elo double-chance bound."""
+) -> str | None:
+    """The USER chooses the definition of the cautious Elo double-chance bound (``None``:
+    unchanged and already decided — nothing recorded)."""
     previous, value = option_d_value(settings), bound_of(value)
+    if unchanged(store, OPTION_D, previous, value):
+        return None
     _save(paths, replace(settings, elo_dc_bound=value))
     return record(
         store,
@@ -251,7 +267,7 @@ def decide_option_d(
         previous={"elo_dc_bound": previous},
         new={"elo_dc_bound": value},
         summary=f"Granica „ostrożnie” podwójnej szansy Elo: {BOUND_LABELS[value]}"
-        + (" (bez zmian)" if value == previous else ""),
+        + (" (potwierdzenie dotychczasowego stanu)" if value == previous else ""),
         now=now,
         source=source,
     )
@@ -265,9 +281,12 @@ def decide_safe_solo(
     enabled: bool,
     now: datetime,
     source: str = "panel",
-) -> str:
-    """The USER switches the optional profile PEWNY SOLO on or off."""
+) -> str | None:
+    """The USER switches the optional profile PEWNY SOLO on or off (``None``: unchanged and
+    already decided — nothing recorded)."""
     previous = safe_solo_value(settings)
+    if unchanged(store, SAFE_SOLO, previous, bool(enabled)):
+        return None
     profiles = [p for p in (settings.enabled_profiles or []) if p != SAFE_PROFILE]
     if enabled:
         profiles.append(SAFE_PROFILE)
@@ -278,7 +297,7 @@ def decide_safe_solo(
         previous={"enabled": previous},
         new={"enabled": enabled},
         summary=f"Profil PEWNY SOLO: {_bool_text(enabled)}"
-        + (" (bez zmian)" if enabled == previous else ""),
+        + (" (potwierdzenie dotychczasowego stanu)" if enabled == previous else ""),
         now=now,
         source=source,
     )
@@ -292,9 +311,12 @@ def decide_limit(
     value: int,
     now: datetime,
     source: str = "panel",
-) -> str:
-    """The USER sets the limit of one selection in the day's coupons (0 = off)."""
+) -> str | None:
+    """The USER sets the limit of one selection in the day's coupons (0 = off; ``None``:
+    unchanged and already decided — nothing recorded)."""
     previous, value = limit_value(paths, settings), int(value)
+    if unchanged(store, LIMIT, previous, value):
+        return None
     stored = value if value != policy_limit(paths) else None
     _save(paths, replace(settings, max_profiles_per_selection=stored))
     return record(
@@ -303,7 +325,7 @@ def decide_limit(
         previous={"max_profiles_per_selection": previous},
         new={"max_profiles_per_selection": value},
         summary=f"Limit różnicowania: {_limit_text(value)}"
-        + (" (bez zmian)" if value == previous else ""),
+        + (" (potwierdzenie dotychczasowego stanu)" if value == previous else ""),
         now=now,
         source=source,
     )

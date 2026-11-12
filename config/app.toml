@@ -8,3 +8,12 @@ match_tolerance_minutes = 10
 sts_download_enabled = false
 arbiscan_enabled = false
 propline_enabled = false
+
+# TASK 016: the cyclic backup of the automation worker (backups/auto-YYYY-MM-DD_HH-MM-SS/).
+# Retention removes cyclic backup folders only — never pre-migration-* copies, manual backups
+# or database records. The schedule (daily, at night) is set in Automatyzacja AI.
+[backup]
+keep_daily = 7          # the newest cyclic backup of each of the last 7 days
+keep_weekly = 4         # ... and of each of the last 4 weeks
+min_free_factor = 2.0   # free disk space required before a copy: 2 x the database size
+check = "quick"         # integrity check of the copy: "quick" (quick_check) or "full"

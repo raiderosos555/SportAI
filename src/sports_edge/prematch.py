@@ -41,6 +41,15 @@ ABSENCE_REASON = {
     "unavailable": "niedostępny",
     "return": "powrót do kadry",
 }
+# TASK 016 §5.3: an absence entered by the user — always with a source; a withdrawal is
+# another row (``quality`` = WITHDRAWN) pointing at the entry it withdraws
+USER_REASONS = {
+    "kontuzja": "injury_reported",
+    "zawieszenie": "suspension",
+    "inne": "unavailable",
+}
+USER_QUALITY = "user"
+WITHDRAWN = "withdrawn"
 # Default checkpoints before kick-off (configurable in the automation panel).
 CHECKPOINTS = (
     ("T-48h", timedelta(hours=48)),
@@ -351,6 +360,114 @@ def record_absence(
     return absence_id, match_status
 
 
+def add_user_absence(
+    store: Store,
+    event: dict,
+    *,
+    team: str,
+    player: str,
+    reason: str,
+    source: str,
+    now: datetime,
+    source_url: str | None = None,
+    information_date: str | None = None,
+) -> str:
+    """TASK 016 §5.3: an absence entered by the user. The SOURCE is obligatory (a name and
+    an address, or a description such as "komunikat klubu") — without it nothing is stored.
+    The entry is append-only and counts as verified "by the user" (``entered_by = 'user'``):
+    a warning in the pre-match check and the coupon reassessment, never a model input."""
+    team, player, source = (team or "").strip(), (player or "").strip(), (source or "").strip()
+    if not source:
+        raise ValueError("Podaj źródło informacji o absencji — bez źródła wpis nie jest zapisywany")
+    if not player:
+        raise ValueError("Podaj zawodnika")
+    if team not in {event.get("home"), event.get("away")}:
+        raise ValueError("Wybierz drużynę tego meczu")
+    code = USER_REASONS.get(reason, reason)
+    if code not in ABSENCE_REASON or code == "return":
+        raise ValueError("Wybierz powód: kontuzja, zawieszenie albo inne")
+    start = datetime.fromisoformat(event["start_at"]) if event.get("start_at") else None
+    absence_id = digest(["absence_user", event["id"], team, player, code, source, iso(now)])
+    previous = store.rows(
+        """SELECT id FROM player_absence_observations WHERE event_id=? AND team_name=?
+        AND player_name=? ORDER BY observed_at DESC, rowid DESC LIMIT 1""",
+        (event["id"], team, player),
+    )
+    store.insert(
+        "player_absence_observations",
+        id=absence_id,
+        event_id=event["id"],
+        team_name=team,
+        player_name=player,
+        player_id=None,
+        reason=code,
+        source=source,
+        source_url=(source_url or "").strip() or None,
+        published_at=information_date or None,
+        observed_at=iso(now),
+        expected_return=None,
+        quality=USER_QUALITY,
+        match_status="verified",
+        entered_by="user",
+        known_before_start=int(start is not None and now < start),
+        previous_id=previous[0]["id"] if previous else None,
+    )
+    return absence_id
+
+
+def withdraw_absence(store: Store, absence_id: str, *, now: datetime, note: str = "") -> str:
+    """Withdrawing an entry is ANOTHER row (nothing is changed or deleted): the same match,
+    team, player and reason, ``quality = 'withdrawn'`` and ``previous_id`` = the entry."""
+    row = store.get("player_absence_observations", absence_id)
+    if row is None:
+        raise ValueError("Nie ma takiego wpisu absencji")
+    if row["quality"] == WITHDRAWN:
+        raise ValueError("Ten wpis jest już wycofaniem")
+    event = store.get("events", row["event_id"]) if row["event_id"] else None
+    start = datetime.fromisoformat(event["start_at"]) if event and event.get("start_at") else None
+    withdrawal_id = digest(["absence_withdrawal", absence_id, iso(now)])
+    store.insert(
+        "player_absence_observations",
+        id=withdrawal_id,
+        event_id=row["event_id"],
+        team_name=row["team_name"],
+        player_name=row["player_name"],
+        player_id=row["player_id"],
+        reason=row["reason"],
+        source=(note or "").strip() or f"wycofanie wpisu ({row['source']})",
+        source_url=row["source_url"],
+        published_at=None,
+        observed_at=iso(now),
+        expected_return=None,
+        quality=WITHDRAWN,
+        match_status=row["match_status"],
+        entered_by="user",
+        known_before_start=int(start is not None and now < start),
+        previous_id=absence_id,
+    )
+    return withdrawal_id
+
+
+def active_absences(store: Store, event_id: str) -> list[dict]:
+    """What holds NOW for a match: the newest row of every (team, player); a player whose
+    newest row is a withdrawal has no absence. The full history stays in ``absences``."""
+    newest: dict[tuple, dict] = {}
+    for row in store.rows(
+        """SELECT * FROM player_absence_observations WHERE event_id=?
+        ORDER BY observed_at, rowid""",
+        (event_id,),
+    ):
+        newest[(row["team_name"], row["player_name"])] = row
+    found = [r for r in newest.values() if r["quality"] != WITHDRAWN]
+    return sorted(found, key=lambda r: r["observed_at"], reverse=True)
+
+
+def verification_label(row: dict) -> str:
+    if row["entered_by"] == "user":
+        return "zweryfikowana przez użytkownika"
+    return "zweryfikowany" if row["match_status"] == "verified" else "do sprawdzenia"
+
+
 def conflicts(store: Store, event_id: str) -> list[dict]:
     """Players reported with different reasons by different sources (source conflict)."""
     seen: dict[tuple, dict] = {}
@@ -614,7 +731,8 @@ def summary(store: Store, event_id: str) -> dict:
         "lineup_status": lineup,
         "lineup_label": LINEUP_STATUS.get(lineup, lineup),
         "sides": sides,
-        "absences": absences(store, event_id),
+        # TASK 016: what holds now (a withdrawn manual entry is not an absence any more)
+        "absences": active_absences(store, event_id),
         "last_check": check,
         "changes": (check or {}).get("changes", []),
         "model_uses_lineups": False,  # Elo and Dixon–Coles do not use lineups or absences

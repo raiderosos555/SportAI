@@ -2700,6 +2700,7 @@ def run_prematch(
     blocked = getattr(fetch, "blocked", None)
     if blocked:  # no key / offline / disabled: one clear reason, not an error per match
         return {**out, "blocked": blocked}
+    without_source: list[dict] = []
     for event in targets:
         if force:
             due, missed = ("ręcznie", None), []
@@ -2725,6 +2726,14 @@ def run_prematch(
         out["changes"] += len(result.changes)
         out["errors"] += result.status == "error"
         out["alerts"] += alerts.from_check(store, event, result, now=now)
+        if (
+            event.get("priority") == 1
+            and result.absence_status == "no_source"
+            and not prematch.active_absences(store, event["id"])
+        ):
+            without_source.append(event)
+    # TASK 016 §4.4: one collective notice a day, not an alert per match
+    out["alerts"] += alerts.absence_notice(store, without_source, now=now)
     return out
 
 

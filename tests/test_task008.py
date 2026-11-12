@@ -227,8 +227,11 @@ def test_predicted_then_confirmed_lineup_with_changes_and_alerts(store, import_s
     assert second.lineup_status == "confirmed"
     alerts.from_check(store, event, second, now=T0 + timedelta(hours=1))
     assert alerts.from_check(store, event, second, now=T0 + timedelta(hours=2)) == 0  # no repeat
-    high = [a for a in alerts.recent(store) if a["kind"] == "goalkeeper_change"]
-    assert high and high[0]["priority"] == "high"
+    # TASK 016 §4.1: the lineup changes of one match and check are ONE alert with the list
+    # of changes; it keeps the highest priority of its changes (the goalkeeper: high)
+    high = [a for a in alerts.recent(store) if a["kind"] == "lineup_changes"]
+    assert len(high) == 1 and high[0]["priority"] == "high"
+    assert "goalkeeper_change" in {c["kind"] for c in high[0]["payload"]["changes"]}
 
 
 def test_no_lineup_no_data_incomplete_and_duplicates(store, import_sts):

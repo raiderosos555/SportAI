@@ -669,29 +669,60 @@ def _history(db) -> None:
 
 
 def _alerts(db) -> None:
-    unread = alerts.recent(db, limit=100, unread_only=True)
-    important = [a for a in unread if a["priority"] in ("high", "medium")]
-    ui.section("Ważne nowe zdarzenia", f"nieprzeczytane: {len(important)}")
-    if important:
-        ui.rows(
-            [
-                ui.list_row(
-                    title=a["message"],
-                    meta=f"{c.local_time(a['created_at'], '%d.%m %H:%M')} · {a['source']}",
-                    badges=[ui.pill(a["label"], "bad" if a["priority"] == "high" else "warn")],
-                    tone="bad" if a["priority"] == "high" else "warn",
-                )
-                for a in important[:15]
-            ]
+    # TASK 016 §4: grouped lineup changes, ranks (coupons → lineups of coupon matches → the
+    # rest), alerts of started matches collapsed, one button for every unread alert
+    found = alerts.overview(db, now=c.now())
+    unread = [a for a in found["items"] if not a["read"]]
+    important = [a for a in unread if a["rank"] <= 1 and not a["stale"]]
+    other = [a for a in unread if a["rank"] > 1 and not a["stale"]]
+    stale = [a for a in unread if a["stale"]]
+
+    def row(a: dict) -> str:
+        tone = "bad" if a["priority"] == "high" else "warn" if a["priority"] == "medium" else ""
+        return ui.list_row(
+            title=a["message"],
+            meta=f"{c.local_time(a['created_at'], '%d.%m %H:%M')} · {a['source']} · "
+            f"{alerts.RANKS[a['rank']]}",
+            badges=[ui.pill(a["label"], tone or "info")],
+            tone=tone,
         )
+
+    ui.section(
+        "Ważne alerty",
+        f"nieprzeczytane ważne: {len(important)} · wszystkie nieprzeczytane: {found['unread']}",
+    )
+    if important:
+        ui.rows([row(a) for a in important[:20]])
+        if len(important) > 20:
+            st.caption(f"Kolejne ważne: {len(important) - 20} — w historii powiadomień poniżej.")
     else:
-        st.caption("Brak ważnych nowych zdarzeń.")
-    if unread and st.button("Oznacz wszystkie jako przeczytane", icon=":material/done_all:"):
-        alerts.mark_read(db, [a["id"] for a in unread], now=c.now())
+        st.caption("Brak ważnych nowych alertów (kupony i składy meczów z kuponów).")
+    if unread and st.button(
+        "Oznacz wszystkie jako przeczytane",
+        icon=":material/done_all:",
+        key="alerts_mark_all",
+        help="Dopisuje odczyt do każdego nieprzeczytanego alertu — niczego nie usuwa.",
+    ):
+        done = alerts.mark_all_read(db, now=c.now())
+        st.toast(f"Oznaczono jako przeczytane: {done}")
         st.rerun()
-    minor = len(unread) - len(important)
-    if minor:
-        st.caption(f"Informacje o niższym priorytecie: {minor} — w historii powiadomień poniżej.")
+    if other:
+        with ui.details(f"Pozostałe alerty: {len(other)}", icon=":material/notifications:"):
+            ui.rows([row(a) for a in other[:40]])
+            if len(other) > 40:
+                st.caption(f"Kolejne: {len(other) - 40} — w historii powiadomień poniżej.")
+    if stale:
+        with ui.details(
+            f"Nieaktualne (mecz już się rozpoczął): {len(stale)}", icon=":material/history:"
+        ):
+            ui.rows([row(a) for a in stale[:40]])
+            if len(stale) > 40:
+                st.caption(f"Kolejne: {len(stale) - 40} — w historii powiadomień poniżej.")
+    if found["raw_unread"] != found["unread"]:
+        st.caption(
+            f"Zmiany składu jednego meczu z jednej kontroli są jedną pozycją: "
+            f"{found['raw_unread']} zapisanych alertów to {found['unread']} pozycji."
+        )
     ui.section("Informacje systemowe", "praca workera")
     events = db.rows(
         "SELECT created_at, kind, detail FROM automation_events WHERE kind!='command_processed' "
@@ -715,7 +746,7 @@ def _alerts(db) -> None:
     else:
         st.caption("Brak zdarzeń systemowych.")
     with ui.details("Historia powiadomień"):
-        every = alerts.recent(db, limit=100)
+        every = sorted(found["items"], key=lambda a: a["created_at"], reverse=True)[:200]
         if every:
             st.dataframe(
                 pd.DataFrame(
@@ -724,8 +755,10 @@ def _alerts(db) -> None:
                             "Czas": c.local_time(a["created_at"], "%d.%m %H:%M"),
                             "Rodzaj": a["label"],
                             "Treść": a["message"],
+                            "Grupa": alerts.RANKS[a["rank"]],
                             "Priorytet": a["priority"],
-                            "Przeczytane": "tak" if a["read_at"] else "nie",
+                            "Stan": "nieaktualny" if a["stale"] else "aktualny",
+                            "Przeczytane": "tak" if a["read"] else "nie",
                         }
                         for a in every
                     ]

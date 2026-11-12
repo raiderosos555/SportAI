@@ -324,12 +324,53 @@ def _scenario_decisions(page, base: str, shot: Path) -> dict:
     return found
 
 
+def _scenario_storage(page, base: str, shot: Path) -> dict:
+    """TASK 016 §2.4 / §3 / §4.2: the Dashboard counts important and all alerts; Źródła →
+    "Zbieranie danych i monitoring" shows the size of the database, its growth, the free
+    disk space and the cyclic backups."""
+    page.goto(f"{base}/?demo=1")
+    _settle(page)
+    found = {"alerts_visible": page.get_by_text("Alerty", exact=True).count() > 0}
+    page.goto(f"{base}/zrodla?widok=Zbieranie%20danych%20i%20monitoring&demo=1")
+    _settle(page)
+    found.update(_assess(page))
+    labels = ("Rozmiar bazy", "Przyrost z 7 dni", "Wolne miejsce na dysku", "Kopie cykliczne")
+    found["labels_visible"] = [t for t in labels if page.get_by_text(t).count() > 0]
+    found["ok"] = (
+        found["ok"] and found["alerts_visible"] and len(found["labels_visible"]) == len(labels)
+    )
+    _full_screenshot(page, shot)
+    return found
+
+
+def _scenario_absence(page, base: str, shot: Path) -> dict:
+    """TASK 016 §5.3: Analiza meczu → "Składy i absencje" — the manual absence form with the
+    obligatory source (opened, nothing is saved)."""
+    page.goto(f"{base}/analiza?demo=1")
+    _settle(page)
+    page.get_by_text("Tylko z prognozą", exact=True).click()
+    _settle(page)
+    page.get_by_text("Dodaj absencję ręcznie (ze źródłem)").first.click()
+    time.sleep(1.0)
+    found = _assess(page)
+    fields = ("Zawodnik", "Powód", "Źródło (obowiązkowe)", "Data informacji")
+    found["fields_visible"] = [t for t in fields if page.get_by_text(t, exact=True).count() > 0]
+    found["button_visible"] = page.get_by_role("button", name="Zapisz absencję").count() > 0
+    found["ok"] = (
+        found["ok"] and len(found["fields_visible"]) == len(fields) and found["button_visible"]
+    )
+    _full_screenshot(page, shot)
+    return found
+
+
 # TASK 010: checked at every screen size (the other scenarios at 1366 and 390 px only)
 EVERY_VIEW = (
     ("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),
     ("historia_oczekiwane", "Historia: oczekiwane kontra faktyczne", _scenario_expected),
     ("ustawienia_profil", "Ustawienia: limit selekcji i profil PEWNY SOLO", _scenario_settings),
     ("decyzje", "Dashboard i Modele: Decyzje do podjęcia", _scenario_decisions),  # TASK 015
+    ("baza_i_kopie", "Dashboard i Źródła: alerty, rozmiar bazy, kopie", _scenario_storage),
+    ("absencja", "Analiza meczu: formularz absencji ze źródłem", _scenario_absence),  # TASK 016
 )
 
 SCENARIOS = (

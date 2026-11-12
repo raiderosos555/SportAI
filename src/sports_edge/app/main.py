@@ -136,7 +136,7 @@ def sidebar() -> None:
                     if c.demo_mode()
                     else automation.status(c.paths(), db, now=c.now())["label"],
                 ),
-                ("Alerty", str(alerts.unread_count(db))),
+                ("Alerty", alerts.counts_text(alerts.overview(db, now=c.now()))),
                 ("Tryb", "offline" if settings.offline_mode else "online (na żądanie)"),
             ]
         )

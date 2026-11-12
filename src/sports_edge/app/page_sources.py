@@ -80,6 +80,7 @@ def _monitoring() -> None:
     """Data collection engine, job runs, storage, integrity, backup with a restore test."""
     import pandas as pd
 
+    from sports_edge import backup as backups
     from sports_edge import collection, maintenance
     from sports_edge.backup import create_backup
     from sports_edge.services import update_results_data
@@ -125,14 +126,14 @@ def _monitoring() -> None:
         st.json(found, expanded=False)
     ui.section("Baza danych", "rozmiar, przyrost, integralność i kopia zapasowa")
     disk = maintenance.storage_report(db, c.paths(), now=now)
+    # TASK 016 §2.4: the size, the growth over 7 days (from a known earlier size) and the
+    # free disk space; §3: the cyclic backups of the worker
+    size = maintenance.size_lines(maintenance.size_report(db, c.paths(), now=now))
     ui.metric_cards(
         [
-            ("Rozmiar bazy", f"{disk['bytes'] / 1e6:.1f} MB", f"schemat {disk['schema']}"),
-            (
-                "Przyrost / miesiąc",
-                f"~{disk['projected_bytes_per_month'] / 1e6:.1f} MB",
-                "szacunek z 7 dni",
-            ),
+            ("Rozmiar bazy", size["size"], f"schemat {disk['schema']} · {size['size_note']}"),
+            ("Przyrost z 7 dni", size["growth"], size["growth_note"]),
+            ("Wolne miejsce na dysku", size["free"], "dysk z bazą danych"),
             ("Pliki surowe", f"{disk['raw_bytes'] / 1e6:.1f} MB", "data/sources, data/raw"),
             ("Kopie zapasowe", f"{disk['backups_bytes'] / 1e6:.1f} MB", "folder backups/"),
             (
@@ -141,6 +142,40 @@ def _monitoring() -> None:
                 f"klucze obce: {disk['integrity']['foreign_key_errors']} błędów",
             ),
         ]
+    )
+    cyclic = [] if c.demo_mode() else backups.cyclic_backups(c.paths())
+    rule = backups.backup_config(c.paths())
+    ui.section(
+        "Kopie cykliczne",
+        f"zadanie workera „Kopia zapasowa bazy” · retencja: {rule['keep_daily']} dziennych + "
+        f"{rule['keep_weekly']} tygodniowe",
+    )
+    if cyclic:
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Kopia": b["folder"],
+                        "Utworzono": b["created"].strftime("%d.%m.%Y %H:%M"),
+                        "Rozmiar": f"{b['bytes'] / 1e6:.1f} MB",
+                        "Kontrola integralności": "OK" if b["ok"] else (b["integrity"] or "brak"),
+                    }
+                    for b in cyclic
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+        )
+    else:
+        st.caption(
+            "Brak kopii cyklicznych — pierwszą wykona worker (domyślnie codziennie o 03:30; "
+            "pominięty termin nadrabia po uruchomieniu). Harmonogram: Automatyzacja AI."
+        )
+    st.caption(
+        "Retencja usuwa wyłącznie starsze kopie cykliczne (foldery backups/auto-…). Kopie "
+        "sprzed migracji (pre-migration-…), kopie ręczne i rekordy bazy zostają nietknięte. "
+        "Przed kopią wymagane jest wolne miejsce: "
+        f"{rule['min_free_factor']:g}× rozmiar bazy; liczby w config/app.toml [backup]."
     )
     ui.explanation("Plan archiwizacji (nic nie jest usuwane automatycznie)", disk["archive_plan"])
     if st.button("Utwórz kopię zapasową i sprawdź odtworzenie", icon=":material/backup:"):

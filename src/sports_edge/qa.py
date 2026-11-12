@@ -288,6 +288,49 @@ def ui_paths(config: Path | None = None) -> list[dict]:
             board,
             ["jeden przedział (opcja D"],
         )
+        # ------------------------------------------------ TASK 016: data hygiene
+        from sports_edge import alerts
+        from sports_edge.services import open_store
+        from sports_edge.settings import AppPaths
+
+        home = AppPaths(Path(os.environ["SPORTS_EDGE_HOME"]))
+        db = open_store(home)
+        moment = datetime.now(UTC)
+        alerts.create(db, kind="coupon_attention", message="QA: kupon", source="QA", now=moment)
+        alerts.create(db, kind="calibration_flag", message="QA: flaga", source="QA", now=moment)
+        db.close()
+        counted = _app(_page("dashboard"), demo=False)
+        counted.run()
+        check("dashboard: alerty ważne i wszystkie", counted, ["ważne 1 · wszystkie 2"])
+        size = _app(_page("zrodla"))
+        size.session_state["sources_view"] = "Zbieranie danych i monitoring"
+        size.run()
+        shown = " ".join(m.value for m in size.markdown)
+        missing = [
+            t
+            for t in (
+                "Rozmiar bazy",
+                "Przyrost z 7 dni",
+                "Wolne miejsce na dysku",
+                "Kopie cykliczne",
+            )
+            if t not in shown
+        ]
+        record(
+            "źródła: rozmiar bazy i kopie cykliczne",
+            not missing and not _errors(size),
+            f"brak: {missing}" if missing else (_errors(size) or [""])[0],
+        )
+        match = _app(_page("analiza"))
+        match.session_state["match_only_model"] = False  # every match of the DEMO offer
+        match.run()
+        labels = {w.label for w in [*match.text_input, *match.selectbox]}
+        wanted = {"Drużyna", "Zawodnik", "Powód", "Źródło (obowiązkowe)"}
+        record(
+            "analiza meczu: formularz absencji ze źródłem",
+            wanted <= labels and not _errors(match),
+            f"brak pól: {sorted(wanted - labels)}" if not wanted <= labels else "",
+        )
     finally:
         if previous is None:
             os.environ.pop("SPORTS_EDGE_HOME", None)

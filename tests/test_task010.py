@@ -55,6 +55,9 @@ def _import(store, sha: str, at: datetime, prices: dict | None = None) -> str:
         source_id="sts_pdf_manual",
         data_kind="prospective",
         ingested_at=at,
+        # documents stored the way they were before TASK 016 (every document with its own
+        # odds ids — as in the existing database); the thrifty write: tests/test_task016.py
+        thrifty=False,
     ).import_id
 
 

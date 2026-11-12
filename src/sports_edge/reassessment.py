@@ -136,7 +136,13 @@ def reassess(
             fact(
                 "coupon_attention",
                 leg,
-                f"{name}: absencja {absence['player_name']} ({absence['reason']})",
+                f"{name}: absencja {absence['player_name']} ({absence['reason']})"
+                # TASK 016 §5.3: a manual entry is shown as verified by the user, with its source
+                + (
+                    f" — wpis użytkownika, źródło: {absence['source']}"
+                    if absence["entered_by"] == "user"
+                    else ""
+                ),
             )
             sources.add(absence["source"])
         if (

@@ -100,3 +100,31 @@ limit z rezerwą; koszykówka i hokej nieaktywne do weryfikacji schematu; regula
 użytkownik przy rejestracji). Hierarchia przy rozbieżnościach: oficjalny organizator > football-data.org >
 openfootball > CSV. Ranking i odpowiedzi na pytania o STS/Superbet:
 [raport TASK 004, sekcje B–D](task_004_report.md).
+
+## TASK 016 — Flashscore i Meczyki.pl: werdykt (sprawdzono 11.11.2026)
+
+Pytanie użytkownika: czy składy, kontuzje i statystyki można pobierać z Flashscore albo
+Meczyki.pl „na własny użytek”. **Werdykt: nie — automatyczne pobieranie jest wykluczone
+regulaminami obu serwisów, także przy użytku prywatnym.** Aplikacja nie zawiera i nie będzie
+zawierać scraperów tych serwisów; żadne dane z nich nie trafiły do bazy.
+
+| Serwis | Operator | Co mówi regulamin | `robots.txt` |
+|---|---|---|---|
+| Flashscore | Livesport s.r.o. (Praga, prawo czeskie) | pkt 2.2 — wyłącznie osobisty, niekomercyjny użytek; pkt 2.9 — zakaz pobierania zawartości bazy danych bez wyraźnej zgody; pkt 2.10 — zakaz scrapingu, agregowania i obciążających zapytań automatycznych bez wyraźnej zgody; pkt 2.11 — odpowiedzialność cywilna, administracyjna i karna | blokuje ścieżki wyników na żywo, wyników i tabel oraz roboty AI i roboty zbierające dane |
+| Meczyki.pl | OV Grupa sp. z o.o. (Gdańsk) | pkt II.11 — zakaz kopiowania bez wyraźnej zgody; zastrzeżony wybór i zestawienie materiałów. Osobnej klauzuli o scrapingu nie ma | nie stanowi zgody na automatyczne pobieranie |
+
+„Własny użytek” niczego tu nie zmienia: wyjątek użytku prywatnego w prawie baz danych dotyczy
+baz nieelektronicznych (to odczytanie przepisów na potrzeby projektu, nie porada prawna).
+
+**Legalne drogi:**
+
+1. **Pisemna zgoda operatora** — wniosek o zgodę na automatyczny odczyt określonego zakresu
+   (np. składy i absencje 12 lig); bez odpowiedzi nic się nie zmienia.
+2. **Ręczny wpis pojedynczych faktów ze źródłem** — od TASK 016 formularz w Analizie meczu
+   („Dodaj absencję ręcznie”): drużyna, zawodnik, powód, obowiązkowe źródło, data. To fakt
+   wpisany przez użytkownika, a nie kopia bazy serwisu.
+3. **Licencjonowane API** — bezpłatne plany już używane w projekcie (football-data.org,
+   PitchAPI, API-Sports, openfootball) w ich limitach; płatny plan tylko po decyzji użytkownika.
+
+Pomiar tego, co bezpłatne plany dają dla kontuzji, zawieszeń i statystyk meczowych (faktyczne
+odpowiedzi API z 11.11.2026): [raport TASK 016, sekcja 5](task_016_report.md).

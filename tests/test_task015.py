@@ -694,14 +694,16 @@ def test_migration_to_v11_backs_up_and_keeps_every_row(tmp_path):
     raw.commit()
     raw.close()
     migrated = Store(path, backup_dir=tmp_path / "backups")
-    assert SCHEMA_VERSION == 11
-    assert migrated.migration_backup.name.startswith("pre-migration-v11_")
+    assert SCHEMA_VERSION >= 11  # TASK 016: v12 adds quote_confirmations on top of v11
+    assert migrated.migration_backup.name.startswith(f"pre-migration-v{SCHEMA_VERSION}_")
     assert migrated.migration_backup.exists()
     for table, n in counts.items():
         if table != "schema_migrations":
             assert migrated.scalar(f"SELECT COUNT(*) FROM {table}") == n, table
     assert "user_decisions" in migrated.tables
-    note = migrated.rows("SELECT description FROM schema_migrations WHERE version=11")
+    note = migrated.rows(
+        "SELECT description FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
+    )
     assert note and "v11 TASK 015" in note[-1]["description"]
     with pytest.raises(sqlite3.DatabaseError, match="append_only"):
         migrated.connection.execute("DELETE FROM model_events")

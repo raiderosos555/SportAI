@@ -259,7 +259,18 @@ def save_analysis(
 
     ``pipeline`` keeps the stage report of the one-button flow (sources, data update, model
     versions, data snapshots) so the analysis can be reproduced and settled later.
+
+    TASK 016: only the selections the analysis could judge are stored item by item — those
+    with a model forecast and those named in the report. A selection without a forecast is
+    an offer row and nothing else: its price and document are in the offer tables (and
+    ``offer_table(as_of=created_at)`` returns them), so copying thousands of them into every
+    analysis only grew the database (measured: 95% of the bytes of ``analyses``). The
+    summary says how many selections were analysed and how many are stored.
     """
+    named = {
+        c.key for group in (report.solo, report.experimental, report.probable) for c in group
+    } | {c.key for c in report.probable_unconfirmed}
+    stored = [c for c in candidates if c.p_model is not None or c.key in named]
     items = [
         {
             "key": c.key,
@@ -295,7 +306,7 @@ def save_analysis(
             },
             "reasons": list(c.reasons),
         }
-        for c in candidates
+        for c in stored
     ]
     summary = {
         "headline": report.headline,
@@ -310,6 +321,9 @@ def save_analysis(
         "ako": {"created": report.ako.created, "reason": report.ako.reason},
         "model_versions": sorted({c.model_version_id for c in candidates if c.model_version_id}),
         "pipeline": pipeline or {},
+        "items_scope": "with_forecast_or_named",
+        "items_total": len(candidates),
+        "items_stored": len(stored),
     }
     key = digest(["analysis", report.day, iso(report.created_at), policy.version])
     with store.transaction():

@@ -1,6 +1,7 @@
 """Offer imports into the append-only store and the read models used by the application."""
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -77,10 +78,19 @@ def import_offer(
     raw_path: str | None = None,
     fetched_at: datetime | None = None,
     source_url: str | None = None,
+    thrifty: bool = True,
 ) -> ImportOutcome:
     """Idempotent: the same file parsed by the same parser version is imported once.
 
     Only STS offers enter the active store; anything else is refused before writing.
+
+    ``thrifty`` (TASK 016): a quote identical to the newest stored quote of its market (the
+    same prices, state and source line) is written as a light confirmation — "this document
+    confirmed quote set Y" — instead of a copy of the quote set and its odds. Every read
+    goes through ``quote_observations`` and sees the same observation either way; ``False``
+    keeps the full write (the comparison store of the tests). A market printed more than once
+    in one document (two lines read as the same market) is always written in full: which of
+    its lines counts is decided by their order in the document, as before.
     """
     if result.bookmaker != BOOKMAKER or any(r.bookmaker != BOOKMAKER for r in result.rows):
         raise ValueError("Aplikacja przyjmuje wyłącznie ofertę STS")
@@ -117,8 +127,7 @@ def import_offer(
             fetched_at=iso(fetched_at) if fetched_at else None,
             source_url=source_url,
         )
-        for row in result.rows:
-            _insert_row(store, row, import_key, valid_at, ingested)
+        insert_rows(store, result.rows, import_key, valid_at, ingested, thrifty=thrifty)
         for index, item in enumerate(result.review):
             store.insert(
                 "review_items",
@@ -132,7 +141,47 @@ def import_offer(
     return ImportOutcome(import_key, False, summary)
 
 
-def _insert_row(store: Store, row: OfferRow, import_key: str, valid_at, ingested: str) -> None:
+def insert_rows(
+    store: Store, rows, import_key: str, valid_at, ingested: str, *, thrifty: bool = True
+) -> None:
+    """The rows of one document (inside the caller's transaction). Thrifty only for a market
+    that the document lists once — see ``import_offer``."""
+    listed = Counter(market_id(row) for row in rows) if thrifty else {}
+    for row in rows:
+        _insert_row(
+            store,
+            row,
+            import_key,
+            valid_at,
+            ingested,
+            thrifty=thrifty and listed[market_id(row)] == 1,
+        )
+
+
+def _stored_quote(store: Store, market_key: str) -> dict | None:
+    """The newest stored quote set of a market with its odds (selection → price, text)."""
+    rows = store.rows(
+        """SELECT id, offer_code, source_text, status, quality, issues_json issues FROM quote_sets
+        WHERE market_id=? ORDER BY COALESCE(valid_at, '') DESC, ingested_at DESC LIMIT 1""",
+        (market_key,),
+    )
+    if not rows:
+        return None
+    odds = store.rows(
+        "SELECT selection_id, price, price_text FROM odds WHERE quote_set_id=?", (rows[0]["id"],)
+    )
+    return {**rows[0], "odds": {o["selection_id"]: (o["price"], o["price_text"]) for o in odds}}
+
+
+def _insert_row(
+    store: Store,
+    row: OfferRow,
+    import_key: str,
+    valid_at,
+    ingested: str,
+    *,
+    thrifty: bool = True,
+) -> None:
     event_key = event_id(row)
     store.insert(
         "events",
@@ -164,6 +213,30 @@ def _insert_row(store: Store, row: OfferRow, import_key: str, valid_at, ingested
         mapping_version=MAPPING_VERSION,
     )
     quote_key = digest(["quote", market_key, import_key, row.offer_code, row.page, row.y])
+    if thrifty:
+        # TASK 016: an unchanged quote is one confirmation row (its id is the id the quote
+        # set would have had, so every identity built on it stays the same)
+        stored = _stored_quote(store, market_key)
+        state = (row.offer_code, row.source_text, row.status.value, canonical(list(row.issues)))
+        prices = {
+            digest(["selection", market_key, s.key]): (str(s.odds), s.odds_text)
+            for s in row.selections
+        }
+        if (
+            stored is not None
+            and state == tuple(stored[k] for k in ("offer_code", "source_text", "status", "issues"))
+            and float(stored["quality"]) == float(row.quality)
+            and prices == stored["odds"]
+            and len(prices) == len(row.selections)
+        ):
+            store.insert(
+                "quote_confirmations",
+                id=quote_key,
+                quote_set_id=stored["id"],
+                import_id=import_key,
+                page=row.page,
+            )
+            return
     store.insert(
         "quote_sets",
         id=quote_key,
@@ -366,11 +439,11 @@ def offer_table(
       SELECT e.id event_id, e.bookmaker_id, e.sport, e.sport_raw, e.league, e.country, e.home,
              e.away, e.participants_json, e.name_raw, e.start_at, e.offer_date,
              m.id market_id, m.market_key, m.period, m.overtime, m.line, m.label_raw, m.rules_ref,
-             q.id quote_set_id, q.offer_code, q.page, q.source_text, q.status, q.quality,
-             q.issues_json, q.valid_at, q.ingested_at, q.import_id, i.parser_verified,
-             i.data_kind, i.offer_kind, i.fetched_at, i.raw_sha256, i.parser
-      FROM quote_sets q JOIN markets m ON m.id=q.market_id JOIN events e ON e.id=m.event_id
-      JOIN imports i ON i.id=q.import_id
+             q.id quote_set_id, q.source_id, q.offer_code, q.page, q.source_text, q.status,
+             q.quality, q.issues_json, q.valid_at, q.ingested_at, q.import_id,
+             i.parser_verified, i.data_kind, i.offer_kind, i.fetched_at, i.raw_sha256, i.parser
+      FROM quote_observations q JOIN markets m ON m.id=q.market_id
+      JOIN events e ON e.id=m.event_id JOIN imports i ON i.id=q.import_id
       WHERE {" AND ".join(where)}
     """
     latest: dict[str, dict] = {}
@@ -383,19 +456,22 @@ def offer_table(
         latest = {k: v for k, v in latest.items() if v["status"] == "ok"}
     if not latest:
         return []
-    odds_rows = store.rows(
-        f"""SELECT o.quote_set_id, o.id odds_id, o.price, s.key, s.id selection_id
-        FROM odds o JOIN selections s ON s.id=o.selection_id
-        WHERE o.quote_set_id IN ({",".join("?" for _ in latest)})""",
-        tuple(v["quote_set_id"] for v in latest.values()),
-    )
+    # a confirmed quote (TASK 016) has the odds of the quote set it confirmed (``source_id``)
+    sources = sorted({v["source_id"] for v in latest.values()})
     by_quote: dict[str, dict] = {}
-    for o in odds_rows:
-        by_quote.setdefault(o["quote_set_id"], {})[o["key"]] = {
-            "price": Decimal(o["price"]),
-            "odds_id": o["odds_id"],
-            "selection_id": o["selection_id"],
-        }
+    for start in range(0, len(sources), 900):
+        part = sources[start : start + 900]
+        for o in store.rows(
+            f"""SELECT o.quote_set_id, o.id odds_id, o.price, s.key, s.id selection_id
+            FROM odds o JOIN selections s ON s.id=o.selection_id
+            WHERE o.quote_set_id IN ({",".join("?" for _ in part)})""",
+            tuple(part),
+        ):
+            by_quote.setdefault(o["quote_set_id"], {})[o["key"]] = {
+                "price": Decimal(o["price"]),
+                "odds_id": o["odds_id"],
+                "selection_id": o["selection_id"],
+            }
     coverage = _coverage(store, known)
     results = latest_result_status(store, known)
     result = []
@@ -403,7 +479,7 @@ def offer_table(
         row = dict(row)
         row["participants"] = json.loads(row.pop("participants_json"))
         row["issues"] = json.loads(row.pop("issues_json"))
-        row["selections"] = by_quote.get(row["quote_set_id"], {})
+        row["selections"] = by_quote.get(row.pop("source_id"), {})
         newer = [
             c
             for c in coverage
@@ -434,7 +510,7 @@ def quote_history(store: Store, market_id: str) -> list[dict]:
     """Every observed price for a market, oldest first (CLV and audit)."""
     return store.rows(
         """SELECT q.valid_at, q.ingested_at, q.import_id, s.key, o.price, o.id odds_id
-        FROM quote_sets q JOIN odds o ON o.quote_set_id=q.id
+        FROM quote_observations q JOIN odds o ON o.quote_set_id=q.source_id
         JOIN selections s ON s.id=o.selection_id
         WHERE q.market_id=? AND q.status='ok' ORDER BY q.valid_at, q.ingested_at""",
         (market_id,),
@@ -460,6 +536,12 @@ def counts(store: Store) -> dict:
         "odds": store.scalar(
             "SELECT COUNT(*) FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id "
             "JOIN imports i ON i.id=q.import_id WHERE i.bookmaker_id=?",
+            sts,
+        ),
+        # TASK 016: unchanged quotes of later documents (no copy of the quote set and odds)
+        "quote_confirmations": store.scalar(
+            "SELECT COUNT(*) FROM quote_confirmations c JOIN imports i ON i.id=c.import_id "
+            "WHERE i.bookmaker_id=?",
             sts,
         ),
         "review_items": store.scalar("SELECT COUNT(*) FROM review_items"),

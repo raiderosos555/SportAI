@@ -45,6 +45,9 @@ def test_main_user_paths_of_the_interface():
         "dashboard: decyzje do podjęcia",  # TASK 015
         "modele: decyzje do podjęcia (5 pozycji)",
         "decyzje: opcja D i jej cofnięcie (dwa wpisy historii)",
+        "dashboard: alerty ważne i wszystkie",  # TASK 016
+        "źródła: rozmiar bazy i kopie cykliczne",
+        "analiza meczu: formularz absencji ze źródłem",
     ):
         assert expected in names
     assert any(name.startswith("brak danych") for name in names)

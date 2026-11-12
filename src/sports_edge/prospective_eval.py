@@ -523,7 +523,7 @@ def pre_match_quotes(store: Store, event_ids: set[str]) -> dict[tuple, dict]:
         rows = store.rows(
             f"""SELECT q.id quote_set_id, COALESCE(q.valid_at, q.ingested_at) observed_at,
             e.id event_id, e.start_at, m.market_key, m.line, s.key, o.price
-            FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id
+            FROM odds o JOIN quote_observations q ON q.source_id=o.quote_set_id
             JOIN selections s ON s.id=o.selection_id JOIN markets m ON m.id=q.market_id
             JOIN events e ON e.id=m.event_id JOIN imports i ON i.id=q.import_id
             WHERE e.id IN ({marks}) AND q.status='ok' AND m.period='FT'
@@ -897,7 +897,8 @@ def odds_age_report(
         marks = ",".join("?" for _ in part)
         for r in store.rows(
             f"""SELECT DISTINCT m.event_id, COALESCE(q.valid_at, q.ingested_at) observed_at
-            FROM quote_sets q JOIN markets m ON m.id=q.market_id JOIN imports i ON i.id=q.import_id
+            FROM quote_observations q JOIN markets m ON m.id=q.market_id
+            JOIN imports i ON i.id=q.import_id
             WHERE m.event_id IN ({marks}) AND q.status='ok' AND i.bookmaker_id='sts'""",
             tuple(part),
         ):
@@ -1046,7 +1047,7 @@ def today_odds_age(store: Store, *, now: datetime, settings: dict | None = None)
     for chunk in range(0, len(ids), 400):
         part = ids[chunk : chunk + 400]
         found = store.scalar(
-            f"""SELECT MAX(COALESCE(q.valid_at, q.ingested_at)) FROM quote_sets q
+            f"""SELECT MAX(COALESCE(q.valid_at, q.ingested_at)) FROM quote_observations q
             JOIN markets m ON m.id=q.market_id JOIN imports i ON i.id=q.import_id
             WHERE m.event_id IN ({",".join("?" for _ in part)}) AND q.status='ok'
             AND i.bookmaker_id='sts'""",

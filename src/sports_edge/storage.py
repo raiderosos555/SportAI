@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -41,6 +41,7 @@ MIGRATIONS = {
     9: "TASK 011: prospective STS market benchmark of the models (append-only snapshots)",
     10: "TASK 012: weekly prospective calibration reports (append-only history entries)",
     11: "TASK 015: the user's decisions (v3 gate, option D, profiles, limit) — append-only",
+    12: "TASK 016: unchanged STS quotes of a new document are light confirmations — append-only",
 }
 
 SCHEMA = """
@@ -94,6 +95,10 @@ CREATE TABLE IF NOT EXISTS odds (
  id TEXT PRIMARY KEY, quote_set_id TEXT NOT NULL REFERENCES quote_sets(id),
  selection_id TEXT NOT NULL REFERENCES selections(id), price TEXT NOT NULL,
  price_text TEXT NOT NULL, UNIQUE(quote_set_id, selection_id)
+);
+CREATE TABLE IF NOT EXISTS quote_confirmations (
+ id TEXT PRIMARY KEY, quote_set_id TEXT NOT NULL REFERENCES quote_sets(id),
+ import_id TEXT NOT NULL REFERENCES imports(id), page INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS review_items (
  id TEXT PRIMARY KEY, import_id TEXT NOT NULL REFERENCES imports(id), page INTEGER NOT NULL,
@@ -345,6 +350,16 @@ CREATE INDEX IF NOT EXISTS event_day ON events(bookmaker_id, offer_date);
 CREATE INDEX IF NOT EXISTS market_event ON markets(event_id);
 CREATE INDEX IF NOT EXISTS quote_market ON quote_sets(market_id, valid_at);
 CREATE INDEX IF NOT EXISTS odds_quote ON odds(quote_set_id);
+CREATE INDEX IF NOT EXISTS confirmation_quote ON quote_confirmations(quote_set_id);
+CREATE VIEW IF NOT EXISTS quote_observations AS
+ SELECT q.id, q.id AS source_id, q.market_id, q.import_id, q.offer_code, q.page, q.source_text,
+        q.status, q.quality, q.issues_json, q.valid_at, q.ingested_at, 0 AS confirmation
+ FROM quote_sets q
+ UNION ALL
+ SELECT c.id, c.quote_set_id, q.market_id, c.import_id, q.offer_code, c.page, q.source_text,
+        q.status, q.quality, q.issues_json, i.generated_at, i.ingested_at, 1
+ FROM quote_confirmations c JOIN quote_sets q ON q.id=c.quote_set_id
+ JOIN imports i ON i.id=c.import_id;
 CREATE INDEX IF NOT EXISTS result_event ON results(event_id);
 CREATE INDEX IF NOT EXISTS history_date ON historical_results(sport, match_date);
 CREATE TRIGGER IF NOT EXISTS odds_same_market BEFORE INSERT ON odds
@@ -419,6 +434,11 @@ class Store:
         v11: one new append-only table (``user_decisions``: every decision of the user from
         the panel "Decyzje do podjęcia" or Ustawienia — who, when, what, the previous and the
         new state; a withdrawal is a new row, TASK 015); no existing row is touched.
+        v12: one new append-only table (``quote_confirmations``: a new STS document whose
+        quote of a market is identical to the stored one adds "document X confirmed quote set
+        Y" instead of copying the quote set and its odds, TASK 016) and the read-only view
+        ``quote_observations`` (every observation of a quote: the stored quote sets and their
+        confirmations); no existing row is touched — old repeated quotes stay as they are.
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

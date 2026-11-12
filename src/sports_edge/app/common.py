@@ -194,6 +194,7 @@ def evaluation_version(db: Store) -> tuple:
             "SELECT COUNT(*) FROM prediction_settlements",
             "SELECT COUNT(*) FROM model_events",
             "SELECT COUNT(*) FROM quote_sets",
+            "SELECT COUNT(*) FROM quote_confirmations",  # TASK 016: confirmed quotes
         )
     )
 

@@ -35,10 +35,14 @@ def _dt(value: str | None) -> datetime | None:
 
 
 def selection_history(store: Store, selection_id: str) -> list[Observation]:
+    """Every observation of a selection's price: the stored quotes and — TASK 016 — the
+    documents that confirmed an unchanged quote (``quote_observations``)."""
     rows = store.rows(
         """SELECT q.valid_at, i.fetched_at, q.ingested_at, q.import_id, i.offer_kind, o.price
-        FROM odds o JOIN quote_sets q ON q.id=o.quote_set_id JOIN imports i ON i.id=q.import_id
-        WHERE o.selection_id=? AND q.status='ok' AND i.bookmaker_id='sts'
+        FROM selections s JOIN quote_observations q ON q.market_id=s.market_id
+        JOIN odds o ON o.quote_set_id=q.source_id AND o.selection_id=s.id
+        JOIN imports i ON i.id=q.import_id
+        WHERE s.id=? AND q.status='ok' AND i.bookmaker_id='sts'
         AND i.data_kind IN ('prospective','archive')
         ORDER BY q.valid_at, q.ingested_at""",
         (selection_id,),
@@ -166,8 +170,9 @@ def offer_changes(store: Store, older: str, newer: str) -> dict:
         return {
             (r["market_id"], r["key"]): r["price"]
             for r in store.rows(
-                """SELECT q.market_id, s.key, o.price FROM quote_sets q
-                JOIN odds o ON o.quote_set_id=q.id JOIN selections s ON s.id=o.selection_id
+                """SELECT q.market_id, s.key, o.price FROM quote_observations q
+                JOIN odds o ON o.quote_set_id=q.source_id
+                JOIN selections s ON s.id=o.selection_id
                 WHERE q.import_id=? AND q.status='ok'""",
                 (import_id,),
             )

@@ -121,12 +121,13 @@ def _status_strip(db, offer: dict | None, freshness: list[dict], now) -> None:
             if nexts and found["alive"]
             else "steruj w Automatyzacji AI",
         )
-    unread = alerts.unread_count(db)
+    # TASK 016 §4.2: important alerts (coupons, lineups of coupon matches) and all of them
+    found = alerts.overview(db, now=now)
     alert = (
         "Alerty",
-        f"{unread} nowych" if unread else "brak nowych",
-        "warn" if unread else "ok",
-        "kontrola składów i kuponów",
+        alerts.counts_text(found),
+        "bad" if found["important"] else "warn" if found["unread"] else "ok",
+        "ważne: kupony i składy meczów z kuponów",
     )
     ui.status_strip([sts, sport, robot, alert])
 

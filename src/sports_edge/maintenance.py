@@ -5,8 +5,10 @@ Nothing here deletes data: the archive plan only says what could be moved out of
 working database; doing it is always the user's decision.
 """
 
+import json
+import shutil
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from sports_edge.ingestion.types import iso
@@ -14,6 +16,8 @@ from sports_edge.settings import AppPaths
 from sports_edge.storage import SCHEMA_VERSION, Store
 
 GROWTH_TABLES = ("quote_sets", "odds", "predictions", "historical_results", "stat_observations")
+BUSY_TIMEOUT_MS = 15000  # the Store connection's own timeout (sqlite3.connect(timeout=15))
+GROWTH_DAYS = 7
 DATE_COLUMNS = {
     "quote_sets": "ingested_at",
     "predictions": "created_at",
@@ -71,8 +75,145 @@ def storage_report(store: Store, paths: AppPaths, *, now: datetime | None = None
             "archiwum i przenieść do osobnej bazy — prognozy i rozliczenia zostają.",
             "Surowe pliki źródłowe (data/sources, data/raw) można spakować po weryfikacji importu.",
             "Kopie zapasowe starsze niż 3 miesiące można przenieść na dysk zewnętrzny.",
-            "Aplikacja niczego nie usuwa sama — każda zmiana to decyzja użytkownika.",
+            "Aplikacja nie usuwa sama żadnych danych; retencja dotyczy wyłącznie starszych "
+            "kopii cyklicznych (backups/auto-…), nigdy kopii sprzed migracji ani rekordów.",
         ],
+    }
+
+
+def checkpoint(store: Store) -> dict:
+    """TASK 016 §2.3: move the write-ahead log into the database file and truncate it.
+
+    Never waits: with a reader or writer active the checkpoint is skipped (the next one
+    will do it) — the application is not blocked. Returns the status with a plain reason."""
+    wal = Path(str(store.path) + "-wal")
+    before = wal.stat().st_size if wal.is_file() else 0
+    connection = store.connection
+    if connection.in_transaction:
+        return {"status": "skipped", "reason": "trwa zapis — pominięto", "wal_before": before}
+    try:
+        connection.execute("PRAGMA busy_timeout=0")
+        row = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    except sqlite3.Error as error:
+        return {
+            "status": "skipped",
+            "reason": f"baza zajęta — pominięto ({type(error).__name__})",
+            "wal_before": before,
+        }
+    finally:
+        try:
+            connection.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+        except sqlite3.Error:
+            pass
+    after = wal.stat().st_size if wal.is_file() else 0
+    busy = bool(row[0]) if row else False
+    return {
+        "status": "skipped" if busy else "ok",
+        "reason": "baza zajęta — pominięto" if busy else "",
+        "wal_before": before,
+        "wal_after": after,
+    }
+
+
+def _size_points(store: Store, paths: AppPaths) -> list[tuple[datetime, int, str]]:
+    """Known sizes of the database in the past: (moment, bytes, where the number is from) —
+    the daily backup runs of the worker, cyclic and manual backups, pre-migration copies."""
+    points: list[tuple[datetime, int, str]] = []
+    if "job_runs" in store.tables:
+        for row in store.rows(
+            "SELECT finished_at, payload_json FROM job_runs WHERE job='auto:backup' "
+            "AND status IN ('ok','skipped','failed')"
+        ):
+            size = json.loads(row["payload_json"] or "{}").get("logical_bytes")
+            if isinstance(size, int) and size > 0:
+                points.append(
+                    (datetime.fromisoformat(row["finished_at"]), size, "zadanie kopii zapasowej")
+                )
+    if paths.backups.is_dir():
+        from sports_edge.backup import CYCLIC_PREFIX, STAMP, WARSAW
+
+        for item in paths.backups.iterdir():
+            name = item.name
+            try:
+                if item.is_file() and name.startswith("pre-migration-") and name.endswith(".db"):
+                    stamp = name[:-3].split("_", 1)[1]
+                    moment = datetime.strptime(stamp, STAMP).replace(tzinfo=UTC)
+                    points.append((moment, item.stat().st_size, "kopia sprzed migracji"))
+                elif item.is_dir() and (item / "sports_edge.db").is_file():
+                    stamp = name[len(CYCLIC_PREFIX) :] if name.startswith(CYCLIC_PREFIX) else name
+                    moment = datetime.strptime(stamp, STAMP).replace(tzinfo=WARSAW)
+                    points.append(
+                        (moment, (item / "sports_edge.db").stat().st_size, "kopia zapasowa")
+                    )
+            except (OSError, ValueError, IndexError):
+                continue
+    return sorted(points, key=lambda p: p[0])
+
+
+def size_report(store: Store, paths: AppPaths, *, now: datetime) -> dict:
+    """TASK 016 §2.4: the size of the database, its growth over the last 7 days and the free
+    disk space. The growth is the difference to a KNOWN earlier size (a backup or a daily
+    backup run); without such a point it is "brak danych" — never 0 and never a guess."""
+    database = Path(store.path)
+    wal = Path(str(database) + "-wal")
+    file_bytes = database.stat().st_size if database.is_file() else 0
+    pages = store.scalar("PRAGMA page_count") or 0
+    logical = pages * (store.scalar("PRAGMA page_size") or 0)
+    try:
+        free = shutil.disk_usage(database.parent if database.parent.is_dir() else paths.root).free
+    except OSError:
+        free = None
+    target = now - timedelta(days=GROWTH_DAYS)
+    # the known size closest to 7 days ago (at least a day old); the text says its real age
+    earlier = [p for p in _size_points(store, paths) if p[0] <= now - timedelta(days=1)]
+    reference = min(earlier, key=lambda p: abs(p[0] - target)) if earlier else None
+    growth = None
+    if reference is not None:
+        days = (now - reference[0]).total_seconds() / 86400
+        if days >= 1:
+            growth = {
+                "bytes": logical - reference[1],
+                "since": reference[0].isoformat(),
+                "days": round(days, 1),
+                "per_day": (logical - reference[1]) / days,
+                "basis": reference[2],
+                "exact_week": abs(days - GROWTH_DAYS) < 2,
+            }
+    return {
+        "file_bytes": file_bytes,
+        "wal_bytes": wal.stat().st_size if wal.is_file() else 0,
+        "logical_bytes": logical,
+        "free_bytes": free,
+        "growth": growth,
+    }
+
+
+def size_lines(report: dict) -> dict:
+    """Polish texts of ``size_report`` for the cards of Źródła i ustawienia."""
+
+    def mb(value) -> str:
+        if value is None:
+            return "brak danych"
+        if abs(value) >= 1e9:
+            return f"{value / 1e9:.2f} GB".replace(".", ",")
+        return f"{value / 1e6:.1f} MB".replace(".", ",")
+
+    growth = report["growth"]
+    if growth is None:
+        growth_value, growth_note = "brak danych", "brak wcześniejszego pomiaru rozmiaru"
+    else:
+        since = datetime.fromisoformat(growth["since"]).astimezone().strftime("%d.%m")
+        days = f"{growth['days']:.1f}".replace(".", ",")
+        growth_value = ("+" if growth["bytes"] >= 0 else "−") + mb(abs(growth["bytes"]))
+        growth_note = (
+            f"od {since} ({days} dnia)" if growth["days"] < 2 else f"od {since} ({days} dni)"
+        ) + f" · ok. {mb(abs(growth['per_day']))} dziennie · {growth['basis']}"
+    return {
+        "size": mb(report["logical_bytes"]),
+        "size_note": f"plik {mb(report['file_bytes'])} + dziennik WAL {mb(report['wal_bytes'])}",
+        "growth": growth_value,
+        "growth_note": growth_note,
+        "free": mb(report["free_bytes"]),
     }
 
 
