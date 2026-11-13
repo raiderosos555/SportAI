@@ -105,7 +105,7 @@ tam tylko status 221 zwalidowanych typów.
 
 ## 4. Nierozliczone kupony — przyczyna i powód na ekranie
 
-**TASIEMKA z 08.11** (7 nóg): brakowało nogi **Elche – Real Betis**. Wynik (0:2) był w bazie z
+**TASIEMKA z 08.11** (7 nóg): brakowało nogi **Elche – Real Betis**. Wynik był w bazie z
 football-data.org od 08.11, ale STS pisze „Real Betis”, a źródło „Real Betis Balompié” — bez
 aliasu noga nie dostała wyniku. Dodano zweryfikowany alias (dowód: ten sam dzień, rozpoznany
 przeciwnik Elche CF, jedyny mecz) do `config/team_aliases.toml`. Na kopii: wynik przeniesiony,
