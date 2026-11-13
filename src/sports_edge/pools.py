@@ -29,6 +29,9 @@ NATIONAL_DEFAULTS = {
     "elo": {"k": [20.0, 30.0, 40.0, 50.0, 60.0], "home_advantage": [40.0, 60.0, 80.0, 100.0]},
     "dixon_coles": {"half_life_days": [240.0, 480.0, 720.0, 1080.0], "window_days": 1460},
     "retraining": {"min_new_results": 60, "min_days_between_trainings": 28},
+    # TASK 019 §1.4: a period without any fixture list or STS archive longer than this may
+    # hide a whole FIFA window — the team's recent matches are "unknown" (a warning only)
+    "completeness": {"unknown_gap_days": 45},
 }
 
 

@@ -67,6 +67,8 @@ FREQUENCIES = {
     "calibration_report": [1440, 4320, 10080],
     # TASK 016: the cyclic backup (default: daily at a fixed time at night)
     "backup": [1440, 4320, 10080],
+    # TASK 019: the coupon of the day — once a day (a fixed time or before the first match)
+    "daily_coupon": [1440],
 }
 JOB_LABELS = {
     "results": "Aktualizacja wyników sportowych",
@@ -88,6 +90,32 @@ JOB_LABELS = {
     "forecasts": "Automatyczne prognozy meczów z oferty (dziś i jutro, bez kuponów)",
     "calibration_report": "Raport tygodniowy: kalibracja strefy kuponów i porównanie z rynkiem",
     "backup": "Kopia zapasowa bazy (cykliczna, z kontrolą integralności i retencją)",
+    "daily_coupon": "Kupon dnia (analiza i zapis kuponów, raz dziennie)",
+}
+# TASK 019 §4.3: short names for the calendar (the full label stays in the editor)
+SHORT_LABELS = {
+    "results": "Wyniki",
+    "prediction_settlement": "Rozliczenie prognoz",
+    "coupon_settlement": "Rozliczenie kuponów",
+    "lineups": "Składy",
+    "sts_offer": "Oferta STS",
+    "coupon_reassessment": "Kontrola kuponów",
+    "quality": "Jakość modeli",
+    "review": "Przegląd retreningu",
+    "uefa_results": "Wyniki pucharów",
+    "national_results": "Wyniki reprezentacji",
+    "national_shadow": "Cień reprezentacji",
+    "cup_monitor": "Mecze pucharowe",
+    "intl_completeness": "Kompletność danych",
+    "cup_training": "Eksperymenty pucharowe",
+    "forecasts": "Prognozy",
+    "calibration_report": "Raport tygodniowy",
+    "backup": "Kopia zapasowa",
+    "daily_coupon": "Kupon dnia",
+}
+DAILY_COUPON_TRIGGERS = {
+    "time": "o stałej godzinie",
+    "before_first": "N minut przed pierwszym meczem z prognozą",
 }
 DEFAULTS = {
     "auto_resume": False,
@@ -121,6 +149,13 @@ DEFAULTS = {
         # TASK 016: once a day at night (a missed time runs once after the next start);
         # retention and the free-space rule are in config/app.toml [backup]
         "backup": {"enabled": True, "mode": "daily", "times": ["03:30"], "every_minutes": 1440},
+        # TASK 019 §2.4: OFF by default; the user switches it on and chooses the moment
+        "daily_coupon": {
+            "enabled": False,
+            "trigger": "time",
+            "time": "09:00",
+            "lead_minutes": 120,
+        },
     },
     "checkpoints_minutes": [2880, 1440, 360, 90, 60, 30, 15],
     "max_candidates": 30,
@@ -514,9 +549,157 @@ def next_run(store: Store, job: str, settings: dict, *, now: datetime) -> dateti
         extra = slot["at"] if slot else None
     elif job == "forecasts":
         extra = morning_next(store, settings, now=now)
+    elif job == "national_results":
+        extra = national_matchday_next(store, settings, now=now)
+    elif job == "daily_coupon":
+        return daily_coupon_next(store, settings, now=now)
     if extra is not None and (when is None or extra < when):
         return extra
     return when
+
+
+def _warsaw_day_start(now: datetime) -> datetime:
+    today = now.astimezone(WARSAW).date()
+    return datetime.combine(today, datetime.min.time(), tzinfo=WARSAW)
+
+
+def daily_coupon_done_today(store: Store, *, now: datetime) -> bool:
+    """The coupon job already ran today (Warsaw day) — it runs at most once a day."""
+    start = _warsaw_day_start(now).astimezone(UTC)
+    return bool(
+        store.scalar(
+            "SELECT COUNT(*) FROM job_runs WHERE job=? AND started_at>=? AND status!='failed'",
+            (_job_name("daily_coupon"), iso(start)),
+        )
+    )
+
+
+def first_forecast_kickoff(store: Store, *, now: datetime) -> datetime | None:
+    """Today's first kick-off (still to come) of an STS event with a stored forecast."""
+    start = _warsaw_day_start(now)
+    end = start + timedelta(days=1)
+    found = store.scalar(
+        """SELECT MIN(e.start_at) FROM events e WHERE e.bookmaker_id='sts' AND e.start_at>?
+        AND e.start_at<? AND EXISTS (SELECT 1 FROM predictions p WHERE p.event_id=e.id
+        AND p.kind='prospective')""",
+        (iso(now), iso(end.astimezone(UTC))),
+    )
+    return datetime.fromisoformat(found) if found else None
+
+
+def daily_coupon_next(store: Store, settings: dict, *, now: datetime) -> datetime | None:
+    """TASK 019 §2.4: the next run of the coupon of the day. Off by default; once a day: at
+    the user's time, or ``lead_minutes`` before today's first match with a forecast."""
+    cfg = (settings.get("jobs") or {}).get("daily_coupon") or {}
+    if not cfg.get("enabled"):
+        return None
+    tomorrow = _warsaw_day_start(now) + timedelta(days=1)
+    if cfg.get("trigger") == "before_first":
+        if daily_coupon_done_today(store, now=now):
+            return None
+        first = first_forecast_kickoff(store, now=now)
+        if first is None:
+            return None
+        return max(first - timedelta(minutes=int(cfg.get("lead_minutes") or 0)), now)
+    hour, minute = (int(x) for x in str(cfg.get("time") or "09:00").split(":"))
+    today_slot = _warsaw_day_start(now).replace(hour=hour, minute=minute)
+    if not daily_coupon_done_today(store, now=now):
+        return today_slot.astimezone(UTC)
+    return tomorrow.replace(hour=hour, minute=minute).astimezone(UTC)
+
+
+def job_daily_coupon(store, paths, *, now, settings) -> JobOutcome:
+    """TASK 019 §2.4: the same path as the button "Analizuj mecze i generuj kupony" (today,
+    coupons saved — the identity and the official-coupon rule of TASK 010). Offline: no
+    download at all; online: the STS offer only with the user's consent (its own limits)."""
+    from sports_edge import alerts
+    from sports_edge.services import analysis_days, run_analysis
+
+    app = _app(paths)
+    online = not app.offline_mode
+    days = analysis_days("Dziś", now.astimezone(WARSAW).date())
+    run = run_analysis(
+        store,
+        paths,
+        app,
+        days,
+        now=now,
+        refresh_offer=online and download_allowed(paths),
+        refresh_results=online,
+    )
+    made = {
+        day: [name for name, p in (r.coupons.proposals if r.coupons else {}).items() if p]
+        for day, r in run.runs.items()
+    }
+    saves = {
+        name: result.get("relation")
+        for r in run.runs.values()
+        for name, result in r.coupon_saves.items()
+    }
+    names = sorted({n for found in made.values() for n in found})
+    day = days[0]
+    if names:
+        message = f"Kupony dnia gotowe ({day}): " + ", ".join(names)
+        kind = "daily_coupons_ready"
+    else:
+        message = f"Brak potwierdzonej przewagi — brak kuponu dnia ({day})"
+        kind = "daily_coupons_none"
+    alerts.create(
+        store,
+        kind=kind,
+        message=message,
+        source="Sports Edge AI",
+        now=now,
+        identity=["daily_coupon", day],
+        payload={"day": day, "profiles": names, "saves": saves},
+    )
+    return JobOutcome(
+        "ok",
+        message[:300],
+        {
+            "processed": len(names),
+            "new": sum(1 for v in saves.values() if v == "official"),
+            "profiles": names,
+            "saves": saves,
+            "offline": not online,
+        },
+    )
+
+
+def national_matchdays(store: Store, *, now: datetime) -> list[str]:
+    """TASK 019 §1.2: Warsaw days (today and yesterday) with an STS match of a modelled
+    national competition — on these days national results are fetched as often as the
+    league results."""
+    from sports_edge.datasources.competitions import COMPETITIONS
+    from sports_edge.pools import NATIONAL_CODES
+
+    headers = [h for code in NATIONAL_CODES for h in COMPETITIONS[code].sts_leagues]
+    if not headers:
+        return []
+    today = now.astimezone(WARSAW).date()
+    start = datetime.combine(today - timedelta(days=1), datetime.min.time(), tzinfo=WARSAW)
+    end = datetime.combine(today + timedelta(days=1), datetime.min.time(), tzinfo=WARSAW)
+    marks = ",".join("?" for _ in headers)
+    rows = store.rows(
+        f"""SELECT DISTINCT start_at FROM events WHERE bookmaker_id='sts' AND sport='football'
+        AND league IN ({marks}) AND start_at>=? AND start_at<? AND start_at<=?""",
+        (*headers, iso(start.astimezone(UTC)), iso(end.astimezone(UTC)), iso(now)),
+    )
+    return sorted(
+        {datetime.fromisoformat(r["start_at"]).astimezone(WARSAW).date().isoformat() for r in rows}
+    )
+
+
+def national_matchday_next(store: Store, settings: dict, *, now: datetime) -> datetime | None:
+    """The next run of ``national_results`` on a national match day (or the day after):
+    the interval of the league results job instead of the usual 3 days. None otherwise."""
+    jobs = settings.get("jobs") or {}
+    cfg = jobs.get("national_results") or {}
+    if not cfg.get("enabled") or not national_matchdays(store, now=now):
+        return None
+    every = int((jobs.get("results") or {}).get("every_minutes") or 180)
+    last = last_finished(store, "national_results")
+    return now if last is None else last + timedelta(minutes=every)
 
 
 def _scheduled_next(store: Store, job: str, settings: dict, *, now: datetime) -> datetime | None:
@@ -622,10 +805,36 @@ def job_prediction_settlement(store, paths, *, now, settings) -> JobOutcome:
 
 
 def job_coupon_settlement(store, paths, *, now, settings) -> JobOutcome:
+    from sports_edge import alerts
     from sports_edge.services import settle_coupons
 
     found = settle_coupons(store, paths, now=now)
-    return JobOutcome("ok", "", {"processed": sum(found.values()), "detail": found})
+    archived = alerts.archive_started(store, now=now)  # TASK 019 §4.3
+    return JobOutcome(
+        "ok", "", {"processed": sum(found.values()), "detail": found, "alerts_archived": archived}
+    )
+
+
+# TASK 019 §4.3: the skip codes of the national shadow task said as sentences
+SKIP_TEXT = {
+    "not_before_start": "mecz już rozpoczęty",
+    "outside_horizon": "mecz poza horyzontem prognozy",
+    "unmapped_competition": "rozgrywki bez mapowania na katalog",
+    "unmatched_participants": "drużyny nierozpoznane w historii",
+    "ambiguous_participants": "nazwa drużyny niejednoznaczna",
+    "missing_start_time": "brak godziny meczu",
+    "invalid_start_time": "błędna godzina meczu",
+    "incomplete_participants": "brak nazwy drużyny",
+    "ambiguous_fixture": "niejednoznaczny terminarz",
+    "no_experiment": "brak eksperymentu modelu",
+    "no_model": "brak modelu",
+}
+
+
+def skip_sentence(skips: dict) -> str:
+    """{"not_before_start": 73, …} → "Pominięte mecze: 73 — mecz już rozpoczęty; …"."""
+    parts = [f"{n} — {SKIP_TEXT.get(key, key.replace('_', ' '))}" for key, n in skips.items() if n]
+    return ("Pominięte mecze: " + "; ".join(parts) + ".") if parts else ""
 
 
 def job_lineups(store, paths, *, now, settings) -> JobOutcome:
@@ -926,7 +1135,8 @@ def job_national_shadow(store, paths, *, now, settings) -> JobOutcome:
         if offline
         else "zadanie lokalne — bez zapytań do zewnętrznych źródeł",
     ]
-    reasons.extend(f"{key}: {value}" for key, value in skips.items())
+    if skip_sentence(skips):
+        reasons.append(skip_sentence(skips))
     return JobOutcome(
         status,
         "; ".join(reasons)[:300],
@@ -1274,6 +1484,7 @@ JOBS: dict[str, Callable] = {
     "forecasts": job_forecasts,
     "calibration_report": job_calibration_report,
     "backup": job_backup,
+    "daily_coupon": job_daily_coupon,
 }
 
 
@@ -1340,6 +1551,11 @@ def planned(store: Store, settings: dict, *, now: datetime, days: int = 7) -> li
         if job == "forecasts" and _valid_time(cfg.get("morning") or ""):
             fixed = {"times": [cfg["morning"]], "weekdays": cfg.get("morning_weekdays")}
             out += [{"at": at, "job": job, "kind": "o godzinie"} for at in slots(fixed, now, end)]
+        if job == "daily_coupon":
+            when = daily_coupon_next(store, settings, now=now)
+            if when is not None and when <= end:
+                out.append({"at": when, "job": job, "kind": "raz dziennie"})
+            continue
         if job == "sts_offer" and matchday_next(store, settings, now=now) is not None:
             out += [
                 {"at": s["at"], "job": job, "kind": "w dniu meczu"}

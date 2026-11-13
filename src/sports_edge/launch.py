@@ -40,6 +40,9 @@ def main(argv: list[str] | None = None) -> int:
         cwd=str(paths.root),
     )
     time.sleep(2)
+    # TASK 019 §4.6: Streamlit's welcome lines are hidden (they carry the "agent skills"
+    # nudge) — the address of the interface is printed here
+    print(f"[Sports Edge AI] Interfejs: http://127.0.0.1:{args.port}")
     try:
         from sports_edge import automation
         from sports_edge.services import open_store

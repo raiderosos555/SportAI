@@ -61,12 +61,24 @@ def learning_panel() -> None:
             "Nowy model (challenger) nigdy nie zastępuje aktywnego sam: działa w trybie cienia, "
             "a o aktywacji decydujesz Ty.",
             "Wybór modelu i statusy: okno selekcji 2023/24. Holdout końcowy od 2024-07-01 jest "
-            "tylko raportowany (był używany do decyzji w TASK 005–006).",
+            "tylko raportowany (wcześniej był używany do decyzji).",
             "Najważniejsza ocena jest prospektywna: prognozy zapisane przed meczem i rozliczone "
             "po wyniku.",
         ],
     )
     gate_panel(db)
+    # TASK 019 §4.5: the rules of the evidence once; each scope keeps only its table
+    ui.explanation(
+        "Challengery i dowody — dla wszystkich zakresów",
+        [
+            "Różnica: log loss challengera minus aktywnej wersji na tych samych meczach (ujemna "
+            "= challenger lepszy); przedział z bootstrapu po meczach.",
+            "Aktywacja zawsze należy do Ciebie — system nigdy nie aktywuje modelu sam.",
+            "Challenger bez wspólnych rozliczonych meczów po 14 dniach albo zastąpiony nowszym "
+            "wygasa przy przeglądzie; identyczny z championem (ten sam protokół) wygasa od razu.",
+            "Szacowana data to szacunek z tempa rozliczeń ostatnich 14 dni, nie termin.",
+        ],
+    )
     for scope in MODEL_SCOPES:
         _scope(db, scope, now)
     _review(db, now)
@@ -164,8 +176,9 @@ def _scope(db, scope: str, now) -> None:
     for key, entry in compared.items():
         champion, challenger = entry["champion"], entry["challenger"]
         lines = [
-            f"Aktywna: {champion.get('version', '—')} (protokół {champion.get('protocol', '—')})",
-            f"Challenger: {challenger.get('version', 'brak')}"
+            f"Aktywna: {short_version(champion.get('version'))} "
+            f"(protokół {champion.get('protocol', '—')})",
+            f"Challenger: {short_version(challenger.get('version'), 'brak')}"
             + (f" (protokół {challenger['protocol']})" if challenger else ""),
             entry["conclusion"],
         ]
@@ -301,7 +314,7 @@ def _train(scope: str) -> None:
         "Wymuś trening także bez nowych meczów (challenger zostanie oznaczony jako wymuszony)",
         key=f"learn_force_{scope}",
         help="Bez nowych meczów od treningu aktywnej wersji challenger miałby te same dane — "
-        "domyślnie trening jest wtedy odrzucany (TASK 011).",
+        "domyślnie trening jest wtedy odrzucany.",
     )
     if st.button(
         f"Trenuj teraz — {SCOPE_LABELS[scope]}",
@@ -381,6 +394,14 @@ def _difference(pro: dict) -> str:
     return f"{ins.num(pro['difference'], 4)} ({ins.num(ci[0], 4)}…{ins.num(ci[1], 4)})"
 
 
+def short_version(value, empty: str = "—") -> str:
+    """TASK 019 §4.5: a model version without its full identifier in the basic view."""
+    if not value:
+        return empty
+    text = str(value)
+    return text if len(text) <= 24 else text[:12] + "…"
+
+
 def _decision_table(compared: dict) -> None:
     """TASK 011 §5.1: champion and challenger side by side with the state of the evidence."""
     rows = []
@@ -394,7 +415,7 @@ def _decision_table(compared: dict) -> None:
                 {
                     "Model": FAMILY_LABEL[key],
                     "Rola": role,
-                    "Wersja": (version or {}).get("version", "—"),
+                    "Wersja": short_version((version or {}).get("version")),
                     "Okno selekcji": _window(version or {}),
                     "Holdout (tylko raport)": _holdout(version or {}),
                     "Statusy rynków": _statuses(version or {}),
@@ -418,14 +439,6 @@ def _decision_table(compared: dict) -> None:
     for key, entry in compared.items():
         if entry.get("estimate"):
             st.caption(f"{FAMILY_LABEL[key]} — {entry['estimate']['label']}")
-    st.caption(
-        "Różnica: log loss challengera minus aktywnej wersji na tych samych meczach (ujemna = "
-        "challenger lepszy); przedział z bootstrapu po meczach. Aktywacja zawsze należy do "
-        "Ciebie — system nigdy nie aktywuje modelu sam. Challenger bez wspólnych rozliczonych "
-        "meczów po 14 dniach albo zastąpiony nowszym wygasa przy przeglądzie i przestaje "
-        "blokować trening; identyczny z championem (ten sam protokół) wygasa od razu. "
-        "Szacowana data to szacunek z tempa rozliczeń ostatnich 14 dni, nie termin."
-    )
 
 
 def _zone_frame(rows: list[dict], minimum: int) -> pd.DataFrame:

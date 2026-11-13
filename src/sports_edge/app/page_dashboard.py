@@ -18,7 +18,7 @@ import streamlit as st
 
 from sports_edge import alerts, automation
 from sports_edge import insights as ins
-from sports_edge.app import cart, prematch_ui, ui
+from sports_edge.app import cart, coupon_view, manual_ui, prematch_ui, ui
 from sports_edge.app import common as c
 from sports_edge.performance import builder_coupons, recent_line
 from sports_edge.repository import imports, offer_days
@@ -192,6 +192,9 @@ def _proposals(db, day: str, offer: dict) -> None:
             ui.pill("Zwalidowany", "ok") if validated else ui.pill("Model eksperymentalny", "warn")
         )
         badges.append(ui.pill(*outcome))
+        state = coupon_view.play_state(payload, c.now())  # TASK 019 §2.3
+        if state:
+            badges.append(ui.pill(*state))
         legs = len(payload["legs"])
         rows.append(
             ui.list_row(
@@ -271,6 +274,19 @@ def _picks(picks: list[dict], now) -> None:
 
 
 def _pending(db) -> None:
+    late = manual_ui.pending(db)  # TASK 019 §1.5: one line, the list is in Wydarzenia
+    if late:
+        ui.explanation(
+            f"Kupony czekające na wynik: {len(late)}",
+            [
+                f"{x['label']} z {c.local_time(x['first_start_at'], '%d.%m')}: brak "
+                + ", ".join(m["event"] for m in x["missing"][:2])
+                + f" — {x['missing'][0]['reason']}"
+                for x in late[:3]
+            ],
+            tone="warn",
+        )
+        c.page_link("wydarzenia", "Lista i ręczny wynik: Wydarzenia i wyniki → Zakończone")
     waiting = [x for x in builder_coupons(db) if x["outcome"] is None]
     if not waiting:
         ui.empty_state("Brak kuponów do rozliczenia", "Wszystkie zapisane kupony są rozliczone.")

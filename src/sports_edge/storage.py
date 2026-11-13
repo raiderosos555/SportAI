@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 ARCHIVED_BOOKMAKERS = ("superbet", "unknown")
 ARCHIVED_SOURCES = ("superbet_pdf_manual", "generic_pdf_manual")
 # Columns added after v2; applied with ALTER TABLE to old and new databases alike.
@@ -42,6 +42,7 @@ MIGRATIONS = {
     10: "TASK 012: weekly prospective calibration reports (append-only history entries)",
     11: "TASK 015: the user's decisions (v3 gate, option D, profiles, limit) — append-only",
     12: "TASK 016: unchanged STS quotes of a new document are light confirmations — append-only",
+    13: "TASK 019: alert states — an alert of a started match is archived by a new row",
 }
 
 SCHEMA = """
@@ -292,6 +293,11 @@ CREATE TABLE IF NOT EXISTS alert_reads (
  id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES prematch_alerts(id),
  read_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS alert_states (
+ id TEXT PRIMARY KEY, alert_id TEXT NOT NULL REFERENCES prematch_alerts(id),
+ state TEXT NOT NULL CHECK(state IN ('archived')), reason TEXT NOT NULL,
+ recorded_at TEXT NOT NULL, UNIQUE(alert_id, state)
+);
 CREATE TABLE IF NOT EXISTS coupon_reassessments (
  id TEXT PRIMARY KEY, coupon_id TEXT NOT NULL REFERENCES coupons(id), checked_at TEXT NOT NULL,
  trigger TEXT NOT NULL,
@@ -439,6 +445,9 @@ class Store:
         Y" instead of copying the quote set and its odds, TASK 016) and the read-only view
         ``quote_observations`` (every observation of a quote: the stored quote sets and their
         confirmations); no existing row is touched — old repeated quotes stay as they are.
+        v13: one new append-only table (``alert_states``: an alert about a match that has
+        already started is archived by a new row ``archived``, TASK 019); no alert and no
+        read mark is touched.
         """
         now = datetime.now(UTC).isoformat(timespec="microseconds")
         steps = [v for v in sorted(MIGRATIONS) if v > self.version_before]

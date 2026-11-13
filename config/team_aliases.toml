@@ -13,6 +13,10 @@
 "Espanyol" = "RCD Espanyol de Barcelona"
 "Racing Santander" = "Real Racing Club de Santander"
 "Real Sociedad" = "Real Sociedad de Fútbol"
+# TASK 019: fixture evidence 08.11.2026 — STS "Elche - Real Betis" and football-data.org
+# "Elche CF - Real Betis Balompié" (same day, opponent identified, the only match); without
+# this pair the TASIEMKA of 08.11 waited for its result
+"Real Betis" = "Real Betis Balompié"
 "Lazio Rzym" = "SS Lazio"
 "Olympique Lyon" = "Olympique Lyonnais"
 "PSG" = "Paris Saint-Germain FC"

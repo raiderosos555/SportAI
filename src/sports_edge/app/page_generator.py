@@ -38,11 +38,23 @@ def tasiemka_page() -> None:
 def _page(default: str) -> None:
     c.setup_page()
     rules = probability_policy(c.paths())
-    title = "Tasiemka" if default == "tasiemka" else "Kupon na kurs"
-    ui.app_header(
-        title,
-        "Kupon jak najbliżej wybranego kursu z najwyższą ostrożną szansą — bez obniżania progów",
-    )
+    if default == "tasiemka":  # TASK 019 §4.2: its own description, clearly apart
+        ui.app_header(
+            "Tasiemka",
+            "Długi kupon na kurs 8–12 z najmniejszą uzasadnioną liczbą zdarzeń — wysoka wypłata "
+            "przy niskiej szansie",
+        )
+        st.caption(
+            "Tasiemka to osobny profil (fioletowy): wiele zdarzeń, szansa zwykle kilka–kilkanaście "
+            "procent. Zwykły kupon na wybrany kurs zbudujesz w „Kupon na kurs” — tam Tasiemka "
+            "jest jednym z profili do wyboru."
+        )
+    else:
+        ui.app_header(
+            "Kupon na kurs",
+            "Kupon jak najbliżej wybranego kursu z najwyższą ostrożną szansą — bez obniżania "
+            "progów",
+        )
     cart.flash()
     db = c.store()
     days = offer_days(db)

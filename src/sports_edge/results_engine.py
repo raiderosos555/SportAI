@@ -42,6 +42,9 @@ SOURCE_PRIORITY = {
     "openfootball_cups": 5,
     "openfootball_int": 5,
     "csv": 6,
+    # TASK 019: a result typed in by the user with its source — the emergency exit when no
+    # provider has the match; any provider's later result takes precedence over it
+    "manual_entry": 8,
 }
 # TASK 009: in cups and national-team competitions the score semantics decide the order —
 # football-data.org and openfootball/champions-league report the 90-minute score, extra time
@@ -54,6 +57,7 @@ CUP_SOURCE_PRIORITY = {
     "pitchapi": 4,
     "api_sports": 5,
     "csv": 6,
+    "manual_entry": 8,
 }
 SOURCE_LABELS = {
     "manual_official": "oficjalny organizator (wpis użytkownika)",
@@ -64,7 +68,9 @@ SOURCE_LABELS = {
     "openfootball_cups": "openfootball/champions-league (CC0)",
     "openfootball_int": "openfootball/internationals (CC0)",
     "csv": "import CSV użytkownika",
+    "manual_entry": "wpis ręczny użytkownika (ze źródłem)",
 }
+MANUAL_ENTRY = "manual_entry"
 UNCERTAIN = '"regulation_certain":false'  # canonical JSON of details (no spaces)
 OVERLAP_DAYS = 3
 FIRST_WINDOW_DAYS = 60
@@ -146,7 +152,17 @@ def effective_results(
         pool = certain or list(newest)
         chosen_source = min(pool, key=lambda s: priority(s, code))
         chosen = dict(newest[chosen_source])
-        scores = {(newest[s]["home_score"], newest[s]["away_score"]) for s in pool}
+        # TASK 019: the user's entry never blocks a provider's result as a "conflict" — the
+        # provider wins and a different entry is reported separately (``manual_differs``)
+        compared = [s for s in pool if s != MANUAL_ENTRY] or pool
+        scores = {(newest[s]["home_score"], newest[s]["away_score"]) for s in compared}
+        manual = newest.get(MANUAL_ENTRY)
+        chosen["manual_differs"] = bool(
+            manual is not None
+            and chosen_source != MANUAL_ENTRY
+            and (manual["home_score"], manual["away_score"])
+            != (chosen["home_score"], chosen["away_score"])
+        )
         chosen["provider_resolved"] = chosen_source
         chosen["providers"] = sorted(newest, key=lambda s: priority(s, code))
         chosen["regulation_certain"] = bool(certain)

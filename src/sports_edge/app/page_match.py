@@ -48,7 +48,8 @@ def match_page() -> None:
         return
     top = st.columns([2, 1, 1])
     with top[0]:
-        day = c.offer_day_choice(days, key="match_day")
+        # TASK 019 §3.1: the nearest day with a match still before its start
+        day = c.offer_day_choice(days, key="match_day", upcoming=True)
     only_model = top[1].toggle("Tylko z prognozą", value=True, key="match_only_model")
     show_done = top[2].toggle("Pokaż rozpoczęte", value=False, key="match_done")
     kind = iui.category_filter("match_category")
@@ -111,9 +112,12 @@ def match_page() -> None:
     teams = (features or {}).get("features", {}).get("teams", {})
     max_odds = float(probability_policy(c.paths()).builder["max_odds_per_leg"])
     info = prematch.summary(db, choice)
+    international = iui.category(head.league, head.sport) in ("european", "national")
+    view = iui.schedule_of(db, choice, now) if international else None
+    gaps = next((r.data_gaps for r in rows if getattr(r, "data_gaps", "")), "")
     # level 1: who plays, the probabilities, the pick
-    match_view.header(head, context, rows, started, review, info)
-    if iui.category(head.league, head.sport) in ("european", "national"):
+    match_view.header(head, context, rows, started, review, info, view, gaps)
+    if international:
         iui.event_block(db, choice, now)
     if started:
         _post_match(review, head)
@@ -128,7 +132,7 @@ def match_page() -> None:
     pick = _pick(rows, now, max_odds, started, day)
     # level 2: comparison, risk factors, short reasoning
     ui.section("Porównanie drużyn", "dane znane przed prognozą")
-    match_view.comparison(head, teams)
+    match_view.comparison(head, teams, view)
     ui.section("Analiza meczu")
     match_view.analysis(rows, teams, info, pick, started=started)
     # level 3: everything else on demand

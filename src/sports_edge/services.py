@@ -120,7 +120,8 @@ MODEL_SCOPES = {
 }
 SCOPE_LABELS = {
     "core": "5 czołowych lig",
-    "extended": "7 lig dodanych w TASK 006",
+    "extended": "7 lig rozszerzonych (Championship, Eredivisie, Portugalia, Belgia, "
+    "2. Bundesliga, Turcja, Ekstraklasa)",
     "national": "reprezentacje",
 }
 # club leagues (freshness, sources); MODELLED_COMPETITIONS: everything a served model covers
@@ -1695,9 +1696,12 @@ def day_candidates_at(
         # TASK 015 (option D): the user's definition of the Elo double-chance bound
         elo_dc_bound=getattr(settings, "elo_dc_bound", "sum"),
     )
+    from sports_edge import team_gaps
     from sports_edge.international import gate_candidates
 
-    return gate_candidates(store, candidates), predictions  # TASK 009: cups after validation
+    gated = gate_candidates(store, candidates)  # TASK 009: cups after validation
+    # TASK 019 §1.4: the team-data warning; the user's rule decides the rest
+    return team_gaps.apply_rule(store, paths, settings, gated, now=now), predictions
 
 
 def match_review(

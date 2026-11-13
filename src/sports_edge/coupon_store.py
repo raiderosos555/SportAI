@@ -433,6 +433,8 @@ def _leg(leg: Candidate) -> dict:
         "odds_age_hours": leg.odds_age_hours,
         "freshness": leg.freshness,
         "prediction_id": getattr(leg, "prediction_id", None),  # TASK 013: the forecast of the leg
+        # TASK 019 §1.4: only when a national team's recent results are incomplete
+        **({"data_gaps": leg.data_gaps} if getattr(leg, "data_gaps", "") else {}),
     }
 
 

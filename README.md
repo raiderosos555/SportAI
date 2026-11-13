@@ -51,6 +51,11 @@ Funkcje:
   retencją 7 dziennych + 4 tygodniowych, alerty zgrupowane i uszeregowane („ważne” i
   „wszystkie”, „Oznacz wszystkie jako przeczytane”), ręczny wpis absencji z obowiązkowym
   źródłem, rozmiar bazy i wolne miejsce w Źródłach.
+- codzienny przebieg bez martwych punktów (TASK 019): ręczny wynik ze źródłem (append-only,
+  wynik dostawcy ma pierwszeństwo, różnica = alert, kolumna „Źródło wyniku”), kupony
+  czekające na wynik z powodem, miara „model nie zna N ostatnich meczów drużyny” i decyzja o
+  reprezentacjach z brakami, zadanie „Kupon dnia” (domyślnie wyłączone), stany „W grze” /
+  „Czeka na wynik”, alerty meczów rozpoczętych archiwizowane (schemat v13), ekrany po polsku.
 
 Tryb **analityczny i paper trading** — aplikacja nie obstawia i nie łączy się z kontem
 bukmachera. Szansa trafienia to oszacowanie modelu, nie gwarancja. Status „zwalidowany
@@ -61,7 +66,7 @@ Kod jest w repozytorium GitHub
 (stan z 06.11.2026). Aplikacja i jej dane działają lokalnie: baza, oferty PDF, eksporty,
 kopie zapasowe i `.env` nie trafiają do repozytorium (`.gitignore`, sprawdzane testem
 `tests/test_task010.py`). Commity i push wyłącznie na wyraźne polecenie.
-Stan i ograniczenia: [raport TASK 018](docs/task_018_report.md).
+Stan i ograniczenia: [raport TASK 019](docs/task_019_report.md).
 
 ## Uruchomienie na Windows
 

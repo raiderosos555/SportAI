@@ -32,3 +32,12 @@ window_days = 1460
 # are played in one FIFA window: a review after every window, at most one training a window.
 min_new_results = 60
 min_days_between_trainings = 28
+
+[completeness]
+# TASK 019 §1.4: the 150-day freshness rule cannot see a missing FIFA window. Per team the
+# application counts the matches that certainly took place without a result (STS offer
+# archive, fixture lists). A period before the first day covered by those sources that is
+# longer than this many days may hide a whole window (autumn windows are 4–6 weeks apart): the
+# team's recent matches are "nieznane" — a warning; whether such selections reach the
+# profiles that require validation is the user's decision (panel "Decyzje do podjęcia").
+unknown_gap_days = 45

@@ -552,7 +552,8 @@ def test_every_decision_and_its_withdrawal_is_a_new_row(store, app_paths):
     items = decisions.panel(store, app_paths, settings, now=NOW, compared={})
     assert [i["key"] for i in items] == list(decisions.KEYS)
     assert all(i["changes"] and i["evidence"] and i["risk"] for i in items)
-    assert decisions.open_count(items) == 4  # nothing decided; challengers wait for nothing
+    # nothing decided; challengers wait for nothing (TASK 019: + reprezentacje z brakami)
+    assert decisions.open_count(items) == 5
     decisions.decide_option_d(store, app_paths, settings, value=BOUND_SINGLE, now=NOW)
     assert load_settings(app_paths).elo_dc_bound == BOUND_SINGLE
     decisions.decide_option_d(
@@ -580,7 +581,8 @@ def test_every_decision_and_its_withdrawal_is_a_new_row(store, app_paths):
     gate = [e["kind"] for e in learning.events(store) if e["kind"] in learning.GATE_KINDS]
     assert gate == ["protocol_gate_accepted", "protocol_gate_withdrawn"]
     items = decisions.panel(store, app_paths, load_settings(app_paths), now=NOW, compared={})
-    assert decisions.open_count(items) == 0
+    # TASK 019: only the new decision about national teams with missing results stays open
+    assert [i["key"] for i in items if i["open"]] == [decisions.NATIONAL_GAPS]
     with pytest.raises(sqlite3.DatabaseError, match="append_only"):
         store.connection.execute("UPDATE user_decisions SET summary='x'")
     with pytest.raises(sqlite3.DatabaseError, match="append_only"):
@@ -725,7 +727,7 @@ def test_dashboard_shows_the_decisions_and_the_panel_has_all_six(app_paths):
     dashboard.run()
     assert not dashboard.exception, dashboard.exception
     text = " ".join(m.value for m in dashboard.markdown)
-    assert "Decyzje do podjęcia" in text and "otwarte: 4 z 6" in text
+    assert "Decyzje do podjęcia" in text and "otwarte: 5 z 7" in text
     models = AppTest.from_string(
         "from sports_edge.app.page_models import models_page; models_page()",
         default_timeout=90,

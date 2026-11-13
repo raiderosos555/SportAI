@@ -22,7 +22,7 @@ LEVEL = {
 }
 MODEL_NOTE = (
     "Czy model wykorzystał tę informację? Nie — Elo i Dixon–Coles liczą szanse z wyników "
-    "meczów. Składy i absencje są pokazywane jako ostrzeżenie (Etap A) i nie zmieniają procentów."
+    "meczów. Składy i absencje są pokazywane jako ostrzeżenie i nie zmieniają procentów."
 )
 
 
@@ -42,7 +42,38 @@ def event_of_odds(db, odds_id: str | None) -> str | None:
     return rows[0]["event_id"] if rows else None
 
 
-def leg_status(db, event_id: str | None) -> str:
+def check_reason(db, event_id: str, saved_at: str | None = None) -> str:
+    """TASK 019 §2.3: why a leg has no lineup check — said as a fact, not "not yet"."""
+    from sports_edge.datasources.competitions import for_sts_league
+    from sports_edge.datasources.pitchapi import LEAGUES
+
+    event = db.get("events", event_id) or {}
+    league = for_sts_league(event.get("league") or "", event.get("sport"))
+    if league is None or league.code not in LEAGUES:
+        return "kontrola: brak źródła składów dla tych rozgrywek"
+    start = event.get("start_at")
+    if not start or datetime.fromisoformat(start) > c.now():
+        return "kontrola: zaplanowana przed meczem"
+    missed = db.scalar(
+        "SELECT COUNT(*) FROM prematch_checks WHERE event_id=? AND status='missed'", (event_id,)
+    )
+    if missed:
+        return "kontrola: pominięta — automatyzacja nie działała w punktach kontrolnych"
+    last_point = datetime.fromisoformat(start) - automation_last_checkpoint()
+    if saved_at and datetime.fromisoformat(saved_at) >= last_point:
+        return "kontrola: kupon zapisany po ostatnim punkcie kontroli"
+    return "kontrola: nie odbyła się przed meczem (automatyzacja zatrzymana lub wyłączona)"
+
+
+def automation_last_checkpoint():
+    from datetime import timedelta
+
+    settings = automation.load_settings(c.store())
+    minutes = [int(m) for m in settings.get("checkpoints_minutes") or [15]]
+    return timedelta(minutes=min(minutes))
+
+
+def leg_status(db, event_id: str | None, saved_at: str | None = None) -> str:
     """One line for a coupon leg: lineup status, changes, absences and the last check."""
     if not event_id:
         return "składy: brak danych"
@@ -58,7 +89,7 @@ def leg_status(db, event_id: str | None) -> str:
     parts.append(
         f"kontrola: {c.local_time(check['executed_at'], '%d.%m %H:%M')}"
         if check
-        else "kontrola: jeszcze nie wykonana"
+        else check_reason(db, event_id, saved_at)
     )
     return " · ".join(parts)
 

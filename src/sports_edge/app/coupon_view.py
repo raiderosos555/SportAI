@@ -29,15 +29,47 @@ PROFILE_TEXT = {
     "wypłata przy niskiej szansie.",
     "safe_solo": "Kurs od 1,15: jedna selekcja z ostrożną szansą co najmniej 75% — profil "
     "opcjonalny, włączony przez Ciebie w Ustawieniach; niska wypłata za wysoką szansę.",
-    "safe": "Profil sprzed TASK 007 (Bezpieczny).",
-    "balanced": "Profil sprzed TASK 007 (Zrównoważony).",
-    "aggressive": "Profil sprzed TASK 007 (Agresywny).",
+    "safe": "Dawny profil (Bezpieczny).",
+    "balanced": "Dawny profil (Zrównoważony).",
+    "aggressive": "Dawny profil (Agresywny).",
 }
 OUTCOME = {"win": ("Trafiony", "ok"), "loss": ("Nietrafiony", "bad")}
 SIMULATED = 20  # coupons in the budget simulation
 
 
-def status_badges(payload: dict) -> list[str]:
+def play_state(payload: dict, now=None) -> tuple[str, str] | None:
+    """TASK 019 §2.3: "W grze" from the first kick-off, "Czeka na wynik" after the last match
+    (typical duration) until the coupon is settled; None before the start or when settled."""
+    from datetime import datetime
+
+    from sports_edge.repository import EVENT_DURATION
+
+    if payload.get("outcome"):
+        return None
+    starts = sorted(
+        datetime.fromisoformat(leg["start_at"])
+        for leg in payload.get("legs", [])
+        if leg.get("start_at")
+    )
+    if not starts:
+        return None
+    now = now or c.now()
+    if now < starts[0]:
+        return None
+    if now >= starts[-1] + EVENT_DURATION["football"]:
+        return ("Czeka na wynik", "warn")
+    return (f"W grze od {c.local_time(starts[0].isoformat(), '%H:%M')}", "info")
+
+
+def started(payload: dict, now=None) -> bool:
+    """At least one match of the coupon has started (no adding to Mój kupon)."""
+    return play_state(payload, now) is not None or any(
+        leg.get("start_at") and leg["start_at"] <= (now or c.now()).isoformat()
+        for leg in payload.get("legs", [])
+    )
+
+
+def status_badges(payload: dict, now=None) -> list[str]:
     validated = payload.get("level") == "validated_predictive"
     out = [
         ui.pill("Zwalidowany predykcyjnie", "ok")
@@ -45,6 +77,9 @@ def status_badges(payload: dict) -> list[str]:
         else ui.pill("SYMULACJA — model eksperymentalny", "warn")
     ]
     out.append(ui.pill(*OUTCOME.get(payload.get("outcome") or "", ("Nierozliczony", "neutral"))))
+    state = play_state(payload, now)
+    if state:
+        out.append(ui.pill(*state))
     return out
 
 
@@ -76,11 +111,11 @@ def _notes(*parts: str | None) -> str:
     return " · ".join(p for p in parts if p)
 
 
-def legs(payload: dict, db) -> list[dict]:
+def legs(payload: dict, db, saved_at: str | None = None) -> list[dict]:
     out = []
     for leg in payload["legs"]:
         lineup = prematch_ui.leg_status(
-            db, leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"])
+            db, leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"]), saved_at
         )
         out.append(
             {
@@ -102,7 +137,8 @@ def legs(payload: dict, db) -> list[dict]:
                     if leg["predictive_status"] == "validated_predictive"
                     else "eksperymentalny"
                 ),
-                "note": _notes(lineup, c.calibration_note(leg)),  # TASK 011 §2.3
+                # TASK 011 §2.3 calibration; TASK 019 §1.4 national team data incomplete
+                "note": _notes(lineup, c.calibration_note(leg), leg.get("data_gaps")),
             }
         )
     return out
@@ -383,13 +419,20 @@ def card(
             + status_html(status, payload)
             + stats(payload)
             + f'<p class="se-desc se-num">{ui.esc(loss_text(payload))}</p>'
-            + ui.legs_html(_exposed(legs(payload, db), payload, name, exposure)),
+            + ui.legs_html(
+                _exposed(
+                    legs(payload, db, (status or {}).get("created_at")), payload, name, exposure
+                )
+            ),
             unsafe_allow_html=True,
         )
         rows = [by_odds.get(leg["odds_id"]) for leg in payload["legs"]]
+        state = play_state(payload)
         with st.container(key=f"row-actions-{day}-{name}"):
             left, right = st.columns([1, 2], vertical_alignment="center")
-            if all(rows):
+            if started(payload):  # TASK 019 §2.3: a started match is no longer on offer
+                left.caption("Mecz kuponu już się rozpoczął — bez dodawania do Mojego kuponu.")
+            elif all(rows):
                 left.button(
                     cart.ADD_LABEL,
                     key=f"to_cart_{day}_{name}",
@@ -401,12 +444,24 @@ def card(
                 )
             if coupon_id and not str(coupon_id).startswith("nie zapisano"):
                 right.caption(
-                    f"Zapisany kupon wirtualny {str(coupon_id)[:10]}… — rozliczy się sam."
+                    f"Zapisany kupon wirtualny {str(coupon_id)[:10]}… — "
+                    + (
+                        "czeka na wynik (szczegóły → Wynik)"
+                        if state and state[0] == "Czeka na wynik"
+                        else "rozliczy się sam po wyniku."
+                    )
                 )
         with ui.details("Szczegóły, ocena AI, ryzyko, składy i historia", icon=":material/tune:"):
-            tabs = st.tabs(
-                ["Dlaczego", "Ocena AI", "Ryzyko", "Składy", "Historia zmian", "Symulacja budżetu"]
-            )
+            names = [
+                "Dlaczego",
+                "Ocena AI",
+                "Ryzyko",
+                "Składy",
+                "Historia zmian",
+                "Symulacja budżetu",
+            ]
+            waiting = bool(state and state[0] == "Czeka na wynik")
+            tabs = st.tabs([*names, "Wynik"] if waiting else names)
             with tabs[0]:
                 for line in payload["reasons"]:
                     st.write("• " + line)
@@ -435,3 +490,26 @@ def card(
                     st.caption("Ten wariant nie był jeszcze zapisany.")
             with tabs[5]:
                 simulation(payload)
+            if waiting:
+                with tabs[6]:
+                    _result_tab(db, payload, f"{day}_{name}")
+
+
+def _result_tab(db, payload: dict, key: str) -> None:
+    """TASK 019 §1.3: a coupon waiting for its result — the legs without a result and the
+    manual form (with a source)."""
+    from sports_edge.app import manual_ui
+    from sports_edge.paper import latest_result
+
+    events = []
+    for leg in payload["legs"]:
+        event_id = leg.get("event_id") or prematch_ui.event_of_odds(db, leg["odds_id"])
+        if event_id and latest_result(db, event_id) is None:
+            event = db.get("events", event_id)
+            if event:
+                events.append(event)
+    if not events:
+        st.caption("Wszystkie mecze mają wynik — rozliczenie nastąpi przy najbliższym przebiegu.")
+        return
+    st.caption("Brak wyniku: " + ", ".join(f"{e['home']} - {e['away']}" for e in events))
+    manual_ui.form(db, events, key=key)

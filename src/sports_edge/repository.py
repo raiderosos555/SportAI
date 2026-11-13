@@ -358,7 +358,10 @@ COMPLETE_DAY_KINDS = {"today", "tomorrow"}  # these documents list every event o
 def event_status(
     start_at: str | None, now: datetime, *, sport: str = "", result_status: str | None = None
 ) -> str:
-    """A: before start / in play / finished / postponed / cancelled / unknown."""
+    """A: before start / in play / finished / postponed / cancelled / awaiting result /
+    unknown. TASK 019 §3.2: a match past its typical duration without a result is
+    ``awaiting_result`` ("zakończony — czekamy na wynik"); ``unknown`` stays for an event
+    without a start time."""
     if result_status == "completed":
         return "finished"
     if result_status == "postponed":
@@ -372,7 +375,7 @@ def event_status(
         return "before_start"
     if now < start + EVENT_DURATION.get(sport, timedelta(hours=3)):
         return "in_play"
-    return "unknown"  # started long ago and no confirmed result
+    return "awaiting_result"  # past its typical duration, no confirmed result yet
 
 
 def odds_freshness(

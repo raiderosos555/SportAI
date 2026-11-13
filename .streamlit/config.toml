@@ -13,6 +13,14 @@ serverAddress = "localhost"
 [client]
 toolbarMode = "minimal"
 
+[logger]
+# TASK 019 §4.6: Streamlit 1.66 shows the card "Help agents write better apps" (install agent
+# skills) in the top right corner of every page when it detects an AI coding agent on this
+# computer. There is no dedicated option; the nudge is withheld when the welcome message is
+# hidden (streamlit/web/skills.py: nudge_suppression_reason -> "welcome_hidden"). The launcher
+# prints the address itself instead of Streamlit's welcome lines.
+hideWelcomeMessage = true
+
 # Sports Edge AI design tokens (TASK 006). Status colours carry meaning only:
 # green = confirmed / won, red = error / lost, amber = warning, blue = information.
 [theme]

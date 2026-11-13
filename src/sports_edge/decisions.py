@@ -30,7 +30,8 @@ SAFE_SOLO = "safe_solo"
 LIMIT = "diversity_limit"
 CHALLENGERS = "challengers"
 NATIONAL_1X2 = "national_1x2"
-KEYS = (GATE, OPTION_D, SAFE_SOLO, LIMIT, CHALLENGERS, NATIONAL_1X2)
+NATIONAL_GAPS = "national_gaps"  # TASK 019 §1.4
+KEYS = (GATE, OPTION_D, SAFE_SOLO, LIMIT, CHALLENGERS, NATIONAL_1X2, NATIONAL_GAPS)
 TITLES = {
     GATE: "Bramka protokołu v3",
     OPTION_D: "Opcja D: granica „ostrożnie” podwójnej szansy Elo",
@@ -38,6 +39,8 @@ TITLES = {
     LIMIT: "Limit różnicowania kuponów dnia",
     CHALLENGERS: "Challengery czekające na dowody",
     NATIONAL_1X2: "1X2 reprezentacji w Kuponie dnia",
+    NATIONAL_GAPS: "Reprezentacje z brakującymi wynikami ostatniego okna: dopuszczać do profili "
+    "wymagających walidacji?",
 }
 WARSAW = ZoneInfo("Europe/Warsaw")
 SAFE_PROFILE = "safe_solo"
@@ -86,6 +89,10 @@ RISKS = {
     "dowodów, by odróżnić lepszy model od przypadku.",
     NATIONAL_1X2: "Po akceptacji 1X2 reprezentacji może pojawić się w puli kuponu. Błędne "
     "mapowanie, nieaktualny kurs albo przyszła zmiana modelu ponownie ją zablokują.",
+    NATIONAL_GAPS: "„Dopuszczać”: rating drużyny nie zna ostatnich meczów, więc szansa może być "
+    "zawyżona albo zaniżona (np. forma z września–października). „Nie dopuszczać”: mniej kuponów "
+    "z reprezentacjami w profilach WYSOKA TRAFNOŚĆ, STANDARDOWY, TASIEMKA i PEWNY SOLO — do "
+    "czasu uzupełnienia wyników (ręcznie albo ze źródła).",
 }
 CHANGES = {
     GATE: "Po akceptacji challenger v3 może zostać aktywowany — osobnym kliknięciem w Uczeniu AI "
@@ -103,6 +110,11 @@ CHANGES = {
     "dopiero po progu.",
     NATIONAL_1X2: "Użycie wyłącznie prognoz 1X2 po 90 minutach dla wersji reprezentacyjnej, "
     "która spełnia bramki walidacji historycznej. Prognozy cieniowe pozostają poza kuponami.",
+    NATIONAL_GAPS: "„Nie dopuszczać”: zwalidowany typ meczu reprezentacji, której model nie zna "
+    "ostatnich meczów (mecz z archiwum oferty STS lub terminarza bez wyniku albo okres bez "
+    "danych dłuższy niż 45 dni), jest traktowany jak eksperymentalny — trafia tylko do profilu "
+    "bez wymogu walidacji (WYŻSZA WYPŁATA, jako symulacja). „Dopuszczać” (domyślnie, jak "
+    "dotąd): tylko ostrzeżenie przy typie i w Analizie meczu. Progi profili bez zmian.",
 }
 SOURCES = {"panel": "panel Decyzje do podjęcia", "settings": "Ustawienia"}
 # TASK 016 §7: saving a decision that changes nothing adds no row — the panel says so
@@ -691,6 +703,111 @@ def _national_1x2_item(store: Store, paths: AppPaths, *, now: datetime) -> dict:
     }
 
 
+def national_gaps_value(settings) -> str:
+    from sports_edge.team_gaps import ALLOW, RULES
+
+    value = getattr(settings, "national_gap_rule", ALLOW)
+    return value if value in RULES else ALLOW
+
+
+def decide_national_gaps(
+    store: Store,
+    paths: AppPaths,
+    settings: AppSettings,
+    *,
+    value: str,
+    now: datetime,
+    source: str = "panel",
+) -> str | None:
+    """The USER decides whether national selections of teams with missing recent results
+    reach the profiles that require validation (``None``: unchanged and already decided)."""
+    from sports_edge.team_gaps import RULES
+
+    if value not in RULES:
+        raise ValueError("Nieznana odpowiedź")
+    previous = national_gaps_value(settings)
+    if unchanged(store, NATIONAL_GAPS, previous, value):
+        return None
+    _save(paths, replace(settings, national_gap_rule=value))
+    return record(
+        store,
+        decision=NATIONAL_GAPS,
+        previous={"national_gap_rule": previous},
+        new={"national_gap_rule": value},
+        summary="Reprezentacje z brakującymi wynikami: "
+        + RULES[value]
+        + (" (potwierdzenie dotychczasowego stanu)" if value == previous else ""),
+        now=now,
+        source=source,
+    )
+
+
+def national_gaps_today(store: Store, paths: AppPaths, settings, *, now: datetime) -> dict:
+    """Live evidence: national teams with incomplete data and the validated national
+    selections of the next offer days that the answer "nie dopuszczać" would change."""
+    from sports_edge import team_gaps
+    from sports_edge.repository import offer_days
+    from sports_edge.services import day_candidates_at
+
+    ctx = team_gaps.context(store, paths, now=now)
+    counts = {"missing": 0, "unknown": 0, "complete": 0}
+    for info in ctx["gaps"].values():
+        counts[info["status"]] += 1
+    today = now.astimezone(WARSAW).date().isoformat()
+    days = [d for d in offer_days(store) if d >= today][:4]
+    allowed = replace(settings, national_gap_rule=team_gaps.ALLOW)
+    changed = events = 0
+    for day in days:
+        candidates, _ = day_candidates_at(store, paths, allowed, day, now=now)
+        hit = [
+            x
+            for x in candidates
+            if x.data_gaps
+            and x.predictive_status == "validated_predictive"
+            and x.start_at
+            and x.start_at > now.isoformat()
+        ]
+        changed += len(hit)
+        events += len({x.event_id for x in hit})
+    return {"teams": counts, "days": days, "selections": changed, "events": events}
+
+
+def _national_gaps_item(store: Store, settings, live: dict | None) -> dict:
+    from sports_edge.team_gaps import RULES
+
+    value = national_gaps_value(settings)
+    mine = last(store, NATIONAL_GAPS)
+    evidence = []
+    if live:
+        teams = live["teams"]
+        evidence.append(
+            f"Reprezentacje w historii: z meczem bez wyniku {teams['missing']}, z okresem bez "
+            f"danych {teams['unknown']}, kompletne {teams['complete']}."
+        )
+        evidence.append(
+            "Oferta "
+            + (", ".join(_day(d) for d in live["days"]) or "— brak dni z ofertą")
+            + f": zwalidowane typy reprezentacji z ostrzeżeniem {live['selections']} "
+            f"({live['events']} meczów) — przy „nie dopuszczać” staną się eksperymentalne."
+        )
+    else:
+        evidence.append("Pomiar na żywo: brak danych w podglądzie — otwórz panel decyzji.")
+    evidence.append(
+        "Pomiar raportu TASK 019 (kopia bazy, 12–16.11): typy i kupony, które zmieniają "
+        "status przy każdej odpowiedzi — docs/task_019_report.md."
+    )
+    return {
+        "key": NATIONAL_GAPS,
+        "title": TITLES[NATIONAL_GAPS],
+        "value": value,
+        "state": RULES[value] + ("" if mine else " — domyślnie (brak decyzji)"),
+        "open": mine is None,
+        "changes": CHANGES[NATIONAL_GAPS],
+        "evidence": evidence,
+        "risk": RISKS[NATIONAL_GAPS],
+    }
+
+
 def panel(
     store: Store,
     paths: AppPaths,
@@ -699,8 +816,9 @@ def panel(
     now: datetime,
     compared: dict | None = None,
     live_option_d: dict | None = None,
+    live_gaps: dict | None = None,
 ) -> list[dict]:
-    """The six decisions with their state, evidence and risk — read only. ``compared``:
+    """The seven decisions with their state, evidence and risk — read only. ``compared``:
     scope → ``retraining.comparison`` (computed when not given)."""
     from sports_edge import retraining
     from sports_edge.services import MODEL_SCOPES
@@ -714,6 +832,7 @@ def panel(
         _limit_item(store, paths, settings),
         _challengers_item(compared),
         _national_1x2_item(store, paths, now=now),
+        _national_gaps_item(store, settings, live_gaps),
     ]
 
 

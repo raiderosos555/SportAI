@@ -313,6 +313,30 @@ def _html(markup: str) -> None:
     st.markdown(markup, unsafe_allow_html=True)
 
 
+PLACEHOLDER = "wybierz…"
+
+
+def polish_placeholders() -> None:
+    """TASK 019 §4.5: no English "Choose an option" — every selectbox and multiselect without
+    its own placeholder gets the Polish one (idempotent)."""
+    from streamlit.delta_generator import DeltaGenerator
+
+    for name in ("selectbox", "multiselect"):
+        original = getattr(DeltaGenerator, name)
+        if getattr(original, "_polish", False):
+            continue
+
+        def wrapper(self, *args, _original=original, **kwargs):
+            if kwargs.get("placeholder") is None:
+                kwargs["placeholder"] = PLACEHOLDER
+            return _original(self, *args, **kwargs)
+
+        wrapper._polish = True
+        wrapper.__doc__ = original.__doc__
+        setattr(DeltaGenerator, name, wrapper)
+        setattr(st, name, getattr(st._main, name))
+
+
 def details(label: str, *, expanded: bool = False, icon: str = ":material/tune:"):
     """Level 3: technical details on demand (closed by default)."""
     return st.expander(label, expanded=expanded, icon=icon)

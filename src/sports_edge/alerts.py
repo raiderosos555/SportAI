@@ -31,7 +31,13 @@ LINEUP_KINDS = (
     "goalkeeper_change",
 )
 GROUP_KIND = "lineup_changes"
-COUPON_KINDS = ("coupon_attention", "coupon_outdated")
+COUPON_KINDS = (
+    "coupon_attention",
+    "coupon_outdated",
+    "result_mismatch",
+    "daily_coupons_ready",
+    "daily_coupons_none",
+)
 SYSTEM_KINDS = ("backup_skipped", "backup_failed")
 ORDER = {"high": 0, "medium": 1, "low": 2}
 RANKS = {0: "kupony", 1: "składy meczów z kuponów", 2: "pozostałe"}
@@ -54,6 +60,10 @@ PRIORITY = {
     # TASK 016: the cyclic backup could not be made or failed its integrity check
     "backup_skipped": "high",
     "backup_failed": "high",
+    # TASK 019: the coupon of the day by the worker; a provider's result against the user's
+    "daily_coupons_ready": "medium",
+    "daily_coupons_none": "low",
+    "result_mismatch": "high",
 }
 LABELS = {
     "confirmed_published": "Opublikowano potwierdzony skład",
@@ -73,6 +83,9 @@ LABELS = {
     "lineup_changes": "Zmiany w składzie",
     "backup_skipped": "Kopia zapasowa pominięta",
     "backup_failed": "Kopia zapasowa nie przeszła kontroli",
+    "daily_coupons_ready": "Kupony dnia gotowe",
+    "daily_coupons_none": "Brak kuponu dnia",
+    "result_mismatch": "Wynik dostawcy różni się od wpisu ręcznego",
 }
 
 
@@ -299,9 +312,14 @@ def overview(store: Store, *, now: datetime) -> dict:
     out.sort(key=lambda i: i["created_at"], reverse=True)
     out.sort(key=lambda i: (i["rank"], ORDER.get(i["priority"], 1)))
     unread = [i for i in out if not i["read"]]
+    archived = archived_ids(store)
+    for item in out:
+        item["archived"] = any(i in archived for i in item["ids"])
     return {
         "items": out,
         "unread": len(unread),
+        # TASK 019 §4.3: what the user can still act on (no started match, not archived)
+        "actionable": sum(1 for i in unread if not i["stale"] and not i["archived"]),
         "important": sum(1 for i in unread if i["rank"] <= 1 and not i["stale"]),
         "stale_unread": sum(1 for i in unread if i["stale"]),
         "raw_total": len(rows),
@@ -310,10 +328,45 @@ def overview(store: Store, *, now: datetime) -> dict:
 
 
 def counts_text(found: dict) -> str:
-    """ "ważne 3 · wszystkie 12" (unread items) — the Dashboard and the navigation."""
-    if not found["unread"]:
+    """ "ważne 3 · wszystkie 12" — the Dashboard and the navigation. TASK 019 §4.3: only the
+    alerts the user can still act on; alerts of started matches are archived, not counted."""
+    actionable = found.get("actionable", found["unread"])
+    if not actionable:
         return "brak nowych"
-    return f"ważne {found['important']} · wszystkie {found['unread']}"
+    return f"ważne {found['important']} · wszystkie {actionable}"
+
+
+def archived_ids(store: Store) -> set[str]:
+    if "alert_states" not in getattr(store, "tables", {"alert_states"}):
+        return set()
+    return {
+        r["alert_id"]
+        for r in store.rows("SELECT alert_id FROM alert_states WHERE state='archived'")
+    }
+
+
+def archive_started(store: Store, *, now: datetime) -> int:
+    """TASK 019 §4.3: an alert about a match that has already started is archived — a new
+    row of ``alert_states`` (the alert and its read marks are never changed or deleted).
+    Alerts without a match (system, coupon of the day) are never archived this way."""
+    rows = store.rows(
+        """SELECT a.id FROM prematch_alerts a JOIN events e ON e.id=a.event_id
+        WHERE e.start_at IS NOT NULL AND e.start_at<=?
+        AND NOT EXISTS (SELECT 1 FROM alert_states s WHERE s.alert_id=a.id)""",
+        (iso(now),),
+    )
+    done = 0
+    with store.transaction():
+        for row in rows:
+            done += store.insert(
+                "alert_states",
+                id=digest(["alert_state", row["id"], "archived"]),
+                alert_id=row["id"],
+                state="archived",
+                reason="mecz już się rozpoczął",
+                recorded_at=iso(now),
+            )
+    return done
 
 
 def mark_all_read(store: Store, *, now: datetime) -> int:

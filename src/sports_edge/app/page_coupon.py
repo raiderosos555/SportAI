@@ -231,9 +231,15 @@ def _day(db, settings, rules, day, run, online) -> None:
         _report, candidates = c.day_candidates(day)
         if saved:
             st.caption(
-                "Ostatnio zapisane propozycje dla tego dnia — kliknij „Analizuj”, aby odświeżyć."
+                "Zapisane propozycje tego dnia (bez nowej analizy) — kliknij „Analizuj”, aby "
+                "odświeżyć."
             )
-    international_ui.national_coupon_block(db, day, now, candidates)
+        else:  # TASK 019 §2.2: the chosen day is shown at once, even without coupons
+            ui.empty_state(
+                "Na ten dzień nie ma jeszcze kuponów — kliknij Analizuj",
+                "Zapisane propozycje pojawiają się tu od razu po zmianie zakresu; analiza "
+                "zapisuje kupony dnia.",
+            )
     # TASK 013 §5.3: the selection nearest to a WYSOKA TRAFNOŚĆ coupon (read only)
     high = rules.profiles.get(HIGH_HIT)
     closest = (
@@ -246,6 +252,7 @@ def _day(db, settings, rules, day, run, online) -> None:
         _no_coupon(explanation, day, run is not None, online)
         if closest and explanation is not None:
             st.caption(f"{high['label']} — {closest}")
+        international_ui.national_coupon_block(db, day, now, candidates)
         return
     by_odds = {x.odds_id: x for x in candidates}
     exposure = _exposure(proposals)
@@ -267,6 +274,8 @@ def _day(db, settings, rules, day, run, online) -> None:
                 for a in alternatives.get(name, ())
             ],
         )
+    # TASK 019 §2.1: the competitions without data come AFTER the coupons, closed
+    international_ui.national_coupon_block(db, day, now, candidates)
 
 
 def _exposure(proposals: dict) -> dict[str, list[tuple[str, str, tuple]]]:
@@ -331,46 +340,54 @@ def risk_numbers(proposals: dict, rates: dict | None = None) -> list[str]:
     return points
 
 
-def _day_risk(proposals: dict, exposure: dict, db=None) -> None:
-    """Ryzyko dnia: matches shared by several coupons — one lost match loses them all."""
+def risk_summary(proposals: dict, exposure: dict, rates: dict | None = None) -> list[str]:
+    """TASK 019 §2.1: "Ryzyko dnia" in two plain sentences — the chance of losing two or
+    more coupons and the matches shared by several coupons."""
+    found = ins.day_risk(proposals, rates)
     made = [p for p in proposals.values() if p]
-    if len(made) < 2:
-        return
     names = {ins.match_of(leg): leg.get("event", "—") for p in made for leg in p["legs"]}
     shared = sorted(
         ((event, profiles) for event, profiles in exposure.items() if len(profiles) > 1),
         key=lambda item: -len(item[1]),
     )
-    numbers = risk_numbers(proposals, ins.matrix_rates(db, proposals) if db is not None else None)
-    if not shared:
-        ui.explanation(
-            "Ryzyko dnia",
-            [
-                *numbers,
-                "Każdy mecz występuje tylko w jednym kuponie dnia — porażka jednego meczu "
-                "przegrywa najwyżej jeden kupon.",
-            ],
-        )
-        return
-    points = [*numbers]
-    for event, profiles in shared:
-        labels = ", ".join(label for _p, label, _pick in profiles)
-        losing = ins.plural(len(profiles), "kupon", "kupony", "kuponów")
-        if len({pick for _p, _label, pick in profiles}) == 1:
-            points.append(
-                f"{names[event]}: ten sam typ w kuponach {labels} — jeśli nie wejdzie, "
-                f"przegrywa {losing}"
-            )
-        else:
-            points.append(
-                f"{names[event]}: różne typy tego meczu w kuponach {labels} — wyniki "
-                f"skorelowane ({losing})"
-            )
-    points.append(
-        "Kupony z tym samym meczem są skorelowane. Opcja różnicowania (Ustawienia: „ta sama "
-        "selekcja najwyżej w N kuponach”) jest domyślnie wyłączona."
+    first = (
+        f"Szansa, że przegrają co najmniej dwa kupony dnia: {ins.pct(found['p_two_or_more_lose'])}."
+        if found
+        else "Szansa przegrania co najmniej dwóch kuponów: brak danych."
     )
-    ui.explanation("Ryzyko dnia", points, tone="warn")
+    if shared:
+        second = (
+            "Wspólne mecze kilku kuponów: "
+            + "; ".join(
+                f"{names.get(event, '—')} ({', '.join(label for _p, label, _x in profiles)})"
+                for event, profiles in shared
+            )
+            + " — porażka takiego meczu przegrywa wszystkie te kupony."
+        )
+    else:
+        second = "Wspólne mecze: brak — każdy mecz jest tylko w jednym kuponie dnia."
+    return [first, second]
+
+
+def _day_risk(proposals: dict, exposure: dict, db=None) -> None:
+    """Ryzyko dnia: two sentences; the method, the score-matrix parameters and the
+    correlation details are in a closed panel."""
+    made = [p for p in proposals.values() if p]
+    if len(made) < 2:
+        return
+    rates = ins.matrix_rates(db, proposals) if db is not None else None
+    shared = any(len(profiles) > 1 for profiles in exposure.values())
+    ui.explanation(
+        "Ryzyko dnia", risk_summary(proposals, exposure, rates), tone="warn" if shared else ""
+    )
+    with ui.details("Szczegóły ryzyka dnia (metoda i założenia)", icon=":material/info:"):
+        for line in risk_numbers(proposals, rates):
+            st.write("• " + line)
+        if shared:
+            st.write(
+                "• Kupony z tym samym meczem są skorelowane. Opcja różnicowania (Ustawienia: „ta "
+                "sama selekcja najwyżej w N kuponach”) jest domyślnie wyłączona."
+            )
     if same_leg_shared(exposure):  # TASK 014 §4.2: the default stays; the user decides
         c.page_link(
             "zrodla",
@@ -427,15 +444,36 @@ def _pool(days: list[str], rules) -> None:
             {**group, "offer_day": day}
             for group in ins.candidate_groups(candidates, now=now, max_odds=max_odds)
         ]
+    started = sum(
+        1 for r in rows if r["candidate"].event_status != "before_start" and r["group"] in "AB"
+    )
     rows = [r for r in rows if r["candidate"].event_status == "before_start" or r["group"] == "C"]
     cart.flash()
+    if not any(r["group"] in ("A", "B") for r in rows) and started:
+        nxt = next_match_day(days)
+        ui.empty_state(
+            "Mecze z typami w grupach A i B już się rozpoczęły",
+            f"Rozpoczęte mecze z typami: {started} — nie można ich już dodać do kuponu. "
+            + (
+                f"Najbliższy dzień z meczami przed startem: {c.day_label(nxt)} — wybierz go w "
+                "„Zakres analizy”."
+                if nxt
+                else "Brak kolejnego dnia z meczami w ofercie."
+            ),
+        )
     if not rows:
-        ui.empty_state("Brak typów z prognozą", "Dla wybranych dni modele nie mają prognoz.")
+        if not started:
+            ui.empty_state("Brak typów z prognozą", "Dla wybranych dni modele nie mają prognoz.")
         return
     cols = st.columns(5)
     sports = sorted({r["sport"] for r in rows})
     leagues = sorted({r["league"] for r in rows})
-    sport = cols[0].selectbox("Dyscyplina", ["wszystkie", *sports], key="pool_sport")
+    sport = cols[0].selectbox(
+        "Dyscyplina",
+        ["wszystkie", *sports],
+        key="pool_sport",
+        format_func=lambda s: s if s == "wszystkie" else c.sport_label(s),
+    )
     league = cols[1].selectbox("Liga", ["wszystkie", *leagues], key="pool_league")
     day = cols[2].selectbox(
         "Data",
@@ -494,6 +532,8 @@ def _pool(days: list[str], rules) -> None:
                             "Kurs STS": r["price_status"],
                             "Model": r["model_status"],
                             "Powód": r["reason"],
+                            # TASK 019 §1.4: the model does not know recent national matches
+                            "Dane drużyn": r["candidate"].data_gaps or "—",
                             "Rynek STS": r["market"],
                         }
                         for r in subset[:200]
@@ -513,7 +553,11 @@ def _pool(days: list[str], rules) -> None:
                 selection_mode="multi-row",
                 key=f"pool_table_{key}",
             )
-            picked = [subset[i] for i in table.selection.rows if i < len(subset)]
+            picked = [
+                subset[i]
+                for i in table.selection.rows
+                if i < len(subset) and subset[i]["candidate"].event_status == "before_start"
+            ]
             st.button(
                 f"{cart.ADD_LABEL} ({len(picked)})",
                 key=f"pool_add_{key}",
@@ -525,6 +569,12 @@ def _pool(days: list[str], rules) -> None:
             )
             if len(subset) > 200:
                 st.caption(f"Pokazano 200 z {len(subset)} — zawęź filtry.")
+
+
+def next_match_day(days: list[str]) -> str | None:
+    """The first offer day after the shown days with a match still before its start."""
+    ahead = [d for d in c.upcoming_days(offer_days(c.store())) if d > max(days)]
+    return ahead[0] if ahead else None
 
 
 # ---------------------------------------------------------------- technical details

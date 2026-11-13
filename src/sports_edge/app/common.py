@@ -26,7 +26,8 @@ EVENT_STATUS = {
     "finished": "zakończony",
     "postponed": "przełożony",
     "cancelled": "odwołany",
-    "unknown": "status nieznany",
+    "awaiting_result": "zakończony — czekamy na wynik",
+    "unknown": "status nieznany (brak godziny startu)",
 }
 EVENT_TONE = {
     "before_start": "info",
@@ -34,6 +35,7 @@ EVENT_TONE = {
     "finished": "neutral",
     "postponed": "warn",
     "cancelled": "bad",
+    "awaiting_result": "neutral",
     "unknown": "neutral",
 }
 PRESENCE = {
@@ -41,7 +43,48 @@ PRESENCE = {
     "withdrawn": "wycofany",
     "unconfirmed": "niepotwierdzony",
 }
+# TASK 019 §3.3: Polish names of the sports (the keys stay internal)
+SPORTS = {
+    "football": "piłka nożna",
+    "ice_hockey": "hokej na lodzie",
+    "tennis": "tenis",
+    "basketball": "koszykówka",
+    "volleyball": "siatkówka",
+    "handball": "piłka ręczna",
+    "american_football": "futbol amerykański",
+    "baseball": "baseball",
+    "boxing": "boks",
+    "cricket": "krykiet",
+    "darts": "dart",
+    "futsal": "futsal",
+    "mma": "MMA",
+    "motorsport": "sporty motorowe",
+    "rugby": "rugby",
+    "snooker": "snooker",
+    "table_tennis": "tenis stołowy",
+    "water_polo": "piłka wodna",
+}
 __all__ = ["MARKETS", "PERIODS", "SELECTIONS", "market_label"]
+
+
+# TASK 019 §4.3: job statuses in Polish (the stored codes stay unchanged)
+JOB_STATUS = {
+    "ok": "wykonane",
+    "partial": "częściowo",
+    "skipped": "pominięte",
+    "failed": "błąd",
+    "running": "w toku",
+}
+
+
+def job_status(value: str | None) -> str:
+    return JOB_STATUS.get(value or "", value or "—") if value else "—"
+
+
+def sport_label(sport: str | None) -> str:
+    return SPORTS.get(sport or "", (sport or "—").replace("_", " "))
+
+
 TIERS = {
     "validated": "zwalidowany",
     "experimental": "eksperymentalny",

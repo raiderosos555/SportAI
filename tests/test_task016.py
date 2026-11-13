@@ -970,8 +970,9 @@ def test_migration_to_v12_backs_up_and_keeps_every_row(tmp_path):
     raw.commit()
     raw.close()
     migrated = Store(path, backup_dir=tmp_path / "backups")
-    assert SCHEMA_VERSION == 12 and migrated.version_before == 11
-    assert migrated.migration_backup.name.startswith("pre-migration-v12_")
+    # TASK 019: v13 (alert states) follows; the v12 step is part of the same migration run
+    assert SCHEMA_VERSION >= 12 and migrated.version_before == 11
+    assert migrated.migration_backup.name.startswith(f"pre-migration-v{SCHEMA_VERSION}_")
     assert migrated.migration_backup.exists()
     for table, n in rows.items():
         if table != "schema_migrations":
@@ -981,7 +982,9 @@ def test_migration_to_v12_backs_up_and_keeps_every_row(tmp_path):
     assert migrated.scalar("SELECT COUNT(*) FROM quote_observations") == rows["quote_sets"]
     kept = migrated.connection.execute("SELECT id, price FROM odds ORDER BY id").fetchall()
     assert [tuple(r) for r in kept] == odds  # old repeated odds stay as they are
-    note = migrated.rows("SELECT description FROM schema_migrations WHERE version=12")
+    note = migrated.rows(
+        "SELECT description FROM schema_migrations WHERE version=?", (SCHEMA_VERSION,)
+    )
     assert note and "v12 TASK 016" in note[-1]["description"]
     with pytest.raises(sqlite3.DatabaseError, match="append_only"):
         migrated.connection.execute("DELETE FROM odds")
@@ -1098,7 +1101,8 @@ def test_the_alert_panel_marks_everything_read_and_the_decision_panel_says_uncha
     panel.run()
     assert not panel.exception, panel.exception
     shown = _text(panel)
-    assert "nieprzeczytane ważne: 1 · wszystkie nieprzeczytane: 2" in shown
+    # TASK 019 §4.3: the count of what can still be acted on (a started match is archived)
+    assert "ważne: 1 · do reakcji: 1" in shown
     assert "6 zapisanych alertów to 2 pozycji" in shown  # grouped when shown
     next(b for b in panel.button if b.label == "Oznacz wszystkie jako przeczytane").click().run()
     assert not panel.exception, panel.exception

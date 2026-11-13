@@ -99,6 +99,38 @@ def _label(job: str) -> str:
     return automation.JOB_LABELS.get(job, job)
 
 
+def _short(job: str) -> str:
+    """TASK 019 §4.3: the calendar shows short names (no clipped labels)."""
+    return automation.SHORT_LABELS.get(job, _label(job))
+
+
+def reason_text(reason: str | None) -> str:
+    """TASK 019 §4.3: stored skip codes ("not_before_start: 73; …") said as sentences."""
+    import re
+
+    if not reason:
+        return "—"
+    found = dict(re.findall(r"([a-z_]+): (\d+)", reason))
+    if found and set(found) <= set(automation.SKIP_TEXT):
+        rest = re.sub(r"[a-z_]+: \d+;? ?", "", reason).strip(" ;")
+        sentence = automation.skip_sentence({k: int(v) for k, v in found.items()})
+        return "; ".join(x for x in (rest, sentence) if x)
+    return reason
+
+
+def open_errors(history: list[dict]) -> list[dict]:
+    """TASK 019 §4.3: an error disappears from "Najważniejsze błędy" after a later
+    successful run of the same job (history is newest first)."""
+    healed: set[str] = set()
+    out = []
+    for row in history:
+        if row["status"] == "ok":
+            healed.add(row["job"])
+        elif row["status"] in ("failed", "partial") and row["job"] not in healed:
+            out.append(row)
+    return out
+
+
 # ---------------------------------------------------------------- PRZEGLĄD
 
 
@@ -128,7 +160,8 @@ def _overview(db, paths, found: dict, now: datetime) -> None:
                 {"ok": "ok", "failed": "bad", "partial": "warn"}.get(
                     last["status"] if last else "", "neutral"
                 ),
-                f"{last['status']} · {c.local_time(last['started_at'], '%d.%m %H:%M')}"
+                f"{c.job_status(last['status'])} · "
+                f"{c.local_time(last['started_at'], '%d.%m %H:%M')}"
                 if last
                 else "brak uruchomień",
             ),
@@ -146,16 +179,20 @@ def _overview(db, paths, found: dict, now: datetime) -> None:
             "Po starcie nadrobiono zaległe zadania: "
             + ", ".join(_label(j) for j in found["catch_up"])
         )
-    ui.section("Najważniejsze błędy", "ostatnie zadania zakończone błędem")
-    errors = [r for r in history if r["status"] in ("failed", "partial")][:3]
+    ui.section("Najważniejsze błędy", "bez późniejszego udanego przebiegu tego samego zadania")
+    errors = open_errors(history)[:3]
     if errors:
         ui.rows(
             [
                 ui.list_row(
                     title=r["label"],
                     meta=f"{c.local_time(r['started_at'], '%d.%m %H:%M')} · "
-                    + (r["reason"] or r["status"]),
-                    badges=[ui.pill(r["status"], "bad" if r["status"] == "failed" else "warn")],
+                    + (reason_text(r["reason"]) if r["reason"] else c.job_status(r["status"])),
+                    badges=[
+                        ui.pill(
+                            c.job_status(r["status"]), "bad" if r["status"] == "failed" else "warn"
+                        )
+                    ],
                     tone="bad" if r["status"] == "failed" else "warn",
                 )
                 for r in errors
@@ -191,52 +228,47 @@ def _overview(db, paths, found: dict, now: datetime) -> None:
         _quality(db)
 
 
+def control_buttons(found: dict) -> list[str]:
+    """TASK 019 §4.3: the buttons possible in the current state (never all five at once)."""
+    if not found["alive"]:
+        return ["start", "check"]
+    if found["label"] == "wstrzymana":
+        return ["resume", "check", "stop"]
+    return ["check", "pause", "stop"]
+
+
 def _controls(db, paths, found: dict) -> None:
-    """Start and an immediate check first; pause, resume and stop in the second row."""
     now = c.now()
+    shown = control_buttons(found)
     with st.container(key="row-controls-main"):
-        start, check = st.columns(2)
-    with st.container(key="row-controls-more"):
-        pause, resume, stop = st.columns(3)
-    if start.button(
-        "URUCHOM AUTOMATYZACJĘ",
-        type="primary",
-        icon=":material/play_arrow:",
-        width="stretch",
-        disabled=found["alive"] and found["label"] == "aktywna",
+        cols = st.columns(len(shown))
+    buttons = dict(zip(shown, cols, strict=True))
+    if "start" in buttons and buttons["start"].button(
+        "URUCHOM AUTOMATYZACJĘ", type="primary", icon=":material/play_arrow:", width="stretch"
     ):
         automation.command(db, "start", now=now)
         automation.start_worker(paths)
         st.toast("Uruchamianie workera…")
         st.rerun()
-    if check.button("URUCHOM KONTROLĘ TERAZ", icon=":material/bolt:", width="stretch"):
+    if buttons["check"].button("URUCHOM KONTROLĘ TERAZ", icon=":material/bolt:", width="stretch"):
         automation.command(db, "run_now", now=now)
         if not found["alive"]:
             automation.start_worker(paths, once=True)  # one-off run, then the process ends
         st.toast("Kontrola zlecona workerowi — wyniki pojawią się w historii zadań.")
         st.rerun()
-    if pause.button(
-        "WSTRZYMAJ AUTOMATYZACJĘ",
-        icon=":material/pause:",
-        width="stretch",
-        disabled=not found["alive"] or found["label"] == "wstrzymana",
+    if "pause" in buttons and buttons["pause"].button(
+        "WSTRZYMAJ AUTOMATYZACJĘ", icon=":material/pause:", width="stretch"
     ):
         automation.command(db, "pause", now=now)
         st.rerun()
-    if resume.button(
-        "WZNÓW AUTOMATYZACJĘ",
-        icon=":material/resume:",
-        width="stretch",
-        disabled=found["label"] not in ("wstrzymana",) and found["alive"],
+    if "resume" in buttons and buttons["resume"].button(
+        "WZNÓW AUTOMATYZACJĘ", type="primary", icon=":material/resume:", width="stretch"
     ):
         automation.command(db, "resume", now=now)
         automation.start_worker(paths)
         st.rerun()
-    if stop.button(
-        "ZATRZYMAJ AUTOMATYZACJĘ",
-        icon=":material/stop:",
-        width="stretch",
-        disabled=not found["alive"],
+    if "stop" in buttons and buttons["stop"].button(
+        "ZATRZYMAJ AUTOMATYZACJĘ", icon=":material/stop:", width="stretch"
     ):
         automation.command(db, "stop", now=now)
         st.toast("Worker zakończy bieżącą operację i zatrzyma się.")
@@ -303,9 +335,10 @@ def _schedule(db, settings: dict, now: datetime) -> None:
         items = by_day.get(day, [])
         body = (
             "".join(
-                f'<div class="se-side-row"><span class="se-num">'
-                f"{ui.esc(c.local_time(i['at'].isoformat(), '%H:%M'))}</span>"
-                f"<b>{ui.esc(_label(i['job']))}</b></div>"
+                '<div class="se-side-row" style="white-space:normal;align-items:flex-start">'
+                f'<span class="se-num">{ui.esc(c.local_time(i["at"].isoformat(), "%H:%M"))}'
+                f'</span><b style="white-space:normal;text-align:right">'
+                f"{ui.esc(_short(i['job']))}</b></div>"
                 for i in items[:8]
             )
             or '<div class="se-muted" style="font-size:.85rem">bez zaplanowanych zadań</div>'
@@ -317,10 +350,67 @@ def _schedule(db, settings: dict, now: datetime) -> None:
         )
         cards.append(ui.card(f"<b>{ui.esc(c.day_label(day.isoformat()))}</b>" + body + more))
     ui.card_grid(cards, wide=False)
+    _daily_coupon(db, settings, now)
     _kickoff(db, settings, now)
     _matchday(db, settings, now)
     _editor(db, settings)
     _one_off(db, settings, now)
+
+
+def _daily_coupon(db, settings: dict, now: datetime) -> None:
+    """TASK 019 §2.4: the coupon of the day by the worker — off until the user enables it."""
+    ui.section(
+        "Kupon dnia automatycznie",
+        "ta sama analiza co przycisk w Kuponie dnia · raz dziennie · domyślnie wyłączone",
+    )
+    cfg = dict(settings["jobs"].get("daily_coupon") or {})
+    with st.container(key="row-daily-coupon"):
+        cols = st.columns([1.2, 2, 1.2])
+        enabled = cols[0].toggle("Włączone", value=bool(cfg.get("enabled")), key="auto_daily_on")
+        trigger = cols[1].radio(
+            "Kiedy",
+            list(automation.DAILY_COUPON_TRIGGERS),
+            index=list(automation.DAILY_COUPON_TRIGGERS).index(cfg.get("trigger") or "time"),
+            format_func=automation.DAILY_COUPON_TRIGGERS.get,
+            key="auto_daily_trigger",
+        )
+        if trigger == "time":
+            when = cols[2].selectbox(
+                "Godzina (czas polski)",
+                TIMES,
+                index=TIMES.index(cfg.get("time")) if cfg.get("time") in TIMES else 18,
+                key="auto_daily_time",
+            )
+            changes = {"time": when}
+        else:
+            lead = cols[2].number_input(
+                "Minut przed meczem",
+                15,
+                720,
+                int(cfg.get("lead_minutes") or 120),
+                15,
+                key="auto_daily_lead",
+            )
+            changes = {"lead_minutes": int(lead)}
+    nxt = automation.daily_coupon_next(db, settings, now=now)
+    st.caption(
+        "Kupon oficjalny dnia to pierwszy zapisany kupon profilu — zadanie i kliknięcie tego "
+        "samego dnia nie tworzą dwóch kuponów oficjalnych. W trybie offline zadanie niczego "
+        "nie pobiera; oferta STS tylko za Twoją zgodą i w jej limitach. Wynik: Historia zadań i "
+        "jeden alert. "
+        + (
+            f"Najbliższe uruchomienie: {c.local_time(nxt.isoformat(), '%d.%m %H:%M')}."
+            if nxt
+            else ""
+        )
+    )
+    if st.button("Zapisz ustawienia Kuponu dnia", icon=":material/save:", key="auto_daily_save"):
+        settings["jobs"].setdefault("daily_coupon", {}).update(
+            {"enabled": enabled, "trigger": trigger, **changes}
+        )
+        automation.save_settings(db, settings, now=c.now())
+        st.success("Zapisano ustawienia zadania „Kupon dnia”.")
+        st.rerun()
 
 
 def _kickoff(db, settings: dict, now: datetime) -> None:
@@ -440,7 +530,7 @@ def _matchday(db, settings: dict, now: datetime) -> None:
 
 def _editor(db, settings: dict) -> None:
     ui.section("Harmonogram zadania", "co określony czas albo o stałych godzinach w wybrane dni")
-    jobs = [j for j in automation.JOBS if j not in ("absences", "training")]
+    jobs = [j for j in automation.JOBS if j not in ("absences", "training", "daily_coupon")]
     job = st.selectbox("Zadanie", jobs, format_func=_label, key="auto_edit_job")
     cfg = dict(settings["jobs"].get(job) or {})
     st.caption(f"Teraz: {_summary(cfg)}")
@@ -548,7 +638,9 @@ def _processes(db, settings: dict) -> None:
                 label, value=bool(cfg.get("enabled")), key=f"auto_on_{job}"
             )
             options = automation.FREQUENCIES.get(job)
-            if options and cfg.get("mode") != "daily":
+            if job == "daily_coupon":
+                cols[1].caption("raz dziennie — godzina w Harmonogramie → Kupon dnia")
+            elif options and cfg.get("mode") != "daily":
                 current = cfg.get("every_minutes", options[0])
                 if current not in options:
                     options = [*options, current]
@@ -622,7 +714,10 @@ def _history(db) -> None:
         labels = sorted({r["label"] for r in rows})
         job = cols[0].selectbox("Zadanie", ["wszystkie", *labels], key="auto_hist_job")
         status = cols[1].selectbox(
-            "Wynik", ["wszystkie", "ok", "partial", "skipped", "failed"], key="auto_hist_status"
+            "Wynik",
+            ["wszystkie", "ok", "partial", "skipped", "failed"],
+            key="auto_hist_status",
+            format_func=lambda s: s if s == "wszystkie" else c.job_status(s),
         )
     shown = [
         r
@@ -636,10 +731,10 @@ def _history(db) -> None:
                 "Zadanie": r["label"],
                 "Start": c.local_time(r["started_at"], "%d.%m %H:%M:%S"),
                 "Czas": _duration(r),
-                "Wynik": r["status"],
+                "Wynik": c.job_status(r["status"]),
                 "Przetworzone": (r["payload"] or {}).get("processed"),
                 "Nowe": (r["payload"] or {}).get("new"),
-                "Przyczyna": r["reason"] or "—",
+                "Przyczyna": reason_text(r["reason"]),
                 "Wyzwalacz": r["trigger"],
             }
             for r in shown
@@ -689,7 +784,8 @@ def _alerts(db) -> None:
 
     ui.section(
         "Ważne alerty",
-        f"nieprzeczytane ważne: {len(important)} · wszystkie nieprzeczytane: {found['unread']}",
+        f"ważne: {len(important)} · do reakcji: {found.get('actionable', found['unread'])} · "
+        "alerty meczów rozpoczętych są archiwizowane",
     )
     if important:
         ui.rows([row(a) for a in important[:20]])
@@ -713,7 +809,7 @@ def _alerts(db) -> None:
                 st.caption(f"Kolejne: {len(other) - 40} — w historii powiadomień poniżej.")
     if stale:
         with ui.details(
-            f"Nieaktualne (mecz już się rozpoczął): {len(stale)}", icon=":material/history:"
+            f"Archiwum — mecz już się rozpoczął: {len(stale)}", icon=":material/history:"
         ):
             ui.rows([row(a) for a in stale[:40]])
             if len(stale) > 40:
@@ -756,8 +852,12 @@ def _alerts(db) -> None:
                             "Rodzaj": a["label"],
                             "Treść": a["message"],
                             "Grupa": alerts.RANKS[a["rank"]],
-                            "Priorytet": a["priority"],
-                            "Stan": "nieaktualny" if a["stale"] else "aktualny",
+                            "Priorytet": {"high": "wysoki", "medium": "średni", "low": "niski"}.get(
+                                a["priority"], a["priority"]
+                            ),
+                            "Stan": "zarchiwizowany (mecz rozpoczęty)"
+                            if a.get("archived") or a["stale"]
+                            else "aktualny",
                             "Przeczytane": "tak" if a["read"] else "nie",
                         }
                         for a in every

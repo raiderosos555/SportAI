@@ -296,6 +296,8 @@ class Candidate:
     # TASK 013 §4: the stored forecast the probability comes from (None: no forecast); a
     # derived market (double chance from 1X2) names the forecast it was derived from
     prediction_id: str | None = None
+    # TASK 019 §1.4: national team data incomplete ("Model nie zna N ostatnich meczów…")
+    data_gaps: str = ""
 
     @property
     def accepted(self) -> bool:

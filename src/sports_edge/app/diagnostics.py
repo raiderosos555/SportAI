@@ -55,7 +55,7 @@ def _candidate_rows(items) -> pd.DataFrame:
         [
             {
                 "Wydarzenie": x.event,
-                "Dyscyplina": x.sport,
+                "Dyscyplina": c.sport_label(x.sport),
                 "Liga": x.league,
                 "Godzina": c.local_time(x.start_at, "%m-%d %H:%M"),
                 "Rynek": x.market_label,

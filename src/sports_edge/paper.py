@@ -22,7 +22,7 @@ from sports_edge.settlement import Outcome, settle
 from sports_edge.storage import Store
 
 MODES = {
-    "paper_system": "Paper trading — selekcja silnika",
+    "paper_system": "Kupon wirtualny — propozycja aplikacji",
     "paper_manual": "Paper trading — wybór użytkownika (nie rekomendacja)",
     "simulation": "Symulacja",
     "backtest": "Backtest historyczny",
@@ -477,6 +477,92 @@ def closing_line_value(store: Store, coupon_id: str) -> list[dict]:
     return out
 
 
+MANUAL_SOURCE = "manual_entry"  # TASK 019: a result typed in by the user, with its source
+
+
+def source_context(
+    store: Store,
+    events: list[dict],
+    *,
+    now: datetime,
+    normalizer,
+    team_aliases,
+    identities=None,
+) -> dict:
+    """What matching STS events with the independent results needs (shared by the import of
+    results and the explanation of a coupon waiting for its result)."""
+    league_for = {
+        (header, comp.sport): code
+        for code, comp in COMPETITIONS.items()
+        for header in comp.sts_leagues
+    }
+    codes = sorted(
+        {
+            league_for[(e["league"], e["sport"])]
+            for e in events
+            if (e["league"], e["sport"]) in league_for
+        }
+    )
+    by_day: dict[tuple, list[dict]] = {}
+    if codes:
+        for row in effective_results(
+            store, sport=None, until=now, competitions=codes, identities=identities
+        ):
+            by_day.setdefault((row["competition"], row["match_date"]), []).append(row)
+    return {
+        "aliases": alias_map(store, team_aliases),
+        "league_for": league_for,
+        "by_day": by_day,
+        "normalizer": normalizer,
+    }
+
+
+def competition_of(event: dict, context: dict) -> str | None:
+    return context["league_for"].get((event["league"], event["sport"]))
+
+
+def source_result(event: dict, context: dict) -> tuple[dict | None, str | None]:
+    """(the effective independent result of an STS event, or None with the reason).
+
+    Certain = covered league, same local match date and both teams matched exactly or through
+    a verified alias, exactly one candidate and no conflict between providers."""
+    code = competition_of(event, context)
+    if code is None:
+        return None, "liga bez niezależnego źródła wyników"
+    sport, names = event["sport"], context["normalizer"]
+    local_day = (
+        datetime.fromisoformat(event["start_at"])
+        .astimezone(ZoneInfo(COMPETITIONS[code].zone))
+        .date()
+        .isoformat()
+    )
+    rows = context["by_day"].get((code, local_day), [])
+    if not rows:
+        return None, "źródło nie ma jeszcze wyników tych rozgrywek z tego dnia"
+    known = known_names(rows, sport, names)
+    home = match_participant(event["home"] or "", sport, known, names, context["aliases"])
+    away = match_participant(event["away"] or "", sport, known, names, context["aliases"])
+    unknown = [
+        event[side]
+        for side, found in (("home", home), ("away", away))
+        if found.status not in {"exact", "alias"}
+    ]
+    found = [r for r in rows if r["home"] == home.target and r["away"] == away.target]
+    if unknown:
+        return None, (
+            "brak pewnego wyniku w źródle — nazwa drużyny bez potwierdzonego aliasu: "
+            + ", ".join(str(u) for u in unknown)
+        )
+    if len(found) != 1:
+        return None, "brak pewnego wyniku w źródle"
+    match = found[0]
+    if match["conflict"]:
+        return None, "źródła podają różne wyniki — rozliczenie wstrzymane"
+    if not match.get("regulation_certain", True):  # TASK 009: score may include extra time
+        return None, "wynik po 90 min niepotwierdzony — rozliczenie wstrzymane"
+    return match, None
+
+
 def import_source_results(
     store: Store,
     *,
@@ -492,75 +578,48 @@ def import_source_results(
     a verified alias, exactly one candidate and no conflict between providers. The provider
     chosen by the source hierarchy is recorded as the result's source. Anything else stays
     for manual entry. ``only_coupons=False`` also records results used for event statuses.
+
+    TASK 019: a result typed in by the user (``manual_entry``) is replaced by a later result
+    of a provider (a new row that supersedes it, nothing is deleted); a different score
+    creates the alert ``result_mismatch``.
     """
-    aliases = alias_map(store, team_aliases)
-    league_for = {
-        (header, comp.sport): code
-        for code, comp in COMPETITIONS.items()
-        for header in comp.sts_leagues
-    }
     sql = """SELECT e.* FROM events e WHERE e.bookmaker_id='sts'
         AND e.start_at IS NOT NULL AND e.start_at < ?"""
     if only_coupons:
         sql += """ AND e.id IN (SELECT m.event_id FROM coupon_legs l
           JOIN selections s ON s.id=l.selection_id JOIN markets m ON m.id=s.market_id)"""
     events = store.rows(sql, (iso(now),))
-    codes = sorted(
-        {
-            league_for[(e["league"], e["sport"])]
-            for e in events
-            if (e["league"], e["sport"]) in league_for
-        }
+    context = source_context(
+        store,
+        events,
+        now=now,
+        normalizer=normalizer,
+        team_aliases=team_aliases,
+        identities=identities,
     )
-    by_day: dict[tuple, list[dict]] = {}
-    if codes:
-        for row in effective_results(
-            store, sport=None, until=now, competitions=codes, identities=identities
-        ):
-            by_day.setdefault((row["competition"], row["match_date"]), []).append(row)
-    recorded, unresolved = 0, []
+    recorded, replaced, unresolved = 0, 0, []
     for event in events:
-        if latest_result(store, event["id"]) is not None:
+        previous = latest_result(store, event["id"])
+        if previous is not None and previous["source"] != MANUAL_SOURCE:
             continue
-        code = league_for.get((event["league"], event["sport"]))
+        code = competition_of(event, context)
         if code is None:
-            if not only_coupons:
+            if not only_coupons or previous is not None:
                 continue  # statuses: only leagues with an independent source are relevant
             unresolved.append(f"{event['name_raw']}: liga bez niezależnego źródła wyników")
             continue
-        sport = event["sport"]
-        local_day = (
-            datetime.fromisoformat(event["start_at"])
-            .astimezone(ZoneInfo(COMPETITIONS[code].zone))
-            .date()
-            .isoformat()
-        )
-        rows = by_day.get((code, local_day), [])
-        known = known_names(rows, sport, normalizer)
-        home = match_participant(event["home"] or "", sport, known, normalizer, aliases)
-        away = match_participant(event["away"] or "", sport, known, normalizer, aliases)
-        found = [r for r in rows if r["home"] == home.target and r["away"] == away.target]
-        if (
-            home.status not in {"exact", "alias"}
-            or away.status not in {"exact", "alias"}
-            or len(found) != 1
-        ):
-            unresolved.append(f"{event['name_raw']}: brak pewnego wyniku w źródle")
+        match, reason = source_result(event, context)
+        if match is None:
+            if previous is None:
+                unresolved.append(f"{event['name_raw']}: {reason}")
             continue
-        match = found[0]
-        if match["conflict"]:
-            unresolved.append(
-                f"{event['name_raw']}: źródła podają różne wyniki — rozliczenie wstrzymane"
-            )
-            continue
-        if not match.get("regulation_certain", True):  # TASK 009: score may include extra time
-            unresolved.append(
-                f"{event['name_raw']}: wynik po 90 min niepotwierdzony — rozliczenie wstrzymane"
-            )
-            continue
+        source = match["provider_resolved"]
+        if source == MANUAL_SOURCE:
+            if previous is not None:
+                continue  # the user's own entry is already the result of the event
         details = json.loads(match["details_json"] or "{}")
         ht = details.get("ht") or [None, None]
-        source = match["provider_resolved"]
+        extra = {"manual": True, "source_text": details.get("source_text")}
         record_result(
             store,
             event_id=event["id"],
@@ -582,12 +641,41 @@ def import_source_results(
                 "stage": details.get("stage"),
                 "after_extra_time": details.get("aet"),
                 "penalties": details.get("pens"),
+                **({"replaces_manual": previous["id"]} if previous is not None else {}),
+                **(extra if source == MANUAL_SOURCE else {}),
             },
             source=source,
             verified=True,
         )
         recorded += 1
-    return {"recorded": recorded, "unresolved": unresolved}
+        if previous is not None:
+            replaced += 1
+            _manual_mismatch(store, event, previous, match, now=now)
+    return {"recorded": recorded, "replaced_manual": replaced, "unresolved": unresolved}
+
+
+def _manual_mismatch(store: Store, event: dict, manual: dict, match: dict, *, now) -> None:
+    """A provider's result that differs from the user's entry: one alert (the provider's
+    result settles; the entry stays in the history)."""
+    typed = (manual["home_score"], manual["away_score"])
+    found = (match["home_score"], match["away_score"])
+    if typed == found:
+        return
+    from sports_edge import alerts
+
+    source = SOURCE_LABELS.get(match["provider_resolved"], match["provider_resolved"])
+    alerts.create(
+        store,
+        kind="result_mismatch",
+        message=f"{event['home']} - {event['away']}: wynik od dostawcy ({source}) "
+        f"{found[0]}:{found[1]} różni się od wpisu ręcznego {typed[0]}:{typed[1]} — "
+        "kupony i prognozy rozliczono wynikiem dostawcy.",
+        source=source,
+        now=now,
+        event_id=event["id"],
+        fingerprint=f"{manual['id']}|{found}",
+        payload={"manual": list(typed), "provider": list(found), "manual_id": manual["id"]},
+    )
 
 
 STATUS_TO_RESULT = {"postponed": "postponed", "cancelled": "cancelled"}

@@ -18,6 +18,7 @@ from sports_edge.coupon_store import (
     save_manual,
 )
 from sports_edge.forecast_quality import coupon_review
+from sports_edge.manual_results import coupon_result_source
 from sports_edge.paper import (
     MODES,
     closing_line_value,
@@ -52,7 +53,7 @@ def history_page() -> None:
     )
     tabs = st.tabs(
         [
-            "Kupony wirtualne",
+            "Szczegóły zaznaczonego kuponu",
             "Wyniki i rozliczenia",
             "Skuteczność kreatora kuponów",
             "Skuteczność i CLV",
@@ -95,26 +96,27 @@ def history_page() -> None:
 
 
 def _coupons(db) -> None:
-    rows = coupons_table(db)
-    relation = {
-        r["coupon_id"]: r["relation"]
-        for r in db.rows("SELECT coupon_id, relation FROM coupon_lineage")
-    }
-    hidden = sum(relation.get(r["id"]) in VERSIONED for r in rows)
-    every = hidden and st.toggle(
-        "Wersje i duplikaty",
-        key="hist_all_coupons",
-        help="Pokaż też rewizje, aktualizacje kursów i duplikaty kuponów dnia (poza statystykami).",
-    )
-    if not every:
-        rows = [r for r in rows if relation.get(r["id"]) not in VERSIONED]
+    """TASK 019 §4.4: one list of coupons (above); here the details of the coupon selected
+    in it, the coupons saved outside the builder and the manual virtual coupon."""
+    chosen = st.session_state.get(SELECTED)
+    found = next((x for x in builder_coupons(db, everything=True) if x["id"] == chosen), None)
+    if found is None:
+        st.caption("Zaznacz wiersz w tabeli „Kupony” powyżej, aby zobaczyć tu jego szczegóły.")
+    else:
+        newest = newest_variants(db, [found])
+        _coupon_details(db, {**found, "kind": kind_label(found, c.now(), newest)})
+    _other_coupons(db)
+
+
+def _other_coupons(db) -> None:
+    ui.section("Kupony spoza kreatora", "wpisy ręczne z Historii (bez propozycji aplikacji)")
+    rows = [r for r in coupons_table(db) if not r.get("proposal_json")]
     if rows:
         st.dataframe(
             pd.DataFrame(
                 [
                     {
                         "Utworzono": c.local_time(r["created_at"]),
-                        "Relacja": RELATION_LABELS.get(relation.get(r["id"]), "—"),
                         "Tryb": MODES[r["mode"]],
                         "Typ": r["kind"].upper(),
                         "Zdarzenia": " | ".join(
@@ -133,13 +135,8 @@ def _coupons(db) -> None:
             hide_index=True,
             width="stretch",
         )
-        if hidden and not every:
-            st.caption(
-                f"Ukryte wersje i duplikaty kuponów dnia (poza statystykami): {hidden} — "
-                "włącz „Wersje i duplikaty”, aby je zobaczyć."
-            )
     else:
-        st.info("Brak wirtualnych kuponów.")
+        st.caption("Brak kuponów spoza kreatora.")
     with st.expander("Dodaj wirtualny kupon (wybór użytkownika — nie rekomendacja systemu)"):
         days = offer_days(db)
         if not days:
@@ -345,8 +342,16 @@ def _overview(db) -> None:
             series.append(
                 {"Data": x["first_start_at"][:10], "Wynik narastająco (zł)": float(running)}
             )
-        ui.section("Skuteczność w czasie")
-        st.line_chart(pd.DataFrame(series).set_index("Data"), height=220)
+        # TASK 019 §4.4: a labelled chart on a real time axis (equal spacing of the days)
+        ui.section("Skuteczność w czasie", "zysk/strata narastająco, zł · po podatku STS")
+        frame = pd.DataFrame(series)
+        frame["Data"] = pd.to_datetime(frame["Data"])
+        st.line_chart(
+            frame.groupby("Data").last(),
+            height=220,
+            x_label="Data pierwszego meczu kuponu",
+            y_label="Zysk/strata narastająco, zł",
+        )
     _coupon_list(db, coupons)
 
 
@@ -418,6 +423,9 @@ def kind_label(coupon: dict, now, newest: set[str] | None = None) -> tuple[str, 
     return "Zapisany wirtualny — czeka na wyniki", "warn"
 
 
+SELECTED = "hist_selected_coupon"
+
+
 def _coupon_list(db, coupons: list[dict]) -> None:
     ui.section("Kupony", "filtry · zaznacz wiersz, aby zobaczyć szczegóły")
     now = c.now()
@@ -478,6 +486,9 @@ def _coupon_list(db, coupons: list[dict]) -> None:
                 "Stawka": float(x["stake"]),
                 "Wynik": OUTCOME.get(x["outcome"], (x["outcome"] or "oczekuje",))[0],
                 "Zysk netto": float(x["net_profit"]) if x["net_profit"] is not None else None,
+                # TASK 019 §1.3: settled by a provider or by the user's entry (counted apart)
+                "Źródło wyniku": coupon_result_source(db, x["id"]),
+                "Relacja": RELATION_LABELS.get(x.get("relation"), "—"),
             }
             for x in shown
         ]
@@ -502,6 +513,7 @@ def _coupon_list(db, coupons: list[dict]) -> None:
         "w bazie — nic nie jest usuwane."
     )
     if picked.selection.rows:
+        st.session_state[SELECTED] = shown[picked.selection.rows[0]]["id"]
         _coupon_details(db, shown[picked.selection.rows[0]])
 
 

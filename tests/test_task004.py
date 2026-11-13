@@ -525,7 +525,10 @@ def test_event_status_odds_age_and_market_presence_are_independent(store, sts_fi
     assert (
         event_status(start, datetime(2026, 10, 31, 21, tzinfo=UTC), sport="football") == "in_play"
     )
-    assert event_status(start, datetime(2026, 11, 1, 9, tzinfo=UTC), sport="football") == "unknown"
+    # TASK 019 §3.2: past the typical duration without a result — "czekamy na wynik"
+    late = datetime(2026, 11, 1, 9, tzinfo=UTC)
+    assert event_status(start, late, sport="football") == "awaiting_result"
+    assert event_status(None, late, sport="football") == "unknown"
     assert event_status(start, afternoon, result_status="postponed") == "postponed"
     assert event_status(start, afternoon, result_status="completed") == "finished"
     week, parsed = parse_pdf(sts_fixture_pdf, file_name="oferta-nastepne-dni-www.pdf")

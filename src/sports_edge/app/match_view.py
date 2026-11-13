@@ -36,6 +36,12 @@ def _tag(statuses: list[str]) -> tuple[str, str] | None:
     return ("eksperymentalny", "warn")
 
 
+def _date(value: str | None) -> str:
+    from datetime import date
+
+    return date.fromisoformat(value).strftime("%d.%m.%Y") if value else "brak danych"
+
+
 def teams_of(head) -> tuple[str, str]:
     home, away = (head.event.split(" - ", 1) + [""])[:2]
     return home.strip(), away.strip()
@@ -44,18 +50,38 @@ def teams_of(head) -> tuple[str, str]:
 # ---------------------------------------------------------------- level 1
 
 
-def header(head, context: dict, rows, started: bool, review: dict, info: dict) -> None:
+def header(
+    head,
+    context: dict,
+    rows,
+    started: bool,
+    review: dict,
+    info: dict,
+    view: dict | None = None,
+    gaps: str = "",
+) -> None:
     home, away = teams_of(head)
     status = c.EVENT_STATUS.get(head.event_status, head.event_status)
     badges = [ui.pill(status.capitalize(), c.EVENT_TONE.get(head.event_status, "neutral"))]
     badges.append(prematch_ui.lineup_pill(info))
     fresh = context.get("freshness") or {}
+    national = bool(view) and view.get("category") == "national"
     if fresh.get("last_result"):
         badges.append(
             ui.pill(
-                f"Wyniki ligi do {fresh['last_result']}", "info" if fresh.get("fresh") else "warn"
+                f"{'Wyniki rozgrywek' if national else 'Wyniki ligi'} do {fresh['last_result']}",
+                "info" if fresh.get("fresh") else "warn",
             )
         )
+    if national:  # TASK 019 §3.1: the team's own newest match next to the pool's
+        last = [
+            f"{view['teams'][s].get('name') or view['teams'][s]['team']} "
+            + (_date(view["schedule"][s].get("last_match")))
+            for s in ("home", "away")
+        ]
+        badges.append(ui.pill("Ostatni mecz drużyny: " + " · ".join(last), "info"))
+    for text in [g for g in gaps.split("; ") if g]:  # TASK 019 §1.4
+        badges.append(ui.pill(text, "warn", wrap=True))
     badges.append(
         ui.pill("Kurs STS potwierdzony", "ok")
         if head.freshness == "fresh"
@@ -87,7 +113,10 @@ def header(head, context: dict, rows, started: bool, review: dict, info: dict) -
                 else "—",
             ),
             ("Dane", inputs.get("data") or "—"),
-            ("Wyniki ligi do", fresh.get("last_result") or "—"),
+            (
+                "Wyniki rozgrywek do" if national else "Wyniki ligi do",
+                fresh.get("last_result") or "—",
+            ),
             ("Liga / sport", f"{head.league} · {head.sport}"),
         ]
         st.markdown(ui.key_values(pairs), unsafe_allow_html=True)
@@ -209,9 +238,45 @@ def _better(a, b, *, higher: bool = True) -> str:
     return ("home" if a > b else "away") if higher else ("home" if a < b else "away")
 
 
-def comparison(head, teams: dict) -> None:
+def national_form(recent: list[dict]) -> dict:
+    """TASK 019 §3.1: the form of a national team from the matches listed on the cards (all
+    national competitions in the database); measures of another source are "brak danych"."""
+    shown = [r for r in recent if r.get("own_score")][:5]
+    if not shown:
+        return {"form5": None, "form10": None, "venue_form5": None}
+    goals = [tuple(int(x) for x in r["own_score"].split(":")) for r in shown]
+    points = [3 if r["outcome"] == "W" else 1 if r["outcome"] == "R" else 0 for r in shown]
+    return {
+        "form5": {
+            "sequence": [r["outcome"] for r in reversed(shown)],
+            "points_per_game": sum(points) / len(shown),
+            "goals_for": sum(g[0] for g in goals) / len(shown),
+            "goals_against": sum(g[1] for g in goals) / len(shown),
+            "points_vs_elo_expectation": None,
+        },
+        "form10": None,
+        "venue_form5": None,
+    }
+
+
+def comparison(head, teams: dict, view: dict | None = None) -> None:
+    """``view`` (TASK 019 §3.1): the cup / national schedule — then the rest days and the
+    matches in 14 days come from it, the same numbers as the cards above."""
     home_name, away_name = teams_of(head)
-    home, away = teams.get("home") or {}, teams.get("away") or {}
+    home, away = dict(teams.get("home") or {}), dict(teams.get("away") or {})
+    scope_note = "(tylko ligowe)"
+    if view and view.get("schedule"):
+        for side, team in (("home", home), ("away", away)):
+            plan = view["schedule"][side]
+            team["rest_days"] = plan.get("rest_days")
+            team["matches_last_14"] = plan.get("matches_14")
+            if view.get("category") == "national":  # the form from the same matches as the cards
+                team.update(national_form(plan.get("recent") or []))
+        scope_note = (
+            "(wszystkie mecze reprezentacji w bazie)"
+            if view.get("category") == "national"
+            else "(liga i puchary)"
+        )
     if not (home.get("form5") or away.get("form5")):
         ui.empty_state(
             "Brak danych do porównania drużyn",
@@ -272,7 +337,7 @@ def comparison(head, teams: dict) -> None:
             None if rest_away is None else str(rest_away),
             "",
             f"mecze w 14 dni: {home.get('matches_last_14', '—')} / "
-            f"{away.get('matches_last_14', '—')} (tylko ligowe)",
+            f"{away.get('matches_last_14', '—')} {scope_note}",
         )
     )
     xg_home = (home.get("stats5") or {}).get("expected_goals")

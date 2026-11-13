@@ -107,6 +107,31 @@ def add_many(items: list[tuple[Candidate, str]]) -> None:
     st.session_state[MESSAGE] = ("ok" if not refused else "warn", text)
 
 
+def started_legs(cart: list[dict], now=None) -> list[dict]:
+    """TASK 019 §4.1: legs whose match has already started (or has no known start)."""
+    moment = (now or c.now()).isoformat()
+    return [leg for leg in cart if leg.get("start_at") and leg["start_at"] <= moment]
+
+
+def remove_started(now=None) -> int:
+    """ "Usuń rozpoczęte (N)": drop the started legs from the cart (the draft only)."""
+    gone = {leg["selection_id"] for leg in started_legs(legs(), now)}
+    set_legs([leg for leg in legs() if leg["selection_id"] not in gone])
+    return len(gone)
+
+
+def counted(cart: list[dict], rows: list, *, late: bool, now=None) -> tuple[list, list]:
+    """(legs, rows) that count in the chance of a NEW coupon: started legs are left out,
+    except in "Wpis po fakcie" (a coupon already placed in STS)."""
+    if late:
+        return cart, rows
+    gone = {leg["selection_id"] for leg in started_legs(cart, now)}
+    kept = [
+        (leg, row) for leg, row in zip(cart, rows, strict=True) if leg["selection_id"] not in gone
+    ]
+    return [k[0] for k in kept], [k[1] for k in kept]
+
+
 def contains(candidate: Candidate) -> bool:
     return any(leg["selection_id"] == candidate.selection_id for leg in legs())
 

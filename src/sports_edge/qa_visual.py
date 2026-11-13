@@ -49,6 +49,7 @@ PAGES = (
     ("automatyzacja", "Automatyzacja AI"),
     ("zrodla", "Źródła i ustawienia"),
 )
+AGENTS_CARD = "Help agents write better apps"
 MIN_CARD = 200  # px: a card narrower than this cannot show a label and a number side by side
 
 CHECK = r"""
@@ -151,6 +152,8 @@ def check_page(page, url: str, shot: Path, *, tabs: bool) -> dict:
     _settle(page)
     found = page.evaluate(CHECK)
     found["exceptions"] = page.locator('[data-testid="stException"]').count()
+    # TASK 019 §4.6: the Streamlit card "Help agents write better apps" never covers a page
+    found["agents_card"] = page.get_by_text(AGENTS_CARD).count()
     _full_screenshot(page, shot)
     if tabs:
         found["tab_check"] = _tabs(page, shot)
@@ -161,6 +164,7 @@ def check_page(page, url: str, shot: Path, *, tabs: bool) -> dict:
         and not found["narrow"]
         and not found["buttons"]
         and not found["exceptions"]
+        and not found["agents_card"]
         and not (found.get("tab_check") or {}).get("failed")
         and not (found.get("tab_check") or {}).get("exceptions")
     )
@@ -364,6 +368,55 @@ def _scenario_absence(page, base: str, shot: Path) -> dict:
     return found
 
 
+def _scenario_automation(page, base: str, shot: Path) -> dict:
+    """TASK 019 §5.14: Automatyzacja → Przegląd (only the buttons possible in the state) and
+    Harmonogram (the calendar with short names, the coupon-of-the-day panel, off)."""
+    page.goto(f"{base}/automatyzacja")
+    _settle(page)
+    found = _assess(page)
+    buttons = [
+        name
+        for name in (
+            "URUCHOM AUTOMATYZACJĘ",
+            "URUCHOM KONTROLĘ TERAZ",
+            "WSTRZYMAJ AUTOMATYZACJĘ",
+            "WZNÓW AUTOMATYZACJĘ",
+            "ZATRZYMAJ AUTOMATYZACJĘ",
+        )
+        if page.get_by_role("button", name=name).count()
+    ]
+    found["overview_buttons"] = buttons
+    page.get_by_role("tab", name="Harmonogram").click()
+    _settle(page)
+    schedule = _assess(page)
+    found["daily_coupon_visible"] = page.get_by_text("Kupon dnia automatycznie").count() > 0
+    found["agents_card"] = page.get_by_text(AGENTS_CARD).count()
+    found["ok"] = (
+        found["ok"]
+        and schedule["ok"]
+        and len(buttons) <= 3
+        and found["daily_coupon_visible"]
+        and not found["agents_card"]
+    )
+    found["schedule"] = {k: schedule[k] for k in ("overflow", "outside", "broken", "narrow")}
+    _full_screenshot(page, shot)
+    return found
+
+
+def _scenario_waiting(page, base: str, shot: Path) -> dict:
+    """TASK 019 §1.3: Wydarzenia i wyniki → Zakończone — the list of coupons waiting for a
+    result and the manual form with an obligatory source (opened, nothing is saved)."""
+    page.goto(f"{base}/wydarzenia?demo=1")
+    _settle(page)
+    page.get_by_role("tab", name="Zakończone i wyniki").click()
+    _settle(page)
+    found = _assess(page)
+    found["section_visible"] = page.get_by_text("Kupony czekające na wynik").count() > 0
+    found["ok"] = found["ok"] and found["section_visible"]
+    _full_screenshot(page, shot)
+    return found
+
+
 # TASK 010: checked at every screen size (the other scenarios at 1366 and 390 px only)
 EVERY_VIEW = (
     ("kupon_ryzyko_dnia", "Kupon dnia: kupony DEMO i Ryzyko dnia", _scenario_day_risk),
@@ -372,6 +425,9 @@ EVERY_VIEW = (
     ("decyzje", "Dashboard i Modele: Decyzje do podjęcia", _scenario_decisions),  # TASK 015
     ("baza_i_kopie", "Dashboard i Źródła: alerty, rozmiar bazy, kopie", _scenario_storage),
     ("absencja", "Analiza meczu: formularz absencji ze źródłem", _scenario_absence),  # TASK 016
+    # TASK 019: Automatyzacja (Przegląd, Harmonogram) and the results waiting for a source
+    ("automatyzacja", "Automatyzacja: Przegląd i Harmonogram", _scenario_automation),
+    ("czeka_na_wynik", "Wydarzenia: zakończone i ręczny wynik", _scenario_waiting),
 )
 
 SCENARIOS = (

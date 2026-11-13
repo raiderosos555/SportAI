@@ -1263,6 +1263,46 @@ def _country_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", plain)
 
 
+def polish_names(store: Store, paths, *, now: datetime) -> dict[str, str]:
+    """TASK 019 §3.1: {history (English) name of a national team: its Polish name}.
+
+    Only existing aliases are used: the STS spellings of national events that map to a team
+    of the history (exactly or through a reviewed alias) and the pairs of
+    ``config/team_aliases.toml``. A team without such a pair keeps its source name."""
+    import tomllib
+
+    from sports_edge.datasources.competitions import by_category
+
+    pool = effective_results(
+        store, sport="football", until=now, competitions=by_category("national")
+    )
+    known = {r[side] for r in pool for side in ("home", "away")}
+    out: dict[str, str] = {}
+    path = paths.config / "team_aliases.toml"
+    if path.is_file():
+        for alias, name in (
+            tomllib.loads(path.read_text(encoding="utf-8")).get("football") or {}
+        ).items():
+            if name in known:
+                out.setdefault(name, alias)
+    headers = [h for code in by_category("national") for h in COMPETITIONS[code].sts_leagues]
+    if headers and pool:
+        mapper = _national_mapper(store, paths, pool)
+        marks = ",".join("?" for _ in headers)
+        for row in store.rows(
+            f"""SELECT DISTINCT home, away FROM events WHERE bookmaker_id='sts'
+            AND sport='football' AND league IN ({marks})""",
+            tuple(headers),
+        ):
+            for raw in (row["home"], row["away"]):
+                if not raw:
+                    continue
+                found = mapper(raw)
+                if found.status in {"exact", "alias"} and found.target and found.target != raw:
+                    out.setdefault(found.target, raw)
+    return out
+
+
 def _national_mapper(store: Store, paths, history: list[dict]):
     """Exact/approved team mapping that refuses keys or aliases with multiple targets."""
     from sports_edge.matching import (
@@ -2082,14 +2122,18 @@ def event_view(store: Store, paths, event: dict, *, now: datetime) -> dict | Non
         history = [*domestic, *pool]
     else:
         history = pool
+    names = polish_names(store, paths, now=now) if category == "national" else {}
     out["schedule"] = {
-        side: _schedule(history, team, day) for side, team in (("home", home), ("away", away))
+        side: _schedule(history, team, day, names)
+        for side, team in (("home", home), ("away", away))
     }
+    for side, team in (("home", home), ("away", away)):  # TASK 019 §3.1: Polish names
+        out["teams"][side]["name"] = names.get(team) or event.get(side) or team
     out["meetings"] = [
         {
             "date": r["match_date"],
             "competition": COMPETITIONS[r["competition"]].name,
-            "match": f"{r['home']} - {r['away']}",
+            "match": f"{names.get(r['home'], r['home'])} - {names.get(r['away'], r['away'])}",
             "score": f"{r['home_score']}:{r['away_score']}",
         }
         for r in sorted(pool, key=lambda r: r["match_date"], reverse=True)
@@ -2098,7 +2142,7 @@ def event_view(store: Store, paths, event: dict, *, now: datetime) -> dict | Non
     return out
 
 
-def _schedule(rows: list[dict], team: str, day: str) -> dict:
+def _schedule(rows: list[dict], team: str, day: str, names: dict | None = None) -> dict:
     """Rest and load from EVERY identified match of the team before the day (no minutes
     played exist in the sources, so player workload is never estimated)."""
     played = sorted(
@@ -2107,22 +2151,32 @@ def _schedule(rows: list[dict], team: str, day: str) -> dict:
     )
     when = date.fromisoformat(day)
     recent = []
+    names = names or {}
     for r in played[-5:][::-1]:
         details = json.loads(r.get("details_json") or "{}")
+        home_side = r["home"] == team
+        own, other = (
+            (r["home_score"], r["away_score"]) if home_side else (r["away_score"], r["home_score"])
+        )
+        opponent = r["away"] if home_side else r["home"]
         recent.append(
             {
                 "date": r["match_date"],
                 "competition": COMPETITIONS[r["competition"]].name,
                 "category": COMPETITIONS[r["competition"]].category,
-                "opponent": r["away"] if r["home"] == team else r["home"],
-                "venue": "dom" if r["home"] == team else "wyjazd",
+                "opponent": names.get(opponent, opponent),
+                "venue": "dom" if home_side else "wyjazd",
                 "score_90": f"{r['home_score']}:{r['away_score']}",
+                # TASK 019 §3.1: the score from the team's side — "P 1:9", not "9:1"
+                "own_score": f"{own}:{other}",
+                "outcome": "W" if own > other else "R" if own == other else "P",
                 "extra_time": details.get("duration") in {"EXTRA_TIME", "PENALTY_SHOOTOUT"},
             }
         )
     last = date.fromisoformat(played[-1]["match_date"]) if played else None
     days14 = [r for r in played if (when - date.fromisoformat(r["match_date"])).days <= 14]
     return {
+        "last_match": played[-1]["match_date"] if played else None,
         "rest_days": (when - last).days if last else None,
         "matches_14": len(days14),
         "european_14": sum(

@@ -43,6 +43,13 @@ def category(league: str | None, sport: str | None) -> str:
     return "other" if any(m in (league or "").upper() for m in OTHER) else "domestic"
 
 
+def category_label(league: str | None, sport: str | None) -> str:
+    """TASK 019 §3.3: the competition category is a football notion — other sports: "—"."""
+    if sport != "football":
+        return "—"
+    return CHOICES.get(category(league, sport), "inne")
+
+
 def category_filter(key: str) -> str:
     chosen = st.segmented_control(
         "Rozgrywki", list(CHOICES), default="all", format_func=CHOICES.get, key=key
@@ -58,6 +65,13 @@ def matches(choice: str, league: str | None, sport: str | None) -> bool:
 def _view(_db, version: tuple, event_id: str, minute: datetime) -> dict | None:
     event = _db.get("events", event_id)
     return international.event_view(_db, c.paths(), event, now=minute) if event else None
+
+
+def schedule_of(db, event_id: str, now: datetime) -> dict | None:
+    """TASK 019 §3.1: the schedule of both teams of a cup / national event — the one source
+    of the rest days for the cards and the comparison table."""
+    view = _view(db, c.data_version(db), event_id, now.replace(second=0, microsecond=0))
+    return view if view and view.get("schedule") else None
 
 
 def event_block(db, event_id: str, now: datetime) -> None:
@@ -133,7 +147,7 @@ def event_block(db, event_id: str, now: datetime) -> None:
         )
     cols = st.columns(2)
     for col, side in zip(cols, ("home", "away"), strict=True):
-        team = view["teams"][side]["team"]
+        team = view["teams"][side].get("name") or view["teams"][side]["team"]
         plan = view["schedule"][side]
         with col:
             ui.metric_cards(
@@ -155,14 +169,19 @@ def event_block(db, event_id: str, now: datetime) -> None:
                     ui.list_row(
                         title=f"{r['date']} · {r['opponent']} ({r['venue']})",
                         meta=r["competition"] + (" · dogrywka" if r["extra_time"] else ""),
-                        value=r["score_90"],
-                        value_hint="po 90 min",
+                        value=f"{r.get('outcome', '')} {r.get('own_score', r['score_90'])}",
+                        value_hint=f"{team} : rywal, po 90 min",
                     )
                     for r in plan["recent"]
                 ]
             )
     st.caption(
-        "Odpoczynek i obciążenie liczone ze wszystkich wiarygodnie zidentyfikowanych meczów "
+        (
+            "Odpoczynek liczony ze wszystkich meczów reprezentacji w bazie (te same liczby co w "
+            "porównaniu drużyn); W wygrana · R remis · P porażka, wynik z perspektywy drużyny."
+        )
+        if view["category"] == "national"
+        else "Odpoczynek i obciążenie liczone ze wszystkich wiarygodnie zidentyfikowanych meczów "
         "(liga, europejskie puchary); bez danych o minutach nie szacujemy zmęczenia zawodników."
     )
 
@@ -172,7 +191,7 @@ def coverage_block(db, now: datetime) -> None:
     from sports_edge import international_data as data
 
     rows = data.coverage(db, now=now)
-    ui.section("Europejskie puchary i reprezentacje", "osobne pokrycie danych (TASK 009)")
+    ui.section("Europejskie puchary i reprezentacje", "osobne pokrycie danych")
     _table(
         ui.table(
             [
@@ -439,28 +458,65 @@ def national_coupon_block(db, day: str, now: datetime, candidates=()) -> None:
     )
     # TASK 018: matches of national competitions with history follow the league path (their
     # forecasts and selections are in "Najlepsze typy" and the coupons); only competitions
-    # without data in the catalogue are listed here, with the reason.
-    statuses = []
+    # without data in the catalogue are listed here. TASK 019 §2.1: one row per match (the
+    # same match printed twice in the offer is shown once), grouped by competition, in a
+    # closed panel UNDER the coupons with a one-line summary.
+    found = no_data_matches(events)
+    if not found:
+        return
+    leagues = sorted({row[0] for row in found})
+    summary = (
+        f"Reprezentacje — rozgrywki bez danych: {_matches(len(found))} z "
+        f"{_competitions(len(leagues))} bez historii"
+    )
+    with ui.details(summary, icon=":material/public:"):
+        st.caption(
+            "Te nagłówki STS nie mają historii wyników w katalogu rozgrywek — mecze są bez "
+            "prognozy (tak samo jak liga bez danych). Mecze reprezentacji z historią są "
+            "analizowane jak ligi (Najlepsze typy i kupony)."
+        )
+        _table(ui.table(["Rozgrywki (nagłówek STS)", "Mecz", "Godzina", "Status"], found))
+
+
+def no_data_matches(events: list[dict]) -> list[list[str]]:
+    """[header, match, time, status] of the matches without data — unique, by competition."""
+    seen: set[tuple] = set()
+    rows = []
     for event in events:
         league = for_sts_league(event.get("league") or "", event.get("sport"))
         if league is not None and league.category == "national":
             continue
-        statuses.append(
+        name = (
+            event.get("name_raw")
+            or f"{event.get('home') or 'brak danych'} – {event.get('away') or 'brak danych'}"
+        )
+        key = (event.get("league"), event.get("home") or name, event.get("away"))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(
             [
-                event.get("name_raw")
-                or f"{event.get('home') or 'brak danych'} – {event.get('away') or 'brak danych'}",
+                event.get("league") or "brak danych",
+                name,
+                c.local_time(event.get("start_at"), "%d.%m %H:%M"),
                 "brak danych — bez prognozy",
-                f"Nagłówek STS „{event.get('league') or 'brak danych'}” nie ma historii wyników "
-                "w katalogu rozgrywek (tak samo jak liga bez danych).",
             ]
         )
-    if not statuses:
-        return
-    ui.section(
-        "Reprezentacje — rozgrywki bez danych",
-        "mecze reprezentacji z historią są analizowane jak ligi (Najlepsze typy i kupony)",
-    )
-    _table(ui.table(["Mecz", "Status", "Przyczyna"], statuses))
+    return sorted(rows, key=lambda r: (r[0], r[2], r[1]))
+
+
+def _matches(n: int) -> str:
+    if n == 1:
+        return "1 mecz"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return f"{n} mecze"
+    return f"{n} meczów"
+
+
+def _competitions(n: int) -> str:
+    if n == 1:
+        return "1 rozgrywek"
+    return f"{n} rozgrywek"
 
 
 def _national_coverage(db, rows: list[dict], now: datetime) -> None:

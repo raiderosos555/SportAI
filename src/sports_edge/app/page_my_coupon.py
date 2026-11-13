@@ -102,7 +102,14 @@ def _browser(days: list[str]) -> None:
         and (show_started or rows[0].event_status == "before_start")
         and (not only_model or any(r.p_model is not None for r in rows))
     ]
-    shown.sort(key=lambda eid: (events[eid][0].start_at or "", events[eid][0].event))
+    # TASK 019 §4.1: the first (default) event is one with a model forecast
+    shown.sort(
+        key=lambda eid: (
+            not any(r.p_model is not None for r in events[eid]),
+            events[eid][0].start_at or "",
+            events[eid][0].event,
+        )
+    )
     if not shown:
         ui.empty_state(
             "Brak wydarzeń dla filtrów",
@@ -211,8 +218,26 @@ def _coupon() -> None:
         _saved_note()
         return
     rows, _pool = cart.rows_for(legs)
+    late = bool(st.session_state.get(LATE))
+    started = {leg["selection_id"] for leg in cart.started_legs(legs)}
     for i, (leg, row) in enumerate(zip(legs, rows, strict=True)):
-        _leg_card(i, leg, row)
+        _leg_card(i, leg, row, started=leg["selection_id"] in started)
+    if started and not late:  # TASK 019 §4.1
+        st.warning(
+            f"Selekcje meczów rozpoczętych: {len(started)} — nie liczą się do szansy nowego "
+            "kuponu (wyjątek: tryb „Wpis po fakcie”).",
+            icon=":material/schedule:",
+        )
+        if st.button(
+            f"Usuń rozpoczęte ({len(started)})", icon=":material/delete:", key="mc_rm_started"
+        ):
+            cart.remove_started()
+            st.rerun()
+    legs, rows = cart.counted(legs, rows, late=late)
+    if not legs:
+        st.caption("Po pominięciu rozpoczętych meczów kupon nie ma selekcji do oceny.")
+        _saved_note()
+        return
     value = st.number_input(
         "Stawka (zł)",
         min_value=1.0,
@@ -225,7 +250,6 @@ def _coupon() -> None:
     if stake != cart.stake():
         cart.set_stake(stake)
     sts = load_profiles(c.paths().config)["sts"]
-    late = bool(st.session_state.get(LATE))
     first = min((r.start_at for r in rows if r is not None and r.start_at), default=None)
     on_date = c.today_local()
     if late and first:
@@ -335,10 +359,10 @@ def _shared_and_weakest(legs: list[dict], rows: list, summary: dict) -> None:
         )
 
 
-def _leg_card(i: int, leg: dict, row) -> None:
+def _leg_card(i: int, leg: dict, row, *, started: bool = False) -> None:
     with st.container(border=True):
         top = st.columns([6, 1], vertical_alignment="top")
-        top[0].markdown(f"**{i + 1}. {leg['event']}**")
+        top[0].markdown(f"**{i + 1}. {leg['event']}**" + (" · mecz rozpoczęty" if started else ""))
         top[0].caption(
             f"{leg.get('market', '')} · {c.local_time(leg.get('start_at'), '%d.%m %H:%M')}"
         )

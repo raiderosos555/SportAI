@@ -26,8 +26,16 @@ def cached_option_d(_db, version: tuple, day: str, at) -> dict | None:
 
 
 @st.cache_data(ttl=600, show_spinner=False, max_entries=8)
-def cached_panel(_db, version: tuple, at, live: dict | None) -> list[dict]:
-    return dec.panel(_db, c.paths(), c.settings(), now=at, live_option_d=live)
+def cached_gaps(_db, version: tuple, at) -> dict | None:
+    try:
+        return dec.national_gaps_today(_db, c.paths(), c.settings(), now=at)
+    except (KeyError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False, max_entries=8)
+def cached_panel(_db, version: tuple, at, live: dict | None, gaps: dict | None = None):
+    return dec.panel(_db, c.paths(), c.settings(), now=at, live_option_d=live, live_gaps=gaps)
 
 
 def ten_minutes():
@@ -39,7 +47,12 @@ def ten_minutes():
 
 def settings_version() -> tuple:
     s = c.settings()
-    return (s.elo_dc_bound, tuple(s.enabled_profiles or ()), s.max_profiles_per_selection)
+    return (
+        s.elo_dc_bound,
+        tuple(s.enabled_profiles or ()),
+        s.max_profiles_per_selection,
+        s.national_gap_rule,
+    )
 
 
 def items(*, live: bool = True) -> list[dict]:
@@ -50,7 +63,7 @@ def items(*, live: bool = True) -> list[dict]:
         + settings_version()
         + (db.scalar("SELECT COUNT(*) FROM user_decisions"),)
     )
-    found = None
+    found = gaps = None
     if live:
         from sports_edge.repository import offer_days
 
@@ -58,7 +71,8 @@ def items(*, live: bool = True) -> list[dict]:
         days = [d for d in offer_days(db) if d >= today]
         if days:
             found = cached_option_d(db, version, days[0], ten_minutes())
-    return cached_panel(db, version, ten_minutes(), found)
+        gaps = cached_gaps(db, version, ten_minutes())
+    return cached_panel(db, version, ten_minutes(), found, gaps)
 
 
 def dashboard_block() -> None:
@@ -91,7 +105,7 @@ def decisions_panel() -> None:
             "sam.",
             "Każda decyzja i jej cofnięcie to nowy wpis historii (kto, kiedy, co, poprzedni i "
             "nowy stan); nic nie jest nadpisywane.",
-            "Dowody to liczby z pomiarów aplikacji (na żywo) i z raportów TASK 011–014 (z "
+            "Dowody to liczby z pomiarów aplikacji (na żywo) i z wcześniejszych raportów (z "
             "podanym źródłem). To nie jest rekomendacja zysku.",
         ],
     )
@@ -207,6 +221,8 @@ def _item(db, item: dict) -> None:
         _limit(db, item)
     elif key == dec.NATIONAL_1X2:
         _national_1x2(db, item)
+    elif key == dec.NATIONAL_GAPS:
+        _national_gaps(db, item)
     else:
         st.caption(
             "Bez przycisku aktywacji przed progiem 300 wspólnych meczów — aktywacja (po progu) "
@@ -324,3 +340,24 @@ def _national_1x2(db, item: dict) -> None:
     ):
         dec.decide_national_1x2(db, c.paths(), accept=accepting, now=c.now())
         _done()
+
+
+def _national_gaps(db, item: dict) -> None:
+    from sports_edge.team_gaps import RULES
+
+    options = list(RULES)
+    choice = st.radio(
+        "Typy reprezentacji, których model nie zna ostatnich meczów",
+        options,
+        index=options.index(item["value"]),
+        format_func=RULES.get,
+        key="decide_gaps_choice",
+    )
+    sure = st.checkbox("Potwierdzam decyzję o reprezentacjach z brakami", key="decide_gaps_sure")
+    if st.button(
+        "Zapisz decyzję o reprezentacjach",
+        key="decide_gaps_go",
+        disabled=not sure,
+        icon=":material/flag:",
+    ):
+        _done(dec.decide_national_gaps(db, c.paths(), c.settings(), value=choice, now=c.now()))

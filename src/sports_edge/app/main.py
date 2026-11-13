@@ -21,6 +21,7 @@ from sports_edge.app.pages_history import history_page
 from sports_edge.repository import imports
 from sports_edge.services import active_versions
 
+ui.polish_placeholders()  # TASK 019 §4.5: no "Choose an option"
 st.set_page_config(
     page_title="Sports Edge AI",
     page_icon=":material/insights:",

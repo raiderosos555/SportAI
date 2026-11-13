@@ -159,11 +159,13 @@ def _basic() -> None:
             _skill_chart(chart)
         st.caption(
             "Porównanie z rynkiem STS: prospektywnie, na tych samych rozliczonych meczach, z "
-            "kursem sprzed meczu bez marży (szczegóły: widok Uczenie AI). Raporty walidacji "
-            "historycznej nie mają takiego pomiaru (brak legalnych historycznych kursów), więc "
-            "ich „beats_market: false” to wartość domyślna, a nie wynik."
+            "kursem sprzed meczu bez marży (szczegóły: widok Uczenie AI)."
         )
         with ui.details(f"Szczegółowe miary i kalibracja — {SCOPE_LABELS[name]}"):
+            st.caption(  # TASK 019 §4.5: the technical field only in the details
+                "Raporty walidacji historycznej nie mają porównania z rynkiem (brak legalnych "
+                "historycznych kursów) — pole „beats_market: false” to wartość domyślna, nie wynik."
+            )
             _details(details)
     ui.section("Dyscypliny")
     ui.explanation(
@@ -172,7 +174,7 @@ def _basic() -> None:
             "Piłka nożna: 12 lig (5 czołowych + Championship, Eredivisie, Liga Portugal, Pro "
             "League, 2. Bundesliga, Süper Lig, Ekstraklasa).",
             "Tenis, koszykówka, siatkówka, hokej: brak modelu — brak legalnego, bezpłatnego "
-            "źródła bieżących wyników (szczegóły w raporcie TASK 006).",
+            "źródła bieżących wyników.",
             "Wysoka trafność nie oznacza zysku: kursy STS uwzględniają marżę i podatek.",
         ],
     )
@@ -391,7 +393,7 @@ def _advanced() -> None:
     if rows:
         st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height=360)
     else:
-        st.caption("Bramki per liga są liczone w eksperymentach od TASK 006.")
+        st.caption("Brak eksperymentów z bramkami per liga.")
     ui.section("Wersje modeli", "aktywne wersje i pełna historia eksperymentów")
     active = {
         row["version_id"]: name

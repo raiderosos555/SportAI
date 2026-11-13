@@ -618,14 +618,12 @@ def test_coupon_card_badges_and_history_hides_duplicates(app_paths, monkeypatch)
     assert not app.exception
     shown = [d.value for d in app.dataframe if "Profil" in d.value.columns]
     assert shown and len(shown[0]) == 1  # the official coupon only
-    virtual = [d.value for d in app.dataframe if "Tryb" in d.value.columns]
-    assert len(virtual[0]) == 1 and virtual[0]["Relacja"].iloc[0] == "Oficjalny kupon dnia"
+    # TASK 019 §4.4: one list of coupons — the relation is a column of it
+    assert shown[0]["Relacja"].iloc[0] == "Oficjalny kupon dnia"
     app.toggle(key="hist_versions").set_value(True).run()
     shown = [d.value for d in app.dataframe if "Profil" in d.value.columns]
     assert len(shown[0]) == 2 and shown[0]["Profil"].iloc[1].startswith("↳ ")
-    app.toggle(key="hist_all_coupons").set_value(True).run()
-    virtual = [d.value for d in app.dataframe if "Tryb" in d.value.columns]
-    assert sorted(virtual[0]["Relacja"]) == ["Duplikat", "Oficjalny kupon dnia"]
+    assert sorted(shown[0]["Relacja"]) == ["Duplikat", "Oficjalny kupon dnia"]
 
 
 def test_kupon_dnia_shows_the_official_coupon_then_no_change_after_a_second_analysis(
